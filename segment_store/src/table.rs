@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::slice::Iter;
 
-use arrow_deps::arrow::record_batch::RecordBatch;
+use arrow_deps::{arrow, arrow::record_batch::RecordBatch};
 
-use crate::column::{AggregateResult, AggregateType, OwnedValue, Scalar, Value, Values};
+use crate::column::{AggregateResult, AggregateType, Column, OwnedValue, Scalar, Value, Values};
+use crate::segment;
 use crate::segment::{ColumnName, GroupKey, Predicate, Segment};
 
 /// A Table represents data for a single measurement.
@@ -40,6 +41,48 @@ impl Table {
             meta: MetaData::new(&segment),
             segments: vec![segment],
         }
+    }
+
+    // TODO(edd): error handling
+    pub fn with_record_batch(name: String, col_types: Vec<ColumnType>, rb: RecordBatch) -> Self {
+        let rows = rb.num_rows();
+        let mut columns = BTreeMap::new();
+
+        for (i, ct) in col_types.into_iter().enumerate() {
+            match ct {
+                ColumnType::Tag(name) => {
+                    let arrow_column = rb.column(i);
+                    assert_eq!(arrow_column.data_type(), &arrow::datatypes::DataType::Utf8);
+                    let arr: &arrow::array::StringArray = arrow_column
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap();
+
+                    let column_data = Column::from(arr);
+
+                    let my_ct = segment::ColumnType::Tag(column_data);
+                    columns.insert(name, my_ct);
+                }
+                ColumnType::Field(name) => {}
+                ColumnType::Time(name) => {}
+            }
+        }
+
+        for (i, column) in rb.columns().iter().enumerate() {
+            match column.data_type() {
+                arrow::datatypes::DataType::Utf8 => {}
+                arrow::datatypes::DataType::Boolean => {}
+                arrow::datatypes::DataType::Int64 => {}
+                arrow::datatypes::DataType::UInt64 => {}
+                arrow::datatypes::DataType::Float64 => {}
+                arrow::datatypes::DataType::Binary => {}
+                _ => unreachable!("unsupported arrow types"),
+            }
+        }
+
+        let mut segment = Segment::new(rows as u32, columns);
+
+        Self::new(name, segment)
     }
 
     /// Add a new segment to this table.
@@ -503,6 +546,11 @@ impl MetaData {
         todo!()
     }
 }
+pub enum ColumnType {
+    Tag(String),
+    Field(String),
+    Time(String),
+}
 
 #[derive(Default)]
 pub struct ReadGroupResult<'a> {
@@ -521,7 +569,6 @@ pub struct ReadGroupResult<'a> {
     aggregates: Vec<Vec<AggregateResult<'a>>>,
 }
 
-use std::iter::Iterator;
 impl<'a> std::fmt::Display for ReadGroupResult<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // header line - display group columns first

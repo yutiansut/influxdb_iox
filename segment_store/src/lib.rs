@@ -5,7 +5,7 @@
 pub mod column;
 pub(crate) mod partition;
 pub(crate) mod segment;
-pub(crate) mod table;
+pub mod table;
 
 use std::collections::BTreeMap;
 
