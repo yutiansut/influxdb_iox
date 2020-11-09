@@ -417,10 +417,23 @@ impl Segment {
         }
 
         // ReadGroupResult {
+        //     groupby_columns: group_columns,
+        //     aggregate_columns: aggregates,
         //     group_keys: group_key_vec,
         //     aggregates: aggregate_vec,
         // }
         ReadGroupResult::default()
+    }
+}
+
+impl std::fmt::Display for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}", self.meta)?;
+        for (name, column) in &self.all_columns_by_name {
+            writeln!(f, "Column {}", name)?;
+            writeln!(f, "{}\n", column)?;
+        }
+        Ok(())
     }
 }
 
@@ -530,6 +543,16 @@ impl MetaData {
             // could contain the value.
             Operator::LTE => column_min <= value,
         }
+    }
+}
+
+impl std::fmt::Display for MetaData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(
+            f,
+            "Segment MetaData: size: {:?} rows: {:?} time range {:?}, ranges: {:?}",
+            self.size, self.rows, self.time_range, self.column_ranges,
+        )
     }
 }
 
