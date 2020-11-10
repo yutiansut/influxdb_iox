@@ -177,6 +177,7 @@ impl Segment {
         columns: &[ColumnName<'a>],
         row_ids: RowIDsOption,
     ) -> Vec<(ColumnName<'a>, Values)> {
+        println!("row ids to materialise are {:?}", &row_ids);
         let mut results = vec![];
         match row_ids {
             RowIDsOption::None(_) => results, // nothing to materialise
@@ -185,8 +186,10 @@ impl Segment {
                 // buffer to the croaring Bitmap API.
                 let row_ids = row_ids.to_vec();
                 for &col_name in columns {
+                    let now = std::time::Instant::now();
                     let col = self.column_by_name(col_name);
                     results.push((col_name, col.values(row_ids.as_slice())));
+                    println!("{} column materialising took {:?}", col_name, now.elapsed());
                 }
                 results
             }
@@ -228,11 +231,13 @@ impl Segment {
             .collect::<Vec<_>>();
         assert!(time_predicates.len() == 2);
 
+        let now = std::time::Instant::now();
         let time_row_ids = self.time_column().row_ids_filter_range(
             &time_predicates[0].1, // min time
             &time_predicates[1].1, // max time
             dst,
         );
+        println!("Time column row ids took {:?}", now.elapsed());
 
         // TODO(edd): potentially pass this in so we can re-use it once we
         // have materialised any results.
@@ -267,6 +272,7 @@ impl Segment {
             // that the buffer should be returned to the caller so it can be
             // re-used on other columns. To do that we need to hand the buffer
             // back even if we haven't populated it with any results.
+            let now = std::time::Instant::now();
             match col.row_ids_filter(op, value, dst) {
                 // No rows will be returned for the segment because this column
                 // doe not match any rows.
@@ -288,6 +294,7 @@ impl Segment {
                     dst = _dst; // hand buffer back
                 }
             }
+            println!("{} column row ids took {:?}", col_name, now.elapsed());
         }
 
         if result_row_ids.is_empty() {
