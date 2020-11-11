@@ -957,6 +957,7 @@ mod test {
     }
 
     #[test]
+<<<<<<< HEAD
     fn size() {
         let mut enc = RLE::default();
         enc.push_additional(Some("east".to_string()), 3);
@@ -981,6 +982,8 @@ mod test {
     }
 
     #[test]
+=======
+>>>>>>> abe85f1... feat: implement push on plain dict encoding
     #[should_panic]
     fn push_wrong_order() {
         let mut enc = RLE::default();
