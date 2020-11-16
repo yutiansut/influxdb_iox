@@ -7,14 +7,17 @@ use generated_types::wal as wb;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wal::{Entry as WalEntry, Result as WalResult};
 
-use data_types::TIME_COLUMN_NAME;
+use data_types::{
+    partition_metadata::{Column as ColumnStats, Table as TableStats},
+    TIME_COLUMN_NAME,
+};
 use storage::{
     predicate::{Predicate, TimestampRange},
     util::{visit_expression, AndExprBuilder, ExpressionVisitor},
 };
 
 use crate::dictionary::Dictionary;
-use crate::table::Table;
+use crate::{column::Column, table::Table};
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
@@ -345,6 +348,47 @@ impl Partition {
 
     /// Convert the table specified in this partition into an arrow record batch
     pub fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch> {
+        let table = self.table(table_name)?;
+
+        table
+            .to_arrow(&self, columns)
+            .context(NamedTableError { table_name })
+    }
+
+    /// Convert the table specified into arrow record batch and return partition metadata with
+    /// summary statistics.
+    pub fn partition_table_to_arrow_with_meta(
+        &self,
+        table_name: &str,
+    ) -> Result<(RecordBatch, TableStats)> {
+        let table = self.table(table_name)?;
+
+        let batch = table
+            .to_arrow(&self, &[])
+            .context(NamedTableError { table_name })?;
+
+        let columns = table
+            .columns
+            .iter()
+            .map(|c| match c {
+                Column::F64(_, stats) => ColumnStats::F64(stats.clone()),
+                Column::I64(_, stats) => ColumnStats::I64(stats.clone()),
+                Column::Bool(_, stats) => ColumnStats::Bool(stats.clone()),
+                Column::String(_, stats) | Column::Tag(_, stats) => {
+                    ColumnStats::String(stats.clone())
+                }
+            })
+            .collect();
+
+        let table_stats = TableStats {
+            name: table_name.to_string(),
+            columns,
+        };
+
+        Ok((batch, table_stats))
+    }
+
+    fn table(&self, table_name: &str) -> Result<&Table> {
         let table_id =
             self.dictionary
                 .lookup_value(table_name)
@@ -360,9 +404,8 @@ impl Partition {
                 table: table_id,
                 partition: &self.key,
             })?;
-        table
-            .to_arrow(&self, columns)
-            .context(NamedTableError { table_name })
+
+        Ok(table)
     }
 
     /// Translate a bunch of strings into a set of ids relative to this partition

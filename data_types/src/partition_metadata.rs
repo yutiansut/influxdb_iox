@@ -15,6 +15,15 @@ pub struct Partition {
     pub tables: Vec<Table>,
 }
 
+impl Partition {
+    pub fn new(key: String) -> Self {
+        Self{
+            key,
+            tables: vec![],
+        }
+    }
+}
+
 /// Metadata and statistics information for a table.
 #[derive(Debug, Deserialize, Serialize)]
 pub struct Table {

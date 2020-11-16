@@ -13,6 +13,7 @@ use crate::server::rpc::storage;
 use ::storage::exec::Executor as StorageExecutor;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
+use object_store::{self, ObjectStore};
 use write_buffer::{Db, WriteBufferDatabases};
 
 pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -32,6 +33,7 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     debug!("InfluxDB IOx Server using database directory: {:?}", db_dir);
 
     let storage = Arc::new(WriteBufferDatabases::new(&db_dir));
+    let object_storage = Arc::new(ObjectStore::new_file(object_store::File::new(&db_dir)));
     let dirs = storage.wal_dirs()?;
 
     // TODO: make recovery of multiple databases multi-threaded
@@ -39,6 +41,11 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = Db::restore_from_wal(dir).await?;
         storage.add_db(db).await;
     }
+
+    let app_server = Arc::new(http_routes::AppServer {
+        write_buffer: storage.clone(),
+        object_store: object_storage.clone(),
+    });
 
     // Fire up the query executor
     let executor = Arc::new(StorageExecutor::default());
@@ -72,10 +79,10 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
 
     let make_svc = make_service_fn(move |_conn| {
-        let storage = storage.clone();
+        let app_server = app_server.clone();
         async move {
             Ok::<_, http::Error>(service_fn(move |req| {
-                let state = storage.clone();
+                let state = app_server.clone();
                 http_routes::service(req, state)
             }))
         }
