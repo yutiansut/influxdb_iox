@@ -202,6 +202,21 @@ pub enum Error {
 
     #[snafu(display("replicated write from writer {} missing payload", writer))]
     MissingPayload { writer: u32 },
+
+    #[snafu(display("partition {} not found", partition_key))]
+    PartitionNotFound { partition_key: String },
+
+    #[snafu(display(
+        "error converting partition table to arrow on partition {} with table {}: {}",
+        partition_key,
+        table_name,
+        source
+    ))]
+    PartitionTableToArrowError {
+        partition_key: String,
+        table_name: String,
+        source: crate::partition::Error,
+    },
 }
 
 impl From<crate::table::Error> for Error {
@@ -498,6 +513,57 @@ impl Database for Db {
             .collect::<Result<Vec<_>, crate::partition::Error>>()?;
 
         Ok(batches)
+    }
+
+    async fn partition_table_to_arrow_with_meta(
+        &self,
+        table_name: &str,
+        partition_key: &str,
+    ) -> Result<(RecordBatch, data_types::partition_metadata::Table), Self::Error> {
+        let partitions = self.partitions.read().await;
+        let partition = partitions
+            .iter()
+            .find(|p| p.key == partition_key)
+            .context(PartitionNotFound { partition_key })?;
+
+        let result = partition
+            .partition_table_to_arrow_with_meta(table_name)
+            .context(PartitionTableToArrowError {
+                partition_key,
+                table_name,
+            })?;
+
+        Ok(result)
+    }
+
+    /// Return the partition keys for data in this DB
+    async fn partition_keys(&self) -> Result<Vec<String>, Self::Error> {
+        let partitions = self.partitions.read().await;
+        let keys = partitions.iter().map(|p| p.key.clone()).collect();
+
+        Ok(keys)
+    }
+
+    /// Return the table names that are in a given partition key
+    async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error> {
+        let partitions = self.partitions.read().await;
+        let partition = partitions
+            .iter()
+            .find(|p| p.key == partition_key)
+            .context(PartitionNotFound { partition_key })?;
+
+        let mut tables = Vec::with_capacity(partition.tables.len());
+
+        for (id, _) in &partition.tables {
+            let name = partition
+                .dictionary
+                .lookup_id(*id)
+                .context(TableIdNotFoundInDictionary {table: *id, partition: &partition.key})?;
+
+            tables.push(name.to_string());
+        }
+
+        Ok(tables)
     }
 
     async fn query(&self, query: &str) -> Result<Vec<RecordBatch>, Self::Error> {

@@ -112,6 +112,19 @@ pub trait Database: Debug + Send + Sync {
         table_name: &str,
         columns: &[&str],
     ) -> Result<Vec<RecordBatch>, Self::Error>;
+
+    /// Return the partition metadata with the arrow data
+    async fn partition_table_to_arrow_with_meta(
+        &self,
+        table_name: &str,
+        partition_key: &str,
+    ) -> Result<(RecordBatch, data_types::partition_metadata::Table), Self::Error>;
+
+    /// Return the partition keys for data in this DB
+    async fn partition_keys(&self) -> Result<Vec<String>, Self::Error>;
+
+    /// Return the table names that are in a given partition key
+    async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error>;
 }
 
 #[async_trait]

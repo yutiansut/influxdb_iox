@@ -17,7 +17,9 @@ use tracing::{debug, error, info};
 
 use arrow_deps::arrow;
 use influxdb_line_protocol::parse_lines;
+use object_store;
 use storage::{org_and_bucket_to_database, Database, DatabaseStore};
+use data_types::partition_metadata::Partition;
 
 use bytes::{Bytes, BytesMut};
 use futures::{self, StreamExt};
@@ -26,6 +28,10 @@ use serde::Deserialize;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::str;
 use std::sync::Arc;
+use std::io::{Write, Seek, SeekFrom, Cursor};
+use arrow_deps::parquet::file::writer::{TryClone, SerializedFileWriter};
+use arrow_deps::parquet::file::properties::WriterProperties;
+use arrow_deps::parquet::arrow::ArrowWriter;
 
 #[derive(Debug, Snafu)]
 pub enum ApplicationError {
@@ -119,6 +125,19 @@ pub enum ApplicationError {
 
     #[snafu(display("Internal error creating gzip decoder: {:?}", source))]
     CreatingGzipDecoder { source: std::io::Error },
+
+    #[snafu(display(
+        "Internal error from database {}:  {}",
+        database,
+        source
+    ))]
+    DatabaseError {
+        database: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Error generating json response: {}", source))]
+    JsonGenerationError{ source: serde_json::Error },
 }
 
 impl ApplicationError {
@@ -141,6 +160,8 @@ impl ApplicationError {
             Self::ReadingBodyAsGzip { .. } => StatusCode::BAD_REQUEST,
             Self::RouteNotFound { .. } => StatusCode::NOT_FOUND,
             Self::CreatingGzipDecoder { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::DatabaseError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::JsonGenerationError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
 }
@@ -209,7 +230,7 @@ async fn parse_body(req: hyper::Request<Body>) -> Result<Bytes, ApplicationError
 #[tracing::instrument(level = "debug")]
 async fn write<T: DatabaseStore>(
     req: hyper::Request<Body>,
-    storage: Arc<T>,
+    server: Arc<AppServer<T>>,
 ) -> Result<Option<Body>, ApplicationError> {
     let query = req.uri().query().context(ExpectedQueryString)?;
 
@@ -219,7 +240,8 @@ async fn write<T: DatabaseStore>(
 
     let db_name = org_and_bucket_to_database(&write_info.org, &write_info.bucket);
 
-    let db = storage
+    let db = server
+        .write_buffer
         .db_or_create(&db_name)
         .await
         .map_err(|e| Box::new(e) as _)
@@ -269,7 +291,7 @@ struct ReadInfo {
 #[tracing::instrument(level = "debug")]
 async fn read<T: DatabaseStore>(
     req: hyper::Request<Body>,
-    storage: Arc<T>,
+    server: Arc<AppServer<T>>,
 ) -> Result<Option<Body>, ApplicationError> {
     let query = req.uri().query().context(ExpectedQueryString {})?;
 
@@ -279,10 +301,14 @@ async fn read<T: DatabaseStore>(
 
     let db_name = org_and_bucket_to_database(&read_info.org, &read_info.bucket);
 
-    let db = storage.db(&db_name).await.context(BucketNotFound {
-        org: read_info.org.clone(),
-        bucket: read_info.bucket.clone(),
-    })?;
+    let db = server
+        .write_buffer
+        .db(&db_name)
+        .await
+        .context(BucketNotFound {
+            org: read_info.org.clone(),
+            bucket: read_info.bucket.clone(),
+        })?;
 
     let results = db
         .query(&read_info.sql_query)
@@ -306,22 +332,187 @@ fn no_op(name: &str) -> Result<Option<Body>, ApplicationError> {
     Ok(None)
 }
 
+#[derive(Debug)]
+pub struct AppServer<T> {
+    pub write_buffer: Arc<T>,
+    pub object_store: Arc<object_store::ObjectStore>,
+}
+
+#[derive(Deserialize, Debug)]
+/// Arguments in the query string of the request to /partitions
+struct DatabaseInfo {
+    org: String,
+    bucket: String,
+}
+
+#[tracing::instrument(level = "debug")]
+async fn list_partitions<T: DatabaseStore>(
+    req: hyper::Request<Body>,
+    app_server: Arc<AppServer<T>>,
+) -> Result<Option<Body>, ApplicationError> {
+    let query = req.uri().query().context(ExpectedQueryString {})?;
+
+    let info: DatabaseInfo = serde_urlencoded::from_str(query).context(InvalidQueryString {
+        query_string: query,
+    })?;
+
+    let db_name = org_and_bucket_to_database(&info.org, &info.bucket);
+
+    let db = app_server
+        .write_buffer
+        .db(&db_name)
+        .await
+        .context(BucketNotFound {
+            org: &info.org,
+            bucket: &info.bucket,
+        })?;
+
+    let partition_keys = db
+        .partition_keys()
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(DatabaseError{database: &db_name})?;
+
+    let result = serde_json::to_string(&partition_keys).context(JsonGenerationError)?;
+
+    Ok(Some(result.into_bytes().into()))
+}
+
+#[derive(Deserialize, Debug)]
+/// Arguments in the query string of the request to /snapshot
+struct SnapshotInfo {
+    org: String,
+    bucket: String,
+    partition: String,
+}
+
+#[tracing::instrument(level = "debug")]
+async fn snapshot_partition<T: DatabaseStore>(
+    req: hyper::Request<Body>,
+    server: Arc<AppServer<T>>,
+) -> Result<Option<Body>, ApplicationError> {
+    let query = req.uri().query().context(ExpectedQueryString {})?;
+
+    let snapshot: SnapshotInfo = serde_urlencoded::from_str(query).context(InvalidQueryString {
+        query_string: query,
+    })?;
+
+    let db_name = org_and_bucket_to_database(&snapshot.org, &snapshot.bucket);
+
+    let db = server
+        .write_buffer
+        .db(&db_name)
+        .await
+        .context(BucketNotFound {
+            org: &snapshot.org,
+            bucket: &snapshot.bucket,
+        })?;
+
+    // TODO: refactor this to happen in the background. Move this logic to the
+    //       cluster (soon to be called server) package
+    let tables = db
+        .table_names_for_partition(&snapshot.partition)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(DatabaseError{database: &db_name})?;
+
+    let mut partition_meta = Partition::new(snapshot.partition.clone());
+
+    for table in tables {
+        let (batch, meta) = db
+            .partition_table_to_arrow_with_meta(&table, &snapshot.partition)
+            .await
+            .map_err(|e| Box::new(e) as _)
+            .context(DatabaseError{database: &db_name})?;
+
+
+        partition_meta.tables.push(meta);
+
+        // let props = Rc::new(WriterProperties::builder().build());
+        let mem_writer = Arc::new(MemWriter::default());
+        let file = SerializedFileWriter::new(mem_writer.clone(), schema, props).unwrap();
+        let mut writer = ArrowWriter::try_new(&file, batch.schema().clone(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        let table_path = format!("{}/data/{}/{}.parquet", db_name, &snapshot.partition, &table);
+        let data = mem_writer.data();
+        let len = data.len();
+        let data = Bytes::from(data);
+        let stream_data = std::io::Result::Ok(data);
+        server
+            .object_store
+            .put(
+                &table_path,
+                futures::stream::once(async move { stream_data }),
+                len)
+            .await
+            .unwrap();
+    }
+
+    let meta_data_path = format!("{}/meta/{}.json", db_name, &snapshot.partition);
+    let json_data = serde_json::to_vec(&partition_meta).context(JsonGenerationError)?;
+    let data = Bytes::from(json_data.clone());
+    let len = data.len();
+    let stream_data = std::io::Result::Ok(data);
+    server.object_store
+        .put(
+            &meta_data_path,
+            futures::stream::once(async move { stream_data }),
+            len,
+        )
+        .await
+        .unwrap();
+
+    Ok(Some(json_data.into()))
+}
+
+#[derive(Debug, Default)]
+struct MemWriter {
+    mem: Arc<Cursor<Vec<u8>>>,
+}
+
+impl Write for MemWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.mem.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.mem.flush()
+    }
+}
+
+impl Seek for MemWriter {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.mem.seek(pos)
+    }
+}
+
+impl TryClone for MemWriter {
+    fn try_clone(&self) -> std::io::Result<Self> {
+        use std::io::{Error, ErrorKind};
+        Err(Error::new(ErrorKind::Other, "Clone not supported"))
+    }
+}
+
 pub async fn service<T: DatabaseStore>(
     req: hyper::Request<Body>,
-    storage: Arc<T>,
+    server: Arc<AppServer<T>>,
 ) -> http::Result<hyper::Response<Body>> {
     let method = req.method().clone();
     let uri = req.uri().clone();
 
     let response = match (req.method(), req.uri().path()) {
-        (&Method::POST, "/api/v2/write") => write(req, storage).await,
+        (&Method::POST, "/api/v2/write") => write(req, server).await,
         (&Method::POST, "/api/v2/buckets") => no_op("create bucket"),
         (&Method::GET, "/ping") => ping(req).await,
-        (&Method::GET, "/api/v2/read") => read(req, storage).await,
+        (&Method::GET, "/api/v2/read") => read(req, server).await,
         _ => Err(ApplicationError::RouteNotFound {
             method: method.clone(),
             path: uri.to_string(),
         }),
+        // TODO: implement routing to change this API
+        (&Method::GET, "/api/v1/partitions") => list_partitions(req, server).await,
+        (&Method::GET, "/api/v1/snapshot") => snapshot_partition(req, server).await,
     };
 
     let result = match response {
@@ -357,13 +548,17 @@ mod tests {
     use hyper::Server;
 
     use storage::{test::TestDatabaseStore, DatabaseStore};
+    use object_store::{ObjectStore, InMemory};
 
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
     type Result<T, E = Error> = std::result::Result<T, E>;
 
     #[tokio::test]
     async fn test_ping() -> Result<()> {
-        let test_storage = Arc::new(TestDatabaseStore::new());
+        let test_storage = Arc::new(AppServer{
+            write_buffer: Arc::new(TestDatabaseStore::new()),
+            object_store: Arc::new(ObjectStore::new_in_memory(InMemory::new())),
+        });
         let server_url = test_server(test_storage.clone());
 
         let client = Client::new();
@@ -376,7 +571,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_write() -> Result<()> {
-        let test_storage = Arc::new(TestDatabaseStore::new());
+        let test_storage = Arc::new(AppServer{
+            write_buffer: Arc::new(TestDatabaseStore::new()),
+            object_store: Arc::new(ObjectStore::new_in_memory(InMemory::new())),
+        });
         let server_url = test_server(test_storage.clone());
 
         let client = Client::new();
@@ -399,6 +597,7 @@ mod tests {
 
         // Check that the data got into the right bucket
         let test_db = test_storage
+            .write_buffer
             .db("MyOrg_MyBucket")
             .await
             .expect("Database exists");
@@ -422,7 +621,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_gzip_write() -> Result<()> {
-        let test_storage = Arc::new(TestDatabaseStore::new());
+        let test_storage = Arc::new(AppServer{
+            write_buffer: Arc::new(TestDatabaseStore::new()),
+            object_store: Arc::new(ObjectStore::new_in_memory(InMemory::new())),
+        });
         let server_url = test_server(test_storage.clone());
 
         let client = Client::new();
@@ -445,6 +647,7 @@ mod tests {
 
         // Check that the data got into the right bucket
         let test_db = test_storage
+            .write_buffer
             .db("MyOrg_MyBucket")
             .await
             .expect("Database exists");
@@ -481,13 +684,13 @@ mod tests {
 
     /// creates an instance of the http service backed by a in-memory
     /// testable database.  Returns the url of the server
-    fn test_server(storage: Arc<TestDatabaseStore>) -> String {
+    fn test_server(server: Arc<AppServer<TestDatabaseStore>>) -> String {
         let make_svc = make_service_fn(move |_conn| {
-            let storage = storage.clone();
+            let server = server.clone();
             async move {
                 Ok::<_, http::Error>(service_fn(move |req| {
-                    let state = storage.clone();
-                    super::service(req, state)
+                    let server = server.clone();
+                    super::service(req, server)
                 }))
             }
         });

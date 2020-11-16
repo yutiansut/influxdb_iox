@@ -410,6 +410,25 @@ impl Database for TestDatabase {
     ) -> Result<Vec<RecordBatch>, Self::Error> {
         unimplemented!("table_to_arrow Not yet implemented for test database");
     }
+
+    /// Return the partition metadata with the arrow data
+    async fn partition_table_to_arrow_with_meta(
+        &self,
+        table_name: &str,
+        partition_key: &str,
+    ) -> Result<(RecordBatch, data_types::partition_metadata::Table), Self::Error> {
+        unimplemented!("partition_table_to_arrow_with_meta not yet implemented for test database");
+    }
+
+    /// Return the partition keys for data in this DB
+    async fn partition_keys(&self) -> Result<Vec<String>, Self::Error> {
+        unimplemented!("partition_keys not yet implemented for test database");
+    }
+
+    /// Return the table names that are in a given partition key
+    async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error> {
+        unimplemented!("table_names_for_partitino not yet implemented for test database");
+    }
 }
 
 #[derive(Debug)]
