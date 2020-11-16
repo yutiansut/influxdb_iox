@@ -429,6 +429,7 @@ impl Segment {
         //     group_keys: group_key_vec,
         //     aggregates: aggregate_vec,
         // }
+        println!("group keys {}", group_key_vec.len());
         ReadGroupResult::default()
     }
 }

@@ -16,8 +16,8 @@ use arrow_deps::{
 use packers::{sorter, Packer, Packers};
 
 use segment_store::column::cmp::Operator;
-use segment_store::column::{Scalar, Value};
-use segment_store::{table, table::ColumnType};
+use segment_store::column::{AggregateType, Scalar, Value, Values};
+use segment_store::{segment, table, table::ColumnType, table::ReadGroupResult};
 
 const ONE_MS: i64 = 1_000_000;
 const ONE_HOUR: i64 = ONE_MS * 3_600_000;
@@ -25,7 +25,7 @@ const START_TIME: i64 = 1604188800000000000_i64;
 
 // determines how many rows will be in a single segment, which is set to one
 // hour.
-const ROWS_PER_HOUR: usize = 100_000_000;
+const ROWS_PER_HOUR: usize = 1_000_000;
 
 // minimum and maximum number of spans in a trace
 const SPANS_MIN: usize = 10;
@@ -52,11 +52,11 @@ fn main() {
 
     // uncomment this to generate a record batch.
     let (rb, sample_trace_id) = generate_record_batch(&mut rng);
-    println!("Saving Arrow file");
-    save_record_batch(&rb[0]);
+    // println!("Saving Arrow file");
+    // save_record_batch(&rb[0]);
 
     // uncomment this to load record batch from file.
-    // let sample_trace_id = "g6oHreN9".to_string();
+    // let sample_trace_id = "zzzzm6FK".to_string();
     // let rb = load_record_batch();
 
     let now = Instant::now();
@@ -65,34 +65,59 @@ fn main() {
     println!("Segment size is {:?} bytes", table.size());
 
     // loop {
-    for _ in 0..100 {
-        let now = Instant::now();
-        let results = table.select(
-            &[
-                "env",
-                "data_centre",
-                "cluster",
-                "user_id",
-                "request_id",
-                "trace_id",
-                "node_id",
-                "pod_id",
-                "span_id",
-                "duration",
-                "time",
-            ],
-            &[
-                (
-                    "trace_id",
-                    (Operator::Equal, Value::String(sample_trace_id.as_str())),
-                ),
-                ("time", (Operator::GTE, Value::Scalar(Scalar::I64(0)))),
-                ("time", (Operator::LT, Value::Scalar(Scalar::I64(i64::MAX)))),
-            ],
-        );
-        println!("executed select in {:?}", now.elapsed());
+    for _ in 0..100000 {
+        // execute_select(&table, sample_trace_id.as_str());
+        execute_read_group(&table);
+
         // println!("{:?}", results);
     }
+}
+
+fn execute_select<'a>(table: &table::Table, sample_trace_id: &str) -> Vec<(&'a str, Vec<Values>)> {
+    let now = Instant::now();
+
+    let res = table.select(
+        &[
+            "env",
+            "data_centre",
+            "cluster",
+            "user_id",
+            "request_id",
+            "trace_id",
+            "node_id",
+            "pod_id",
+            "span_id",
+            "duration",
+            "time",
+        ],
+        &[
+            (
+                "trace_id",
+                (Operator::Equal, Value::String(sample_trace_id)),
+            ),
+            ("time", (Operator::GTE, Value::Scalar(Scalar::I64(0)))),
+            ("time", (Operator::LT, Value::Scalar(Scalar::I64(i64::MAX)))),
+        ],
+    );
+
+    println!("executed select in {:?}", now.elapsed());
+    res
+}
+
+fn execute_read_group(table: &'_ table::Table) -> table::ReadGroupResult<'_> {
+    let now = Instant::now();
+
+    let res = table.aggregate(
+        &[
+            ("time", (Operator::GTE, Value::Scalar(Scalar::I64(0)))),
+            ("time", (Operator::LT, Value::Scalar(Scalar::I64(i64::MAX)))),
+        ],
+        vec!["trace_id"],
+        vec![("duration", AggregateType::Sum)],
+    );
+
+    println!("executed read group in {:?}", now.elapsed());
+    res
 }
 
 // generates a record batch of test data and rather spuriously returns a sample
@@ -454,7 +479,7 @@ fn save_record_batch(rb: &RecordBatch) {
 
 fn load_record_batch() -> Vec<RecordBatch> {
     let now = std::time::Instant::now();
-    let file = File::open("/Users/edd/tracing_100m.arrow").unwrap();
+    let file = File::open("/Users/edd/tracing_100m-zzzzm6FK.arrow").unwrap();
     let reader = reader::StreamReader::try_new(file).unwrap();
     let rbs = reader.map(|r| r.unwrap()).collect::<Vec<_>>();
     println!("Loading record batches from arrow took {:?}", now.elapsed());
