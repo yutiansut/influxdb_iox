@@ -455,7 +455,6 @@ fn skip_until<R: BufRead + ?Sized>(r: &mut R, delim: u8) -> std::io::Result<usiz
 mod tests {
     use super::*;
     use rand::Rng;
-    use std::os::unix::fs::FileExt;
     use tempdir::TempDir;
 
     fn rand_vec(n: usize) -> Vec<u8> {
@@ -511,7 +510,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn wal_iter() {
+        use std::os::unix::fs::FileExt;
+
         let temp_dir = TempDir::new("wal").unwrap();
         let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
 
