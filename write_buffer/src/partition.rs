@@ -5,7 +5,7 @@ use arrow_deps::{
 };
 use generated_types::wal as wb;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use wal::{Entry as WalEntry, Result as WalResult};
+use wal::Result as WalResult;
 
 use data_types::TIME_COLUMN_NAME;
 use storage::{
@@ -427,17 +427,16 @@ pub struct RestorationStats {
 
 /// Given a set of WAL entries, restore them into a set of Partitions.
 pub fn restore_partitions_from_wal(
-    wal_entries: impl Iterator<Item = WalResult<WalEntry>>,
+    wal_entries: impl Iterator<Item = WalResult<Vec<u8>>>,
 ) -> Result<(Vec<Partition>, RestorationStats)> {
     let mut stats = RestorationStats::default();
 
     let mut partitions = BTreeMap::new();
 
-    for wal_entry in wal_entries {
-        let wal_entry = wal_entry.context(WalEntryRead)?;
-        let bytes = wal_entry.as_data();
+    for payload in wal_entries {
+        let payload = payload.context(WalEntryRead)?;
 
-        let batch = flatbuffers::get_root::<wb::WriteBufferBatch<'_>>(&bytes);
+        let batch = flatbuffers::get_root::<wb::WriteBufferBatch<'_>>(&payload);
 
         if let Some(entries) = batch.entries() {
             for entry in entries {

@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use influxdb_line_protocol as line_parser;
 use storage::Database;
-use wal::{Entry, WalBuilder};
+use wal::WalReader;
 use write_buffer::{restore_partitions_from_wal, Db};
 
 type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -31,7 +31,7 @@ fn benchmark_restore_single_entry_single_partition(common_create_entries: &mut C
 }
 
 #[tokio::main]
-async fn generate_single_entry_single_partition() -> Result<(Vec<Entry>, usize)> {
+async fn generate_single_entry_single_partition() -> Result<(Vec<Vec<u8>>, usize)> {
     common_create_entries(|add_entry| {
         add_entry(create_line_protocol(1000, DAY_1_NS));
     })
@@ -57,7 +57,7 @@ fn benchmark_restore_multiple_entry_multiple_partition(common_create_entries: &m
 }
 
 #[tokio::main]
-async fn generate_multiple_entry_multiple_partition() -> Result<(Vec<Entry>, usize)> {
+async fn generate_multiple_entry_multiple_partition() -> Result<(Vec<Vec<u8>>, usize)> {
     common_create_entries(|add_entry| {
         for &day_ns in DAYS_NS {
             for _ in 0..4 {
@@ -70,7 +70,7 @@ async fn generate_multiple_entry_multiple_partition() -> Result<(Vec<Entry>, usi
 
 async fn common_create_entries(
     mut f: impl FnMut(&mut dyn FnMut(String)),
-) -> Result<(Vec<Entry>, usize)> {
+) -> Result<(Vec<Vec<u8>>, usize)> {
     let tmp_dir = test_helpers::tmp_dir()?;
     let mut wal_dir = tmp_dir.as_ref().to_owned();
     let db = Db::try_with_wal("mydb", &mut wal_dir).await?;
@@ -85,8 +85,9 @@ async fn common_create_entries(
         total_lines += lines.len();
     }
 
-    let wal_builder = WalBuilder::new(wal_dir);
-    let entries = wal_builder.entries()?.collect::<Result<_, _>>()?;
+    let entries = WalReader::new(wal_dir)
+        .read_entire_wal()?
+        .collect::<Result<_, _>>()?;
 
     Ok((entries, total_lines))
 }

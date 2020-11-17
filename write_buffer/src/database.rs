@@ -8,10 +8,7 @@ use storage::{
     predicate::Predicate,
     Database,
 };
-use wal::{
-    writer::{start_wal_sync_task, Error as WalWriterError, WalDetails},
-    WalBuilder,
-};
+use wal::{Error as WalError, Wal, WalReader};
 
 use crate::column::Column;
 use crate::partition::Partition;
@@ -56,22 +53,13 @@ pub enum Error {
     OpenDb { dir: PathBuf },
 
     #[snafu(display("Error opening WAL for database {}: {}", database, source))]
-    OpeningWal {
-        database: String,
-        source: WalWriterError,
-    },
+    OpeningWal { database: String, source: WalError },
 
     #[snafu(display("Error writing to WAL for database {}: {}", database, source))]
-    WritingWal {
-        database: String,
-        source: WalWriterError,
-    },
+    WritingWal { database: String, source: WalError },
 
     #[snafu(display("Error opening WAL for database {}: {}", database, source))]
-    LoadingWal {
-        database: String,
-        source: wal::Error,
-    },
+    LoadingWal { database: String, source: WalError },
 
     #[snafu(display("Error recovering WAL for database {}: {}", database, source))]
     WalRecoverError {
@@ -229,7 +217,7 @@ pub struct Db {
     pub name: String,
     // TODO: partitions need to be wrapped in an Arc if they're going to be used without this lock
     partitions: RwLock<Vec<Partition>>,
-    wal_details: Option<WalDetails>,
+    wal: Option<Wal>,
 }
 
 impl Db {
@@ -258,18 +246,15 @@ impl Db {
                 }
             }
         }
-        let wal_builder = WalBuilder::new(wal_dir.clone());
-        let wal_details = start_wal_sync_task(wal_builder)
-            .await
-            .context(OpeningWal { database: &name })?;
-        wal_details
-            .write_metadata()
+
+        let wal = Wal::new(wal_dir.clone(), None).context(OpeningWal { database: &name })?;
+        wal.write_metadata()
             .await
             .context(OpeningWal { database: &name })?;
 
         Ok(Self {
             name,
-            wal_details: Some(wal_details),
+            wal: Some(wal),
             ..Default::default()
         })
     }
@@ -286,14 +271,11 @@ impl Db {
             .with_context(|| OpenDb { dir: &wal_dir })?
             .to_string();
 
-        let wal_builder = WalBuilder::new(wal_dir);
-        let wal_details = start_wal_sync_task(wal_builder.clone())
-            .await
-            .context(OpeningWal { database: &name })?;
+        let wal = Wal::new(wal_dir.to_path_buf(), None).context(OpeningWal { database: &name })?;
 
         // TODO: check wal metadata format
-        let entries = wal_builder
-            .entries()
+        let entries = WalReader::new(wal_dir.to_path_buf())
+            .read_entire_wal()
             .context(LoadingWal { database: &name })?;
 
         let (partitions, stats) =
@@ -313,7 +295,7 @@ impl Db {
         Ok(Self {
             name,
             partitions: RwLock::new(partitions),
-            wal_details: Some(wal_details),
+            wal: Some(wal),
         })
     }
 
@@ -353,8 +335,8 @@ impl Database for Db {
 
         self.write_entries_to_partitions(&batch).await?;
 
-        if let Some(wal) = &self.wal_details {
-            wal.write_and_sync(data).await.context(WritingWal {
+        if let Some(wal) = &self.wal {
+            wal.append(&data).context(WritingWal {
                 database: &self.name,
             })?;
         }
@@ -373,14 +355,10 @@ impl Database for Db {
             }
         };
 
-        if let Some(wal) = &self.wal_details {
-            // TODO(paul): refactor this so we're not cloning. Although replicated writes shouldn't
-            //  be using a WAL and how the WAL is used at all is likely to have a larger refactor soon.
-            wal.write_and_sync(write.data.clone())
-                .await
-                .context(WritingWal {
-                    database: &self.name,
-                })?;
+        if let Some(wal) = &self.wal {
+            wal.append(&write.data).context(WritingWal {
+                database: &self.name,
+            })?;
         }
 
         Ok(())
@@ -1112,6 +1090,7 @@ mod tests {
     use influxdb_line_protocol::parse_lines;
     use test_helpers::str_pair_vec_to_vec;
     use tokio::sync::mpsc;
+    use wal::WalReader;
 
     type TestError = Box<dyn std::error::Error + Send + Sync + 'static>;
     type Result<T = (), E = TestError> = std::result::Result<T, E>;
@@ -1433,10 +1412,12 @@ mod tests {
         {
             let name = dir.iter().last().unwrap().to_str().unwrap().to_string();
 
-            let wal_builder = WalBuilder::new(&dir);
+            let wal = Wal::new(dir.clone(), None).context(OpeningWal {
+                database: name.clone(),
+            })?;
 
-            let wal_entries = wal_builder
-                .entries()
+            let wal_entries = WalReader::new(dir.clone())
+                .read_entire_wal()
                 .context(LoadingWal { database: &name })?;
 
             // Skip the first 2 entries in the wal; only restore from the last 2
@@ -1447,7 +1428,7 @@ mod tests {
             let db = Db {
                 name,
                 partitions: RwLock::new(partitions),
-                wal_details: None,
+                wal: Some(wal),
             };
 
             // some cpu

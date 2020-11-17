@@ -6,738 +6,543 @@
     clippy::use_self
 )]
 
-//! # wal
-//!
-//! This crate provides a WAL tailored for InfluxDB IOx `Partition`s
-//!
-//! Work remaining:
-//!
-//! - More testing for correctness; the existing tests mostly demonstrate possible usages.
-//! - Error handling
-
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use crc32fast::Hasher;
+use crate::payload::{Header, Payload};
+use crossbeam_epoch::{self as epoch, Atomic, Owned};
 use once_cell::sync::Lazy;
 use regex::Regex;
-use snafu::{ensure, ResultExt, Snafu};
+use serde::{Deserialize, Serialize};
+use snafu::{ResultExt, Snafu};
+use std::ffi::OsStr;
 use std::{
-    convert::TryFrom,
-    ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
-    iter, mem, num,
-    path::{Path, PathBuf},
+    io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom},
+    os::unix::io::AsRawFd,
+    path::PathBuf,
+    sync::atomic::{AtomicU16, AtomicU64, Ordering::*},
 };
 
-/// WAL Writer and related utilties
-pub mod writer;
+pub mod payload;
+
+const U48_MAX: u64 = (1 << 48) - 1;
+const U47_MAX: u64 = (1 << 47) - 1;
+static WAL_FILENAME_PATTERN: Lazy<Regex> = Lazy::new(|| {
+    let pattern = format!(r"^{}([0-9a-f]{{8}})$", Wal::FILE_PREFIX);
+    Regex::new(&pattern).expect("Hardcoded regex should be valid")
+});
+
+/// A specialized `Result` for WAL-related errors
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Opaque public `Error` type
 #[derive(Debug, Snafu)]
 pub struct Error(InternalError);
 
-/// SequenceNumber is a u64 monotonically increasing number for each WAL entry
-pub type SequenceNumber = u64;
-
 #[derive(Debug, Snafu)]
 enum InternalError {
-    UnableToReadFileMetadata {
-        source: io::Error,
+    PayloadError {
+        source: crate::payload::PayloadError,
     },
 
-    UnableToReadSequenceNumber {
-        source: io::Error,
-    },
-
-    UnableToReadChecksum {
-        source: io::Error,
-    },
-
-    UnableToReadLength {
-        source: io::Error,
-    },
-
-    UnableToReadData {
-        source: io::Error,
-    },
-
-    LengthMismatch {
-        expected: usize,
-        actual: usize,
-    },
-
-    ChecksumMismatch {
-        expected: u32,
-        actual: u32,
-    },
-
-    ChunkSizeTooLarge {
-        source: num::TryFromIntError,
-        actual: usize,
-    },
-
-    UnableToWriteSequenceNumber {
-        source: io::Error,
-    },
-
-    UnableToWriteChecksum {
-        source: io::Error,
-    },
-
-    UnableToWriteLength {
-        source: io::Error,
-    },
-
-    UnableToWriteData {
-        source: io::Error,
-    },
-
-    UnableToCompressData {
-        source: snap::Error,
-    },
-
-    UnableToDecompressData {
-        source: snap::Error,
-    },
-
-    UnableToSync {
-        source: io::Error,
-    },
-
-    UnableToOpenFile {
-        source: io::Error,
+    UnableToWritePayload {
+        source: std::io::Error,
         path: PathBuf,
     },
 
-    UnableToCreateFile {
-        source: io::Error,
+    UnableToCreateWal {
+        source: std::io::Error,
         path: PathBuf,
     },
 
-    UnableToCopyFileContents {
-        source: io::Error,
-        src: PathBuf,
-        dst: PathBuf,
+    UnableToOpenWal {
+        source: std::io::Error,
+        path: PathBuf,
     },
 
-    UnableToReadDirectoryContents {
-        source: io::Error,
+    UnableToReadWalDirectory {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    UnableToReadWal {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Error serializing metadata: {}", source))]
+    SerializeMetadata {
+        source: serde_json::error::Error,
+    },
+
+    #[snafu(display("Error writing metadata to '{:?}': {}", metadata_path, source))]
+    WritingMetadata {
+        source: std::io::Error,
+        metadata_path: PathBuf,
+    },
+
+    EntireWalIsEmpty {
         path: PathBuf,
     },
 }
 
-/// A specialized `Result` for WAL-related errors
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-
-/// Build a Wal rooted at a directory.
-///
-/// May take more configuration options in the future.
-#[derive(Debug, Clone)]
-pub struct WalBuilder {
-    root: PathBuf,
-    file_rollover_size: u64,
+/// SequenceNumber is a u64 monotonically increasing number for each WAL entry.
+/// Most significant 16 bits are the WAL file id.
+/// Lest significant 48 bits are the offset within the WAL file.
+#[derive(Copy, Clone, Debug)]
+pub struct SequenceNumber {
+    wal_id: u16,
+    offset: u64,
 }
 
-impl WalBuilder {
-    /// The default size to create new WAL files at. Currently 10MiB.
-    ///
-    /// See [WalBuilder::file_rollover_size]
-    pub const DEFAULT_FILE_ROLLOVER_SIZE_BYTES: u64 = 10 * 1024 * 1024;
+impl SequenceNumber {
+    pub fn new(wal_id: u16, offset: u64) -> Self {
+        Self { wal_id, offset }
+    }
 
-    /// Create a new WAL rooted at the provided directory on disk.
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        // TODO: Error if `root` is not a directory?
-        let root = root.into();
+    pub fn as_u64(&self) -> u64 {
+        let shifted = (self.wal_id as u64) << 48;
+        shifted | self.offset.min(U48_MAX)
+    }
+}
+
+/// Metadata about this particular WAL
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub struct WalMetadata {
+    pub format: WalFormat,
+}
+
+impl Default for WalMetadata {
+    fn default() -> Self {
         Self {
-            root,
-            file_rollover_size: Self::DEFAULT_FILE_ROLLOVER_SIZE_BYTES,
-        }
-    }
-
-    /// Set the size (in bytes) of each WAL file that should prompt a file rollover when it is
-    /// exceeded.
-    ///
-    /// File rollover happens per sync batch. If the file is underneath this file size limit at the
-    /// start of a sync operation, the entire sync batch will be written to that file even if
-    /// some of the entries in the batch cause the file to exceed the file size limit.
-    ///
-    /// See [WalBuilder::DEFAULT_FILE_ROLLOVER_SIZE_BYTES]
-    pub fn file_rollover_size(mut self, file_rollover_size: u64) -> Self {
-        self.file_rollover_size = file_rollover_size;
-        self
-    }
-
-    /// Consume the builder and create a `Wal`.
-    ///
-    /// # Asynchronous considerations
-    ///
-    /// This method performs blocking IO and care should be taken when using
-    /// it in an asynchronous context.
-    pub fn wal(self) -> Result<Wal> {
-        let rollover_size = self.file_rollover_size;
-        Wal::new(self.file_locator(), rollover_size)
-    }
-
-    /// Consume the builder to get an iterator of all entries in this
-    /// WAL that have been persisted to disk.
-    ///
-    /// Sequence numbers on the entries will be in increasing order, but if files have been
-    /// modified or deleted since getting this iterator, there may be gaps in the sequence.
-    ///
-    /// # Asynchronous considerations
-    ///
-    /// This method performs blocking IO and care should be taken when using
-    /// it in an asynchronous context.
-    pub fn entries(self) -> Result<impl Iterator<Item = Result<Entry>>> {
-        Loader::load(self.file_locator())
-    }
-
-    fn file_locator(self) -> FileLocator {
-        FileLocator {
-            root: self.root,
-            file_rollover_size: self.file_rollover_size,
+            format: WalFormat::FlatBuffers,
         }
     }
 }
 
-/// The main WAL type to interact with.
-///
-/// For use in single-threaded synchronous contexts. For multi-threading or
-/// asynchronous, you should wrap the WAL in the appropriate patterns.
-///
-/// # Example
-///
-/// This demonstrates using the WAL with the Tokio asynchronous runtime.
-///
-/// ```
-/// # fn example(root_path: &std::path::Path) -> Result<(), Box<dyn std::error::Error>> {
-/// use wal::{WalBuilder, WritePayload};
-///
-/// // This wal should be either protected with a mutex or moved into a single
-/// // worker thread that receives writes from channels.
-/// let mut wal = WalBuilder::new(root_path).wal()?;
-///
-/// // Now create a payload and append it
-/// let payload = WritePayload::new(Vec::from("some data"))?;
-///
-/// // append will create a new WAL entry with its own sequence number, which is returned
-/// let sequence_number = wal.append(payload)?;
-///
-/// // after appends, call sync_all to fsync the underlying WAL file
-/// wal.sync_all()?;
-///
-/// # Ok(())
-/// # }
-/// ```
+/// Supported WAL formats that can be restored
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum WalFormat {
+    FlatBuffers,
+    #[serde(other)]
+    Unknown,
+}
+
+#[derive(Debug)]
+struct WalFile {
+    id: u16,
+    file: File,
+    size: AtomicU64,
+}
+
+impl WalFile {
+    pub fn create(root: &PathBuf, id: u16) -> Result<Self> {
+        let file_path = Self::id_to_path(root, id);
+        Ok(Self {
+            id,
+            file: OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&file_path)
+                .context(UnableToCreateWal { path: file_path })?,
+            size: AtomicU64::new(0),
+        })
+    }
+
+    pub fn open(root: &PathBuf, id: u16) -> Result<Self> {
+        let file_path = Self::id_to_path(root, id);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&file_path)
+            .context(UnableToOpenWal {
+                path: file_path.clone(),
+            })?;
+        Ok(Self {
+            id,
+            size: AtomicU64::new(
+                file.metadata()
+                    .context(UnableToOpenWal { path: file_path })?
+                    .len(),
+            ),
+            file,
+        })
+    }
+
+    pub fn id_to_path(root: &PathBuf, id: u16) -> PathBuf {
+        let mut path = root.join(format!("{}{:08x}", Wal::FILE_PREFIX, id));
+        path.set_extension(Wal::FILE_EXTENSION);
+        path
+    }
+
+    pub fn id_from_path(path: &PathBuf) -> Option<u16> {
+        path.file_stem().and_then(|file_stem| {
+            let file_stem = file_stem.to_string_lossy();
+            u16::from_str_radix(
+                WAL_FILENAME_PATTERN.captures(&file_stem)?.get(1)?.as_str(),
+                16,
+            )
+            .ok()
+        })
+    }
+}
+
 #[derive(Debug)]
 pub struct Wal {
-    files: FileLocator,
-    sequence_number: u64,
-    total_size: u64,
-    active_file: Option<File>,
-    file_rollover_size: u64,
+    root: PathBuf,
+    active: Atomic<WalFile>,
+    total_size: AtomicU64,
+    next_id: AtomicU16,
+    rollover_size: u64,
+    metadata: WalMetadata,
 }
 
 impl Wal {
-    fn new(files: FileLocator, file_rollover_size: u64) -> Result<Self> {
-        let last_sequence_number = Loader::last_sequence_number(&files)?;
-        let sequence_number = last_sequence_number.map_or(0, |last| last + 1);
+    /// The default size to create new WAL files at. Currently 10GiB.
+    pub const DEFAULT_FILE_ROLLOVER_SIZE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+    /// The theoretical max is u48::MAX but u47::MAX is used to give room for late writes
+    pub const MAX_FILE_ROLLOVER_SIZE_BYTES: u64 = U47_MAX;
+    pub const FILE_PREFIX: &'static str = "wal_";
+    pub const FILE_EXTENSION: &'static str = "db";
+    pub const METADATA_FILE: &'static str = "wal.metadata";
 
-        let total_size = files.total_size();
+    pub fn new(root: PathBuf, rollover_size: Option<u64>) -> Result<Self> {
+        let rollover_size = rollover_size
+            .unwrap_or(Self::DEFAULT_FILE_ROLLOVER_SIZE_BYTES)
+            .min(Self::MAX_FILE_ROLLOVER_SIZE_BYTES);
+
+        let wal_files = WalReader::new(root.clone()).list_wal_files()?;
+
+        let total_size = wal_files
+            .iter()
+            .map(|(_, path)| path.metadata().map(|m| m.len()).unwrap_or(0))
+            .sum();
+
+        let active_file = match wal_files.last() {
+            Some((id, path)) => {
+                if path.metadata().context(UnableToOpenWal { path })?.len() < rollover_size {
+                    WalFile::open(&root, *id)?
+                } else {
+                    WalFile::create(&root, id + 1)?
+                }
+            }
+            None => WalFile::create(&root, 0)?,
+        };
 
         Ok(Self {
-            files,
-            sequence_number,
-            total_size,
-            file_rollover_size,
-            active_file: None,
+            root,
+            next_id: AtomicU16::new(active_file.id + 1),
+            active: Atomic::new(active_file),
+            total_size: AtomicU64::new(total_size),
+            rollover_size,
+            metadata: Default::default(),
         })
     }
 
-    /// A path to a file for storing arbitrary metadata about this WAL, guaranteed not to collide
-    /// with the data files.
-    pub fn metadata_path(&self) -> PathBuf {
-        self.files.root.join("metadata")
-    }
+    pub fn append(&self, data: &[u8]) -> Result<SequenceNumber> {
+        let guard = epoch::pin();
+        // SAFETY: file is properly synchronized (Acquire ordering)
+        // so we won't be dereferencing uninitialized data
+        let active_wal = self.active.load(Acquire, &guard);
+        let active_wal_ref = unsafe { active_wal.as_ref() }.expect("active file was null!");
 
-    /// Appends a WritePayload to the active segment file in the WAL and returns its
-    /// assigned sequence number.
-    ///
-    /// To ensure the data is written to disk, `sync_all` should be called after a
-    /// single or batch of append operations.
-    pub fn append(&mut self, payload: WritePayload) -> Result<SequenceNumber> {
-        let sequence_number = self.sequence_number;
+        let payload = Payload::encode(data).context(PayloadError)?;
+        let header_bytes = payload.header().as_bytes();
+        let data_bytes = payload.data();
+        let payload_size = payload.size() as u64;
 
-        let mut f = match self.active_file.take() {
-            Some(f) => f,
-            None => self.files.open_file_for_append(sequence_number)?,
+        // Optimistically increment file size even if things could still go wrong
+        let offset = active_wal_ref.size.fetch_add(payload_size, Relaxed);
+        self.total_size.fetch_add(payload_size, Relaxed);
+        let new_wal_size = offset + payload_size;
+
+        let iovec = [
+            libc::iovec {
+                iov_base: header_bytes.as_ptr() as _,
+                iov_len: header_bytes.len(),
+            },
+            libc::iovec {
+                iov_base: data_bytes.as_ptr() as _,
+                iov_len: data_bytes.len(),
+            },
+        ];
+
+        //TODO(CJP10): cross platformify
+        unsafe {
+            libc::pwritev(
+                active_wal_ref.file.as_raw_fd(),
+                iovec.as_ptr() as _,
+                iovec.len() as i32,
+                offset as i64,
+            )
         };
 
-        let h = Header {
-            sequence_number,
-            checksum: payload.checksum,
-            len: payload.len,
-        };
-
-        h.write(&mut f)?;
-        f.write_all(&payload.data).context(UnableToWriteData)?;
-
-        self.total_size += Header::LEN + payload.len as u64;
-        self.active_file = Some(f);
-        self.sequence_number += 1;
-
-        Ok(sequence_number)
-    }
-
-    /// Total size, in bytes, of all the data in all the files in the WAL. If files are deleted
-    /// from disk without deleting them through the WAL, the size won't reflect that deletion
-    /// until the WAL is recreated.
-    pub fn total_size(&self) -> u64 {
-        self.total_size
-    }
-
-    /// Deletes files up to, but not including, the file that contains the entry number specified
-    pub fn delete_up_to_entry(&self, entry_number: u64) -> Result<()> {
-        let mut iter = self.files.existing_filenames()?.peekable();
-        let hypothetical_filename = self
-            .files
-            .filename_starting_at_sequence_number(entry_number);
-
-        while let Some(inner_path) = iter.next() {
-            if iter.peek().map_or(false, |p| p < &hypothetical_filename) {
-                // Intentionally ignore failures. Should we collect them for reporting instead?
-                let _ = fs::remove_file(inner_path);
-            } else {
-                break;
+        // We are writing past the `file_rollover_size`, let's make sure the file is being rolled over
+        if new_wal_size > self.rollover_size {
+            let already_marked = self.active.fetch_or(1, Relaxed, &guard).tag() == 1;
+            if !already_marked {
+                // We were the ones who marked the active file so we will now roll it over
+                let new_id = self.next_id.fetch_add(1, Relaxed);
+                let new_active_wal = Owned::new(WalFile::create(&self.root, new_id)?);
+                // This could be a store in theory but for some practical correctness let's just use a CAS with a panic
+                self.active
+                    .compare_and_set(active_wal.with_tag(1), new_active_wal, Release, &guard)
+                    .expect("CAS on active wal failed!");
+                // SAFETY: active_wal has been successfully replaced and is no longer reachable.
+                // Once the current epoch is over it's impossible to get a ref to active_wal
+                // making this safe to destroy after this epoch is over.
+                unsafe { guard.defer_destroy(active_wal) };
             }
         }
 
-        Ok(())
+        Ok(SequenceNumber::new(active_wal_ref.id, offset))
     }
 
-    /// Flush all pending bytes in the active segment file to disk and closes it if it is over
-    /// the file rollover size.
-    pub fn sync_all(&mut self) -> Result<()> {
-        let f = self.active_file.take();
+    pub async fn write_metadata(&self) -> Result<()> {
+        let metadata_path = self.root.join(Self::METADATA_FILE);
+        Ok(tokio::fs::write(
+            &metadata_path,
+            serde_json::to_string(&self.metadata).context(SerializeMetadata)?,
+        )
+        .await
+        .context(WritingMetadata {
+            metadata_path: &metadata_path,
+        })?)
+    }
 
-        if let Some(f) = f {
-            f.sync_all().context(UnableToSync)?;
-
-            let meta = f.metadata().context(UnableToReadFileMetadata)?;
-            if meta.len() < self.file_rollover_size {
-                self.active_file = Some(f);
-            }
-        }
-
-        Ok(())
+    pub fn reader(&self) -> WalReader {
+        WalReader::new(self.root.clone())
     }
 }
 
-// Manages files within the WAL directory
 #[derive(Debug)]
-struct FileLocator {
+pub struct WalReader {
     root: PathBuf,
-    file_rollover_size: u64,
 }
 
-impl FileLocator {
-    const PREFIX: &'static str = "wal_";
-    const EXTENSION: &'static str = "db";
-
-    fn open_files_for_read(&self) -> Result<impl Iterator<Item = Result<Option<File>>> + '_> {
-        Ok(self
-            .existing_filenames()?
-            .map(move |path| self.open_file_for_read(&path)))
+impl WalReader {
+    pub fn new(root: PathBuf) -> Self {
+        Self { root }
     }
 
-    fn total_size(&self) -> u64 {
-        self.existing_filenames()
-            .map(|files| {
-                files
-                    .map(|file| {
-                        fs::metadata(file)
-                            .map(|metadata| metadata.len())
-                            .unwrap_or(0)
-                    })
-                    .sum()
-            })
-            .unwrap_or(0)
-    }
-
-    fn open_file_for_read(&self, path: &Path) -> Result<Option<File>> {
-        let r = OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(&path);
-
-        match r {
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
-            r => r
-                .map(Some)
-                .context(UnableToOpenFile { path })
-                .map_err(Into::into),
-        }
-    }
-
-    fn open_file_for_append(&self, starting_sequence_number: u64) -> Result<File> {
-        // Is there an existing file?
-        let file_name = self
-            .active_filename()?
-            .filter(|existing| {
-                // If there is an existing file, check its size.
-                fs::metadata(&existing)
-                    // Use the existing file if its size is under the file size limit.
-                    .map(|metadata| metadata.len() < self.file_rollover_size)
-                    .unwrap_or(false)
-            })
-            // If there is no file or the file is over the file size limit, start a new file.
-            .unwrap_or_else(|| self.filename_starting_at_sequence_number(starting_sequence_number));
-
-        Ok(OpenOptions::new()
-            .read(false)
-            .append(true)
-            .create(true)
-            .open(&file_name)
-            .context(UnableToOpenFile { path: file_name })?)
-    }
-
-    fn active_filename(&self) -> Result<Option<PathBuf>> {
-        Ok(self.existing_filenames()?.last())
-    }
-
-    fn existing_filenames(&self) -> Result<impl Iterator<Item = PathBuf>> {
-        static FILENAME_PATTERN: Lazy<Regex> = Lazy::new(|| {
-            let pattern = format!(r"^{}[0-9a-f]{{16}}$", FileLocator::PREFIX);
-            Regex::new(&pattern).expect("Hardcoded regex should be valid")
-        });
-
-        let mut wal_paths: Vec<_> = fs::read_dir(&self.root)
-            .context(UnableToReadDirectoryContents { path: &self.root })?
+    pub fn list_wal_files(&self) -> Result<Vec<(u16, PathBuf)>> {
+        let mut wal_files: Vec<_> = fs::read_dir(&self.root)
+            .context(UnableToReadWalDirectory { path: &self.root })?
             .flatten() // Discard errors
             .map(|e| e.path())
-            .filter(|path| path.extension() == Some(OsStr::new(Self::EXTENSION)))
-            .filter(|path| {
-                path.file_stem().map_or(false, |file_stem| {
-                    let file_stem = file_stem.to_string_lossy();
-                    FILENAME_PATTERN.is_match(&file_stem)
-                })
-            })
+            .filter(|path| path.extension() == Some(OsStr::new(Wal::FILE_EXTENSION)))
+            .filter_map(|path| WalFile::id_from_path(&path).map(|id| (id, path)))
             .collect();
 
-        wal_paths.sort();
+        wal_files.sort_by_key(|(id, _)| *id);
 
-        Ok(wal_paths.into_iter())
+        Ok(wal_files)
     }
 
-    fn filename_starting_at_sequence_number(&self, starting_sequence_number: u64) -> PathBuf {
-        let file_stem = format!("{}{:016x}", Self::PREFIX, starting_sequence_number);
-        let mut filename = self.root.join(file_stem);
-        filename.set_extension(Self::EXTENSION);
-        filename
-    }
-}
-
-/// Produces an iterator over the on-disk entries in the WAL.
-///
-/// # Asynchronous considerations
-///
-/// This type performs blocking IO and care should be taken when using
-/// it in an asynchronous context.
-#[derive(Debug)]
-struct Loader;
-
-impl Loader {
-    fn last_sequence_number(files: &FileLocator) -> Result<Option<u64>> {
-        let last = Self::headers(files)?.last().transpose()?;
-        Ok(last.map(|h| h.sequence_number))
+    pub fn read(&self, sequence: SequenceNumber) -> Result<Vec<u8>> {
+        let path = WalFile::id_to_path(&self.root, sequence.wal_id);
+        let mut reader = BufReader::new(WalFile::open(&self.root, sequence.wal_id)?.file);
+        reader
+            .seek(SeekFrom::Start(sequence.offset))
+            .context(UnableToReadWal { path })?;
+        Ok(Payload::decode(reader).context(PayloadError)?)
     }
 
-    fn headers(files: &FileLocator) -> Result<impl Iterator<Item = Result<Header>>> {
-        let r = files
-            .open_files_for_read()?
-            .flat_map(|result_option_file| result_option_file.transpose())
-            .map(|result_file| result_file.and_then(Self::headers_from_one_file));
+    pub fn read_wal_file(&self, wal_id: u16) -> Result<impl Iterator<Item = Result<Vec<u8>>>> {
+        struct Iter {
+            reader: BufReader<File>,
+        }
 
-        itertools::process_results(r, |iterator_of_iterators_of_result_headers| {
-            iterator_of_iterators_of_result_headers
-                .flatten()
-                .collect::<Vec<_>>()
-                .into_iter()
+        impl Iterator for Iter {
+            type Item = Result<Vec<u8>>;
+
+            fn next(&mut self) -> Option<Self::Item> {
+                use crate::payload::PayloadError;
+
+                loop {
+                    return match Payload::decode(&mut self.reader) {
+                        Ok(payload) => Some(Ok(payload)),
+                        Err(PayloadError::ReadEmptyPayload) => {
+                            match skip_until(&mut self.reader, Header::MAGIC) {
+                                Ok(_) => continue,
+                                Err(_) => None,
+                            }
+                        }
+                        Err(PayloadError::ReaderAtEof) => None,
+                        Err(e) => Some(Err(Error(InternalError::PayloadError { source: e }))),
+                    };
+                }
+            }
+        }
+
+        Ok(Iter {
+            reader: BufReader::new(WalFile::open(&self.root, wal_id)?.file),
         })
     }
 
-    fn headers_from_one_file(mut file: File) -> Result<impl Iterator<Item = Result<Header>>> {
-        let metadata = file.metadata().context(UnableToReadFileMetadata)?;
-        let mut length_remaining = metadata.len();
+    pub fn read_entire_wal(&self) -> Result<impl Iterator<Item = Result<Vec<u8>>>> {
+        struct Iter<T, I>
+        where
+            T: Iterator<Item = I>,
+            I: Iterator<Item = Result<Vec<u8>>>,
+        {
+            wal_iters: T,
+            current_iter: I,
+        }
 
-        Ok(Box::new(iter::from_fn(move || {
-            if length_remaining == 0 {
-                return None;
-            }
+        impl<T, I> Iterator for Iter<T, I>
+        where
+            T: Iterator<Item = I>,
+            I: Iterator<Item = Result<Vec<u8>>>,
+        {
+            type Item = Result<Vec<u8>>;
 
-            match Header::read(&mut file) {
-                Ok(header) => {
-                    let data_len = i64::from(header.len);
-                    file.seek(SeekFrom::Current(data_len)).unwrap();
-
-                    length_remaining -= Header::LEN + u64::from(header.len);
-
-                    Some(Ok(header))
+            fn next(&mut self) -> Option<Self::Item> {
+                loop {
+                    match self.current_iter.next() {
+                        Some(item) => return Some(item),
+                        None => self.current_iter = self.wal_iters.next()?,
+                    }
                 }
-                Err(e) => Some(Err(e)),
             }
-        })))
-    }
+        }
 
-    fn load(files: FileLocator) -> Result<impl Iterator<Item = Result<Entry>>> {
-        let r = files
-            .open_files_for_read()?
-            .flat_map(|result_option_file| result_option_file.transpose())
-            .map(|result_file| result_file.and_then(Self::load_from_one_file));
+        let mut wal_iters = Vec::new();
 
-        itertools::process_results(r, |iterator_of_iterators_of_result_entries| {
-            iterator_of_iterators_of_result_entries
-                .flatten()
-                .collect::<Vec<_>>()
-                .into_iter()
-        })
-    }
+        for (id, _) in self.list_wal_files()? {
+            wal_iters.push(self.read_wal_file(id)?)
+        }
 
-    fn load_from_one_file(mut file: File) -> Result<impl Iterator<Item = Result<Entry>>> {
-        let metadata = file.metadata().context(UnableToReadFileMetadata)?;
-        let mut length_remaining = metadata.len();
-
-        Ok(Box::new(iter::from_fn(move || {
-            if length_remaining == 0 {
-                return None;
+        let mut wal_iters = wal_iters.into_iter();
+        let current_iter = match wal_iters.next() {
+            Some(iter) => iter,
+            None => {
+                return Err(Error(InternalError::EntireWalIsEmpty {
+                    path: self.root.clone(),
+                }))
             }
-
-            match Self::load_one(&mut file) {
-                Ok((entry, bytes_read)) => {
-                    length_remaining -= bytes_read;
-
-                    Some(Ok(entry))
-                }
-                Err(e) => Some(Err(e)),
-            }
-        })))
-    }
-
-    fn load_one(file: &mut File) -> Result<(Entry, u64)> {
-        let header = Header::read(&mut *file)?;
-
-        let expected_len_us =
-            usize::try_from(header.len).expect("Only designed to run on 32-bit systems or higher");
-
-        let mut compressed_data = Vec::with_capacity(expected_len_us);
-
-        let actual_compressed_len = file
-            .take(u64::from(header.len))
-            .read_to_end(&mut compressed_data)
-            .context(UnableToReadData)?;
-
-        ensure!(
-            expected_len_us == actual_compressed_len,
-            LengthMismatch {
-                expected: expected_len_us,
-                actual: actual_compressed_len
-            }
-        );
-
-        let mut hasher = Hasher::new();
-        hasher.update(&compressed_data);
-        let actual_checksum = hasher.finalize();
-
-        ensure!(
-            header.checksum == actual_checksum,
-            ChecksumMismatch {
-                expected: header.checksum,
-                actual: actual_checksum
-            }
-        );
-
-        let mut decoder = snap::raw::Decoder::new();
-        let data = decoder
-            .decompress_vec(&compressed_data)
-            .context(UnableToDecompressData)?;
-
-        let entry = Entry {
-            sequence_number: header.sequence_number,
-            data,
         };
 
-        let bytes_read = Header::LEN + u64::from(header.len);
-
-        Ok((entry, bytes_read))
-    }
-}
-
-#[derive(Debug)]
-struct Header {
-    sequence_number: u64,
-    checksum: u32,
-    len: u32,
-}
-
-impl Header {
-    const LEN: u64 = (mem::size_of::<u64>() + mem::size_of::<u32>() + mem::size_of::<u32>()) as u64;
-
-    fn read(mut r: impl Read) -> Result<Self> {
-        let sequence_number = r
-            .read_u64::<LittleEndian>()
-            .context(UnableToReadSequenceNumber)?;
-        let checksum = r.read_u32::<LittleEndian>().context(UnableToReadChecksum)?;
-        let len = r.read_u32::<LittleEndian>().context(UnableToReadLength)?;
-
-        Ok(Self {
-            sequence_number,
-            checksum,
-            len,
+        Ok(Iter {
+            current_iter,
+            wal_iters,
         })
     }
-
-    fn write(&self, mut w: impl Write) -> Result<()> {
-        w.write_u64::<LittleEndian>(self.sequence_number)
-            .context(UnableToWriteSequenceNumber)?;
-        w.write_u32::<LittleEndian>(self.checksum)
-            .context(UnableToWriteChecksum)?;
-        w.write_u32::<LittleEndian>(self.len)
-            .context(UnableToWriteLength)?;
-        Ok(())
-    }
 }
 
-/// One batch of data read from the WAL.
-///
-/// This corresponds to one call to `Wal::append`.
-#[derive(Debug, Clone)]
-pub struct Entry {
-    sequence_number: u64,
-    data: Vec<u8>,
-}
-
-impl Entry {
-    /// Gets the unique, increasing sequence number associated with this data
-    pub fn sequence_number(&self) -> u64 {
-        self.sequence_number
-    }
-
-    /// Gets a reference to the entry's data
-    pub fn as_data(&self) -> &[u8] {
-        &self.data
-    }
-
-    /// Gets the entry's data
-    pub fn into_data(self) -> Vec<u8> {
-        self.data
-    }
-}
-
-/// A single write to append to the WAL file
-#[derive(Debug)]
-pub struct WritePayload {
-    checksum: u32,
-    data: Vec<u8>,
-    len: u32,
-}
-
-impl WritePayload {
-    /// Initializes a write payload, compresses the data, and computes its CRC.
-    pub fn new(uncompressed_data: Vec<u8>) -> Result<Self> {
-        // Only designed to support chunks up to `u32::max` bytes long.
-        let uncompressed_len = uncompressed_data.len();
-        let _ = u32::try_from(uncompressed_len).context(ChunkSizeTooLarge {
-            actual: uncompressed_len,
-        })?;
-
-        let mut encoder = snap::raw::Encoder::new();
-        let compressed_data = encoder
-            .compress_vec(&uncompressed_data)
-            .context(UnableToCompressData)?;
-        let actual_compressed_len = compressed_data.len();
-        let actual_compressed_len =
-            u32::try_from(actual_compressed_len).context(ChunkSizeTooLarge {
-                actual: actual_compressed_len,
-            })?;
-
-        let mut hasher = Hasher::new();
-        hasher.update(&compressed_data);
-        let checksum = hasher.finalize();
-
-        Ok(Self {
-            checksum,
-            data: compressed_data,
-            len: actual_compressed_len,
-        })
+fn skip_until<R: BufRead + ?Sized>(r: &mut R, delim: u8) -> std::io::Result<usize> {
+    let mut read = 0;
+    loop {
+        let (done, used) = {
+            let available = match r.fill_buf() {
+                Ok(n) => n,
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            };
+            match memchr::memchr(delim, available) {
+                Some(i) => (true, i),
+                None => (false, available.len()),
+            }
+        };
+        r.consume(used);
+        read += used;
+        if done || used == 0 {
+            return Ok(read);
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::Rng;
+    use std::os::unix::fs::FileExt;
+    use tempdir::TempDir;
 
-    type TestError = Box<dyn std::error::Error + Send + Sync + 'static>;
-    type Result<T = (), E = TestError> = std::result::Result<T, E>;
+    fn rand_vec(n: usize) -> Vec<u8> {
+        (0..n).map(|_| rand::random::<u8>()).collect()
+    }
 
-    #[test]
-    fn sequence_numbers_are_persisted() -> Result {
-        let dir = test_helpers::tmp_dir()?;
-        let builder = WalBuilder::new(dir.as_ref());
-        let mut wal;
+    fn append_read_many<F: Fn() -> Vec<u8>>(wal: &Wal, gen: F) {
+        let mut inputs = Vec::new();
 
-        // Create one in-memory WAL and sync it
-        {
-            wal = builder.clone().wal()?;
-
-            let data = Vec::from("somedata");
-            let data = WritePayload::new(data)?;
-            let seq = wal.append(data)?;
-            assert_eq!(0, seq);
-            wal.sync_all()?;
+        for _ in 0..1_000 {
+            let bytes = gen();
+            let sequence = wal.append(&bytes).unwrap();
+            inputs.push((sequence, bytes));
         }
 
-        // Pretend the process restarts
-        {
-            wal = builder.wal()?;
-
-            assert_eq!(1, wal.sequence_number);
+        let reader = wal.reader();
+        for (sequence, bytes) in inputs {
+            assert_eq!(reader.read(sequence).unwrap(), bytes)
         }
-
-        Ok(())
     }
 
     #[test]
-    fn sequence_numbers_increase_by_number_of_pending_entries() -> Result {
-        let dir = test_helpers::tmp_dir()?;
-        let builder = WalBuilder::new(dir.as_ref());
-        let mut wal = builder.wal()?;
+    fn sequence_numbers() {
+        assert_eq!(SequenceNumber::new(0, u64::MAX).as_u64(), U48_MAX);
+        assert_eq!(SequenceNumber::new(u16::MAX, u64::MAX).as_u64(), u64::MAX);
+        assert_eq!(
+            SequenceNumber::new(u16::MAX, 0).as_u64(),
+            (u16::MAX as u64) << 48
+        );
+        assert_eq!(SequenceNumber::new(1, u64::MAX).as_u64(), (1 << 49) - 1);
+    }
 
-        // Write 1 entry then sync
-        let data = Vec::from("some");
-        let data = WritePayload::new(data)?;
-        let seq = wal.append(data)?;
-        wal.sync_all()?;
-        assert_eq!(0, seq);
+    #[test]
+    fn wal_id_conversions() {
+        let path = WalFile::id_to_path(&"/".into(), u16::MAX);
+        assert_eq!(WalFile::id_from_path(&path), Some(u16::MAX));
+        let path = WalFile::id_to_path(&"/".into(), u16::MIN);
+        assert_eq!(WalFile::id_from_path(&path), Some(u16::MIN));
+    }
 
-        // Sequence number should increase by 1
-        assert_eq!(1, wal.sequence_number);
+    #[test]
+    fn append_read_many_random() {
+        let temp_dir = TempDir::new("wal").unwrap();
+        let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
+        append_read_many(&wal, || rand_vec(32));
+    }
 
-        // Write 2 entries then sync
-        let data = Vec::from("other");
-        let data = WritePayload::new(data)?;
-        let seq = wal.append(data)?;
-        assert_eq!(1, seq);
+    #[test]
+    fn append_read_many_empty() {
+        let temp_dir = TempDir::new("wal").unwrap();
+        let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
+        append_read_many(&wal, Vec::new);
+    }
 
-        let data = Vec::from("again");
-        let data = WritePayload::new(data)?;
-        let seq = wal.append(data)?;
-        assert_eq!(2, seq);
-        wal.sync_all()?;
+    #[test]
+    fn wal_iter() {
+        let temp_dir = TempDir::new("wal").unwrap();
+        let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
 
-        // Sequence number should increase by 2
-        assert_eq!(3, wal.sequence_number);
+        let mut inputs = Vec::new();
 
-        Ok(())
+        for _ in 0..1_000 {
+            let file = unsafe { wal.active.load(Acquire, epoch::unprotected()).deref() };
+            let offset = file.size.fetch_add(Header::LEN as u64, Relaxed);
+            file.file.write_all_at(&[0u8; Header::LEN], offset).unwrap();
+
+            let bytes = if rand::thread_rng().gen_bool(1.0 / 3.0) {
+                Vec::new()
+            } else {
+                rand_vec(16)
+            };
+
+            let sequence = wal.append(&bytes).unwrap();
+            inputs.push((sequence, bytes));
+
+            let file = unsafe { wal.active.load(Acquire, epoch::unprotected()).deref() };
+            let offset = file.size.fetch_add(Header::LEN as u64, Relaxed);
+            file.file.write_all_at(&[0u8; Header::LEN], offset).unwrap();
+        }
+
+        let wal_iter = wal.reader().read_entire_wal().unwrap();
+        let mut input_iter = inputs.into_iter();
+        for payload in wal_iter {
+            let payload = payload.unwrap();
+            let (sequence, bytes) = input_iter.next().unwrap();
+            assert_eq!(payload, bytes);
+            assert_eq!(wal.reader().read(sequence).unwrap(), bytes);
+        }
     }
 }
