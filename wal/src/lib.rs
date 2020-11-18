@@ -16,11 +16,11 @@ use std::ffi::OsStr;
 use std::{
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Seek, SeekFrom},
-    os::unix::io::AsRawFd,
     path::PathBuf,
     sync::atomic::{AtomicU16, AtomicU64, Ordering::*},
 };
 
+mod io;
 pub mod payload;
 
 const U48_MAX: u64 = (1 << 48) - 1;
@@ -44,7 +44,7 @@ enum InternalError {
     },
 
     UnableToWritePayload {
-        source: std::io::Error,
+        source: crate::io::IoError,
         path: PathBuf,
     },
 
@@ -255,26 +255,11 @@ impl Wal {
         self.total_size.fetch_add(payload_size, Relaxed);
         let new_wal_size = offset + payload_size;
 
-        let iovec = [
-            libc::iovec {
-                iov_base: header_bytes.as_ptr() as _,
-                iov_len: header_bytes.len(),
+        io::write(&active_wal_ref.file, &header_bytes, data_bytes, offset).context(
+            UnableToWritePayload {
+                path: WalFile::id_to_path(&self.root, active_wal_ref.id),
             },
-            libc::iovec {
-                iov_base: data_bytes.as_ptr() as _,
-                iov_len: data_bytes.len(),
-            },
-        ];
-
-        //TODO(CJP10): cross platformify
-        unsafe {
-            libc::pwritev(
-                active_wal_ref.file.as_raw_fd(),
-                iovec.as_ptr() as _,
-                iovec.len() as i32,
-                offset as i64,
-            )
-        };
+        )?;
 
         // We are writing past the `file_rollover_size`, let's make sure the file is being rolled over
         if new_wal_size > self.rollover_size {
