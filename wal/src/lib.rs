@@ -53,6 +53,11 @@ enum InternalError {
         path: PathBuf,
     },
 
+    UnableToSyncWal {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
     UnableToOpenWal {
         source: std::io::Error,
         path: PathBuf,
@@ -187,13 +192,40 @@ impl WalFile {
 }
 
 #[derive(Debug)]
+pub struct WalOptions {
+    rollover_size: u64,
+    sync_writes: bool,
+}
+
+impl WalOptions {
+    pub fn rollover_size(mut self, rollover_size: u64) -> Self {
+        self.rollover_size = rollover_size;
+        self
+    }
+
+    pub fn sync_writes(mut self, sync_writes: bool) -> Self {
+        self.sync_writes = sync_writes;
+        self
+    }
+}
+
+impl Default for WalOptions {
+    fn default() -> Self {
+        Self {
+            rollover_size: Wal::DEFAULT_FILE_ROLLOVER_SIZE_BYTES,
+            sync_writes: true,
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct Wal {
     root: PathBuf,
     active: Atomic<WalFile>,
     total_size: AtomicU64,
     next_id: AtomicU16,
-    rollover_size: u64,
     metadata: WalMetadata,
+    options: WalOptions,
 }
 
 impl Wal {
@@ -205,11 +237,12 @@ impl Wal {
     pub const FILE_EXTENSION: &'static str = "db";
     pub const METADATA_FILE: &'static str = "wal.metadata";
 
-    pub fn new(root: PathBuf, rollover_size: Option<u64>) -> Result<Self> {
-        let rollover_size = rollover_size
-            .unwrap_or(Self::DEFAULT_FILE_ROLLOVER_SIZE_BYTES)
-            .min(Self::MAX_FILE_ROLLOVER_SIZE_BYTES);
+    pub fn new(root: PathBuf) -> Result<Self> {
+        let options = WalOptions::default();
+        Self::with_options(root, options)
+    }
 
+    pub fn with_options(root: PathBuf, options: WalOptions) -> Result<Self> {
         let wal_files = WalReader::new(root.clone()).list_wal_files()?;
 
         let total_size = wal_files
@@ -219,7 +252,8 @@ impl Wal {
 
         let active_file = match wal_files.last() {
             Some((id, path)) => {
-                if path.metadata().context(UnableToOpenWal { path })?.len() < rollover_size {
+                if path.metadata().context(UnableToOpenWal { path })?.len() < options.rollover_size
+                {
                     WalFile::open(&root, *id)?
                 } else {
                     WalFile::create(&root, id + 1)?
@@ -233,8 +267,8 @@ impl Wal {
             next_id: AtomicU16::new(active_file.id + 1),
             active: Atomic::new(active_file),
             total_size: AtomicU64::new(total_size),
-            rollover_size,
             metadata: Default::default(),
+            options,
         })
     }
 
@@ -261,8 +295,14 @@ impl Wal {
             },
         )?;
 
+        if self.options.sync_writes {
+            active_wal_ref.file.sync_all().context(UnableToSyncWal {
+                path: WalFile::id_to_path(&self.root, active_wal_ref.id),
+            })?;
+        }
+
         // We are writing past the `file_rollover_size`, let's make sure the file is being rolled over
-        if new_wal_size > self.rollover_size {
+        if new_wal_size > self.options.rollover_size {
             let already_marked = self.active.fetch_or(1, Relaxed, &guard).tag() == 1;
             if !already_marked {
                 // We were the ones who marked the active file so we will now roll it over
@@ -483,14 +523,22 @@ mod tests {
     #[test]
     fn append_read_many_random() {
         let temp_dir = TempDir::new("wal").unwrap();
-        let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
+        let wal = Wal::with_options(
+            temp_dir.path().to_path_buf(),
+            WalOptions::default().rollover_size(128),
+        )
+        .unwrap();
         append_read_many(&wal, || rand_vec(32));
     }
 
     #[test]
     fn append_read_many_empty() {
         let temp_dir = TempDir::new("wal").unwrap();
-        let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
+        let wal = Wal::with_options(
+            temp_dir.path().to_path_buf(),
+            WalOptions::default().rollover_size(128),
+        )
+        .unwrap();
         append_read_many(&wal, Vec::new);
     }
 
@@ -500,7 +548,11 @@ mod tests {
         use std::os::unix::fs::FileExt;
 
         let temp_dir = TempDir::new("wal").unwrap();
-        let wal = Wal::new(temp_dir.path().to_path_buf(), Some(128)).unwrap();
+        let wal = Wal::with_options(
+            temp_dir.path().to_path_buf(),
+            WalOptions::default().rollover_size(128),
+        )
+        .unwrap();
 
         let mut inputs = Vec::new();
 

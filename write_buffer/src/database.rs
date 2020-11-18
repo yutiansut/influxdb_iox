@@ -247,7 +247,7 @@ impl Db {
             }
         }
 
-        let wal = Wal::new(wal_dir.clone(), None).context(OpeningWal { database: &name })?;
+        let wal = Wal::new(wal_dir.clone()).context(OpeningWal { database: &name })?;
         wal.write_metadata()
             .await
             .context(OpeningWal { database: &name })?;
@@ -271,7 +271,7 @@ impl Db {
             .with_context(|| OpenDb { dir: &wal_dir })?
             .to_string();
 
-        let wal = Wal::new(wal_dir.to_path_buf(), None).context(OpeningWal { database: &name })?;
+        let wal = Wal::new(wal_dir.to_path_buf()).context(OpeningWal { database: &name })?;
 
         // TODO: check wal metadata format
         let entries = WalReader::new(wal_dir.to_path_buf())
@@ -1412,7 +1412,7 @@ mod tests {
         {
             let name = dir.iter().last().unwrap().to_str().unwrap().to_string();
 
-            let wal = Wal::new(dir.clone(), None).context(OpeningWal {
+            let wal = Wal::new(dir.clone()).context(OpeningWal {
                 database: name.clone(),
             })?;
 
