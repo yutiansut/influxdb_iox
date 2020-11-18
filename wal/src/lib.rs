@@ -191,7 +191,7 @@ impl WalFile {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Copy, Clone)]
 pub struct WalOptions {
     rollover_size: u64,
     sync_writes: bool,
