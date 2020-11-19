@@ -557,9 +557,6 @@ mod tests {
         let mut inputs = Vec::new();
 
         for _ in 0..1_000 {
-            let file = unsafe { wal.active.load(Acquire, epoch::unprotected()).deref() };
-            let offset = file.size.fetch_add(Header::LEN as u64, Relaxed);
-            file.file.write_all_at(&[0u8; Header::LEN], offset).unwrap();
 
             let bytes = if rand::thread_rng().gen_bool(1.0 / 3.0) {
                 Vec::new()
@@ -569,10 +566,6 @@ mod tests {
 
             let sequence = wal.append(&bytes).unwrap();
             inputs.push((sequence, bytes));
-
-            let file = unsafe { wal.active.load(Acquire, epoch::unprotected()).deref() };
-            let offset = file.size.fetch_add(Header::LEN as u64, Relaxed);
-            file.file.write_all_at(&[0u8; Header::LEN], offset).unwrap();
         }
 
         let wal_iter = wal.reader().read_entire_wal().unwrap();
@@ -584,4 +577,61 @@ mod tests {
             assert_eq!(wal.reader().read(sequence).unwrap(), bytes);
         }
     }
+
+    #[test]
+    #[cfg(unix)]
+    fn wal_multi_threaded() {
+        // write several chunks of data to the wal with different
+        // threads and ensure the right is returned
+
+        let mut input = (0..1000)
+            .map(|_| {
+                rand_vec(18)
+            })
+            .collect::<Vec<_>>();
+        input.sort();
+
+        let temp_dir = TempDir::new("wal").unwrap();
+        let wal = Wal::with_options(
+            temp_dir.path().to_path_buf(),
+            WalOptions::default().rollover_size(1000),
+        )
+        .unwrap();
+
+        let wal = std::sync::Arc::new(wal);
+
+        let handles = input
+            .clone()
+            .into_iter()
+            .map(|i| {
+                let wal = wal.clone();
+                std::thread::spawn(move || {
+                    wal.append(&i)
+                })
+            });
+
+        // now wait for all threads to complete
+        for h in handles {
+            h.join()
+                .expect("Thread completed")
+                .expect("append result was successful");
+        }
+
+        // Now read the entries back out of the wal
+        let wal_iter = wal.reader().read_entire_wal().unwrap();
+
+        let mut read_data = wal_iter
+            .map(|payload| {
+                payload.unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        read_data.sort();
+
+        println!("read {} entries", read_data.len());
+        assert_eq!(input, read_data);
+    }
+
+
+
 }
