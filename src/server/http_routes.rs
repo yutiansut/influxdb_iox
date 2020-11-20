@@ -27,10 +27,9 @@ use hyper::{Body, Method, StatusCode};
 use serde::Deserialize;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::str;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::io::{Write, Seek, SeekFrom, Cursor};
-use arrow_deps::parquet::file::writer::{TryClone, SerializedFileWriter};
-use arrow_deps::parquet::file::properties::WriterProperties;
+use arrow_deps::parquet::file::writer::TryClone;
 use arrow_deps::parquet::arrow::ArrowWriter;
 
 #[derive(Debug, Snafu)]
@@ -428,18 +427,23 @@ async fn snapshot_partition<T: DatabaseStore>(
 
         partition_meta.tables.push(meta);
 
-        // let props = Rc::new(WriterProperties::builder().build());
-        let mem_writer = Arc::new(MemWriter::default());
-        let file = SerializedFileWriter::new(mem_writer.clone(), schema, props).unwrap();
-        let mut writer = ArrowWriter::try_new(&file, batch.schema().clone(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
+        let mem_writer = MemWriter::default();
+        {
+            let mut writer =
+                ArrowWriter::try_new(mem_writer.clone(), batch.schema().clone(), None).unwrap();
+            writer.write(&batch).unwrap();
+            writer.close().unwrap();
+        } // drop the reference to the MemWriter that the SerializedFileWriter has
 
-        let table_path = format!("{}/data/{}/{}.parquet", db_name, &snapshot.partition, &table);
-        let data = mem_writer.data();
+        let data = mem_writer
+            .into_inner()
+            .expect("Nothing else should have a reference here");
         let len = data.len();
         let data = Bytes::from(data);
         let stream_data = std::io::Result::Ok(data);
+
+        let table_path = format!("{}/data/{}/{}.parquet", db_name, &snapshot.partition, &table);
+
         server
             .object_store
             .put(
@@ -467,30 +471,45 @@ async fn snapshot_partition<T: DatabaseStore>(
     Ok(Some(json_data.into()))
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct MemWriter {
-    mem: Arc<Cursor<Vec<u8>>>,
+    mem: Arc<Mutex<Cursor<Vec<u8>>>>,
+}
+
+impl MemWriter {
+    /// Returns the inner buffer as long as there are no other references to the Arc.
+    pub fn into_inner(self) -> Option<Vec<u8>> {
+        Arc::try_unwrap(self.mem)
+            .ok()
+            .and_then(|mutex| mutex.into_inner().ok())
+            .map(|cursor| cursor.into_inner())
+    }
 }
 
 impl Write for MemWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.mem.write(buf)
+        let mut inner = self.mem.lock().unwrap();
+        inner.write(buf)
     }
+
     fn flush(&mut self) -> std::io::Result<()> {
-        self.mem.flush()
+        let mut inner = self.mem.lock().unwrap();
+        inner.flush()
     }
 }
 
 impl Seek for MemWriter {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.mem.seek(pos)
+        let mut inner = self.mem.lock().unwrap();
+        inner.seek(pos)
     }
 }
 
 impl TryClone for MemWriter {
     fn try_clone(&self) -> std::io::Result<Self> {
-        use std::io::{Error, ErrorKind};
-        Err(Error::new(ErrorKind::Other, "Clone not supported"))
+        Ok(Self {
+            mem: self.mem.clone(),
+        })
     }
 }
 
