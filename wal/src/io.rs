@@ -1,7 +1,9 @@
-use nix::sys::uio::{pwritev, IoVec};
+use crate::payload::Header;
+use nix::sys::uio::{pwrite, pwritev, IoVec};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use snafu::{ResultExt, Snafu};
+use std::io::SeekFrom;
 use std::{fs::File, os::unix::io::AsRawFd};
 
 #[derive(Debug, Snafu)]
@@ -35,6 +37,20 @@ pub fn write(
     Ok(())
 }
 
+#[cfg(macos)]
+pub fn write(
+    file: &File,
+    header_bytes: &[u8],
+    data_bytes: &[u8],
+    offset: u64,
+) -> Result<(), IoError> {
+    pwrite(file.as_raw_fd(), &header_bytes, offset as i64).context(FailedToWriteDataUnix)?;
+    pwrite(file.as_raw_fd(), &data_bytes, offset + Header::LEN as i64)
+        .context(FailedToWriteDataUnix)?;
+
+    Ok(())
+}
+
 #[allow(dead_code)]
 static MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
@@ -43,7 +59,8 @@ static MUTEX: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
     target_os = "freebsd",
     target_os = "linux",
     target_os = "netbsd",
-    target_os = "openbsd"
+    target_os = "openbsd",
+    target_os = "macos"
 )))]
 pub fn write(
     file: &File,
