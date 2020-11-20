@@ -1,9 +1,7 @@
-use crate::payload::Header;
-use nix::sys::uio::{pwrite, pwritev, IoVec};
+use nix::sys::uio::{pwritev, IoVec};
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use snafu::{ResultExt, Snafu};
-use std::io::SeekFrom;
 use std::{fs::File, os::unix::io::AsRawFd};
 
 #[derive(Debug, Snafu)]
@@ -37,13 +35,16 @@ pub fn write(
     Ok(())
 }
 
-#[cfg(macos)]
+#[cfg(target_os = "macos")]
 pub fn write(
     file: &File,
     header_bytes: &[u8],
     data_bytes: &[u8],
     offset: u64,
 ) -> Result<(), IoError> {
+    use crate::payload::Header;
+    use nix::sys::uio::pwrite;
+
     pwrite(file.as_raw_fd(), &header_bytes, offset as i64).context(FailedToWriteDataUnix)?;
     pwrite(file.as_raw_fd(), &data_bytes, offset + Header::LEN as i64)
         .context(FailedToWriteDataUnix)?;
@@ -68,6 +69,8 @@ pub fn write(
     data_bytes: &[u8],
     offset: u64,
 ) -> Result<(), IoError> {
+    use std::io::SeekFrom;
+
     let _ = MUTEX.lock();
     let mut file = file.try_clone().context(FailedToCloneFile)?;
     file.seek(SeekFrom::Start(offset)).context(FailedToSeek)?;

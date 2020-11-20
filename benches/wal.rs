@@ -1,7 +1,6 @@
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
-use wal::Wal;
 use tempfile::TempDir;
-
+use wal::{Wal, WalOptions};
 
 fn wal(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal");
@@ -11,10 +10,12 @@ fn wal(c: &mut Criterion) {
 
     group.bench_function("append", |b| {
         let dir = TempDir::new().unwrap();
-        let wal = Wal::new(dir.path().to_path_buf()).unwrap();
-        b.iter(|| {
-            wal.append(&bytes)
-        })
+        let wal = Wal::with_options(
+            dir.path().to_path_buf(),
+            WalOptions::default().sync_writes(false),
+        )
+        .unwrap();
+        b.iter(|| wal.append(&bytes))
     });
 
     group.finish();
