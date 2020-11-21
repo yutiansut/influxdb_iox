@@ -543,7 +543,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn wal_iter() {
         let temp_dir = TempDir::new("wal").unwrap();
         let wal = Wal::with_options(
@@ -576,7 +575,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(unix)]
     fn wal_multi_threaded() {
         // write several chunks of data to the wal with different
         // threads and ensure the right is returned
