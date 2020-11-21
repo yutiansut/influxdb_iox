@@ -545,8 +545,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn wal_iter() {
-        use std::os::unix::fs::FileExt;
-
         let temp_dir = TempDir::new("wal").unwrap();
         let wal = Wal::with_options(
             temp_dir.path().to_path_buf(),
@@ -557,7 +555,6 @@ mod tests {
         let mut inputs = Vec::new();
 
         for _ in 0..1_000 {
-
             let bytes = if rand::thread_rng().gen_bool(1.0 / 3.0) {
                 Vec::new()
             } else {
@@ -584,11 +581,7 @@ mod tests {
         // write several chunks of data to the wal with different
         // threads and ensure the right is returned
 
-        let mut input = (0..1000)
-            .map(|_| {
-                rand_vec(18)
-            })
-            .collect::<Vec<_>>();
+        let mut input = (0..1000).map(|_| rand_vec(18)).collect::<Vec<_>>();
         input.sort();
 
         let temp_dir = TempDir::new("wal").unwrap();
@@ -600,15 +593,10 @@ mod tests {
 
         let wal = std::sync::Arc::new(wal);
 
-        let handles = input
-            .clone()
-            .into_iter()
-            .map(|i| {
-                let wal = wal.clone();
-                std::thread::spawn(move || {
-                    wal.append(&i)
-                })
-            });
+        let handles = input.clone().into_iter().map(|i| {
+            let wal = wal.clone();
+            std::thread::spawn(move || wal.append(&i))
+        });
 
         // now wait for all threads to complete
         for h in handles {
@@ -620,18 +608,11 @@ mod tests {
         // Now read the entries back out of the wal
         let wal_iter = wal.reader().read_entire_wal().unwrap();
 
-        let mut read_data = wal_iter
-            .map(|payload| {
-                payload.unwrap()
-            })
-            .collect::<Vec<_>>();
+        let mut read_data = wal_iter.map(|payload| payload.unwrap()).collect::<Vec<_>>();
 
         read_data.sort();
 
         println!("read {} entries", read_data.len());
         assert_eq!(input, read_data);
     }
-
-
-
 }
