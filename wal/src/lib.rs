@@ -24,7 +24,7 @@ use std::{
     convert::TryFrom,
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{self, ErrorKind, Read, Seek, SeekFrom, Write},
+    io::{self, ErrorKind, Read, Seek, SeekFrom, Write, BufWriter},
     iter, mem, num,
     path::{Path, PathBuf},
 };
@@ -234,7 +234,7 @@ pub struct Wal {
     files: FileLocator,
     sequence_number: u64,
     total_size: u64,
-    active_file: Option<File>,
+    active_file: Option<BufWriter<File>>,
     file_rollover_size: u64,
 }
 
@@ -270,7 +270,7 @@ impl Wal {
 
         let mut f = match self.active_file.take() {
             Some(f) => f,
-            None => self.files.open_file_for_append(sequence_number)?,
+            None => BufWriter::new(self.files.open_file_for_append(sequence_number)?),
         };
 
         let h = Header {
@@ -321,9 +321,9 @@ impl Wal {
         let f = self.active_file.take();
 
         if let Some(f) = f {
-            f.sync_all().context(UnableToSync)?;
+            f.get_ref().sync_all().context(UnableToSync)?;
 
-            let meta = f.metadata().context(UnableToReadFileMetadata)?;
+            let meta = f.get_ref().metadata().context(UnableToReadFileMetadata)?;
             if meta.len() < self.file_rollover_size {
                 self.active_file = Some(f);
             }
