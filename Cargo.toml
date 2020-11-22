@@ -106,3 +106,7 @@ harness = false
 [[bench]]
 name = "packers"
 harness = false
+
+[[bench]]
+name = "wal"
+harness = false
