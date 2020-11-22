@@ -25,7 +25,7 @@ fn wal10(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal");
     let bytes = vec![1u8; 4096];
 
-    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.throughput(Throughput::Bytes((bytes.len() * 10) as u64));
 
     group.bench_function("append-10", |b| {
         let dir = TempDir::new().unwrap();
@@ -46,7 +46,7 @@ fn wal100(c: &mut Criterion) {
     let mut group = c.benchmark_group("wal");
     let bytes = vec![1u8; 4096];
 
-    group.throughput(Throughput::Bytes(bytes.len() as u64));
+    group.throughput(Throughput::Bytes((bytes.len() * 100) as u64));
 
     group.bench_function("append-100", |b| {
         let dir = TempDir::new().unwrap();
