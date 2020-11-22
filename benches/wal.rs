@@ -53,7 +53,7 @@ fn wal100(c: &mut Criterion) {
 
     group.throughput(Throughput::Bytes((bytes.len() as u64)*100));
 
-    group.bench_function("append-10", |b| {
+    group.bench_function("append-100", |b| {
         let dir = TempDir::new().unwrap();
         let wal = Wal::with_options(
             dir.path().to_path_buf(),
