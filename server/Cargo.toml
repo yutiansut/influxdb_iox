@@ -23,6 +23,3 @@ arrow_deps = { path = "../arrow_deps" }
 futures = "0.3.7"
 bytes = "0.5"
 chrono = "0.4"
-
-[dev-dependencies]
-test_helpers = { path = "../test_helpers" }

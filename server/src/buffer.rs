@@ -81,14 +81,14 @@ impl Buffer {
             };
 
             if oldest_is_persisted {
-                let _ = self.remove_oldest_segment();
+                self.remove_oldest_segment();
                 continue;
             }
 
             match self.rollover_behavior {
                 WalBufferRollover::DropIncoming => {
                     warn!(
-                        "dropping incoming write for current segment (segment id: {:?})",
+                        "WAL is full, dropping incoming write for current segment (segment id: {:?})",
                         self.open_segment.id,
                     );
                     return Ok(None);
@@ -96,7 +96,7 @@ impl Buffer {
                 WalBufferRollover::DropOldSegment => {
                     let oldest_segment_id = self.remove_oldest_segment();
                     warn!(
-                        "dropping oldest segment (segment id: {:?})",
+                        "WAL is full, dropping oldest segment (segment id: {:?})",
                         oldest_segment_id
                     );
                 }
