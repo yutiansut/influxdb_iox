@@ -3,8 +3,6 @@ pub mod rle;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use croaring::Bitmap;
-
 // This makes the encoding types available under the dictionary module.
 pub use self::plain::Plain;
 pub use self::rle::RLE;
@@ -115,9 +113,10 @@ impl Encoding {
     }
 
     // The set of row ids for each distinct value in the column.
-    fn group_row_ids(&self) -> &BTreeMap<u32, Bitmap> {
+    fn group_row_ids(&self) -> BTreeMap<u32, RowIDs> {
         match self {
-            Encoding::RLE(enc) => enc.group_row_ids(),
+            // TODO(edd): figure out the API here as one is owned and one is borrowed.
+            Encoding::RLE(enc) => enc.group_row_ids().clone(),
             Encoding::Plain(enc) => enc.group_row_ids(),
         }
     }
@@ -736,10 +735,45 @@ mod test {
     }
 
     #[test]
+    fn group_row_ids() {
+        let encodings = vec![
+            Encoding::RLE(RLE::default()),
+            Encoding::Plain(Plain::default()),
+        ];
+
+        for enc in encodings {
+            _group_row_ids(enc);
+        }
+    }
+
+    fn _group_row_ids(mut enc: Encoding) {
+        let name = enc.debug_name();
+
+        enc.push_additional(Some("east".to_string()), 4); // 0, 1, 2, 3
+        enc.push_additional(Some("west".to_string()), 2); // 4, 5
+        enc.push_none(); // 6
+        enc.push_additional(Some("zoo".to_string()), 1); // 7
+
+        let exp = vec![
+            (0_u32, RowIDs::bitmap_from_slice(&[6])),
+            (1, RowIDs::bitmap_from_slice(&[0, 1, 2, 3])),
+            (2, RowIDs::bitmap_from_slice(&[4, 5])),
+            (3, RowIDs::bitmap_from_slice(&[7])),
+        ];
+
+        let got = enc
+            .group_row_ids()
+            .iter()
+            .map(|(id, row_ids)| (*id, row_ids.clone()))
+            .collect::<Vec<(u32, RowIDs)>>();
+        assert_eq!(got, exp, "{}", name);
+    }
+
+    #[test]
     fn dictionary() {
         let encodings = vec![
             Encoding::RLE(RLE::default()),
-            // Encoding::Plain(Plain::default()),
+            Encoding::Plain(Plain::default()),
         ];
 
         for enc in encodings {

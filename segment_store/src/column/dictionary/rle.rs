@@ -26,7 +26,7 @@ pub struct RLE {
     // The set of rows that belong to each distinct value in the dictionary.
     // This allows essentially constant time grouping of rows on the column by
     // value.
-    index_row_ids: BTreeMap<u32, Bitmap>,
+    index_row_ids: BTreeMap<u32, RowIDs>,
 
     // stores tuples where each pair refers to a dictionary entry and the number
     // of times the entry repeats.
@@ -51,7 +51,7 @@ impl Default for RLE {
             contains_null: false,
             num_rows: 0,
         };
-        _self.index_row_ids.insert(NULL_ID, Bitmap::create());
+        _self.index_row_ids.insert(NULL_ID, RowIDs::new_bitmap());
 
         _self
     }
@@ -69,7 +69,7 @@ impl RLE {
 
             _self.entry_index.insert(entry.clone(), next_id);
             _self.index_entries.push(entry);
-            _self.index_row_ids.insert(next_id, Bitmap::create());
+            _self.index_row_ids.insert(next_id, RowIDs::new_bitmap());
         }
 
         _self
@@ -153,7 +153,7 @@ impl RLE {
                 self.index_row_ids
                     .get_mut(&id)
                     .unwrap()
-                    .add_range(self.num_rows as u64..self.num_rows as u64 + additional as u64);
+                    .add_range(self.num_rows, self.num_rows + additional);
             }
             // no dictionary entry for value.
             None => {
@@ -167,7 +167,7 @@ impl RLE {
                 self.index_entries.push(v.clone());
 
                 self.entry_index.insert(v, next_id);
-                self.index_row_ids.insert(next_id, Bitmap::create());
+                self.index_row_ids.insert(next_id, RowIDs::new_bitmap());
 
                 // start a new run-length
                 self.run_lengths.push((next_id, additional));
@@ -176,7 +176,7 @@ impl RLE {
                 self.index_row_ids
                     .get_mut(&(next_id as u32))
                     .unwrap()
-                    .add_range(self.num_rows as u64..self.num_rows as u64 + additional as u64);
+                    .add_range(self.num_rows, self.num_rows + additional);
             }
         }
         self.num_rows += additional;
@@ -198,7 +198,7 @@ impl RLE {
             self.index_row_ids
                 .get_mut(&NULL_ID)
                 .unwrap()
-                .add_range(self.num_rows as u64..self.num_rows as u64 + additional as u64);
+                .add_range(self.num_rows, self.num_rows + additional);
         } else {
             // very first run-length in column...
             self.run_lengths.push((NULL_ID, additional));
@@ -208,7 +208,7 @@ impl RLE {
             self.index_row_ids
                 .get_mut(&NULL_ID)
                 .unwrap()
-                .add_range(self.num_rows as u64..self.num_rows as u64 + additional as u64);
+                .add_range(self.num_rows, self.num_rows + additional);
         }
 
         self.num_rows += additional;
@@ -259,7 +259,7 @@ impl RLE {
             match op {
                 cmp::Operator::Equal => {
                     let ids = self.index_row_ids.get(encoded_id).unwrap();
-                    dst.add_from_bitmap(ids);
+                    dst.union(ids);
                     return dst;
                 }
                 cmp::Operator::NotEqual => {
@@ -380,7 +380,7 @@ impl RLE {
     }
 
     // The set of row ids for each distinct value in the column.
-    pub fn group_row_ids(&self) -> &BTreeMap<u32, Bitmap> {
+    pub fn group_row_ids(&self) -> &BTreeMap<u32, RowIDs> {
         &self.index_row_ids
     }
 

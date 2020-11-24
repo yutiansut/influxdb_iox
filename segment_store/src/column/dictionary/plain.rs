@@ -11,8 +11,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::convert::From;
 use std::mem::size_of;
 
-use croaring::Bitmap;
-
 use arrow_deps::arrow::array::{Array, StringArray};
 
 use crate::column::dictionary::NULL_ID;
@@ -469,8 +467,17 @@ impl Plain {
     }
 
     // The set of row ids for each distinct value in the column.
-    pub fn group_row_ids(&self) -> &BTreeMap<u32, Bitmap> {
-        todo!()
+    pub fn group_row_ids(&self) -> BTreeMap<u32, RowIDs> {
+        let mut results = BTreeMap::new();
+        for (i, id) in self.encoded_data.iter().enumerate() {
+            if !results.contains_key(id) {
+                results.insert(*id, RowIDs::bitmap_from_slice(&[i as u32]));
+            }
+
+            results.get_mut(id).unwrap().add(i as u32);
+        }
+
+        results
     }
 
     //

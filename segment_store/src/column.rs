@@ -2511,7 +2511,7 @@ impl RowIDsOption {
 
 /// Represents vectors of row IDs, which are usually used for intermediate
 /// results as a method of late materialisation.
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 pub enum RowIDs {
     Bitmap(Bitmap),
     Vector(Vec<u32>),
@@ -2520,6 +2520,10 @@ pub enum RowIDs {
 impl RowIDs {
     pub fn new_bitmap() -> Self {
         Self::Bitmap(Bitmap::create())
+    }
+
+    pub fn bitmap_from_slice(arr: &[u32]) -> Self {
+        Self::Bitmap(arr.iter().cloned().collect())
     }
 
     pub fn new_vector() -> Self {
@@ -2544,71 +2548,79 @@ impl RowIDs {
     // used for testing.
     pub fn to_vec(&self) -> Vec<u32> {
         match self {
-            RowIDs::Bitmap(bm) => bm.to_vec(),
-            RowIDs::Vector(arr) => arr.clone(),
+            Self::Bitmap(bm) => bm.to_vec(),
+            Self::Vector(arr) => arr.clone(),
         }
     }
 
     pub fn as_slice(&self) -> &[u32] {
         match self {
-            RowIDs::Bitmap(bm) => panic!("not supported yet"),
-            RowIDs::Vector(arr) => arr.as_slice(),
+            Self::Bitmap(bm) => panic!("not supported yet"),
+            Self::Vector(arr) => arr.as_slice(),
         }
     }
 
     pub fn len(&self) -> usize {
         match self {
-            RowIDs::Bitmap(ids) => ids.cardinality() as usize,
-            RowIDs::Vector(ids) => ids.len(),
+            Self::Bitmap(ids) => ids.cardinality() as usize,
+            Self::Vector(ids) => ids.len(),
         }
     }
 
     pub fn is_empty(&self) -> bool {
         match self {
-            RowIDs::Bitmap(ids) => ids.is_empty(),
-            RowIDs::Vector(ids) => ids.is_empty(),
+            Self::Bitmap(ids) => ids.is_empty(),
+            Self::Vector(ids) => ids.is_empty(),
         }
     }
 
     pub fn clear(&mut self) {
         match self {
-            RowIDs::Bitmap(ids) => ids.clear(),
-            RowIDs::Vector(ids) => ids.clear(),
+            Self::Bitmap(ids) => ids.clear(),
+            Self::Vector(ids) => ids.clear(),
         }
     }
 
     pub fn add(&mut self, id: u32) {
         match self {
-            RowIDs::Bitmap(ids) => ids.add(id),
-            RowIDs::Vector(ids) => ids.push(id),
+            Self::Bitmap(ids) => ids.add(id),
+            Self::Vector(ids) => ids.push(id),
         }
     }
 
     pub fn add_range(&mut self, from: u32, to: u32) {
         match self {
-            RowIDs::Bitmap(ids) => ids.add_range(from as u64..to as u64),
-            RowIDs::Vector(ids) => ids.extend(from..to),
+            Self::Bitmap(ids) => ids.add_range(from as u64..to as u64),
+            Self::Vector(ids) => ids.extend(from..to),
         }
     }
 
     // Adds all the values from the provided bitmap into self.
     pub fn add_from_bitmap(&mut self, other: &croaring::Bitmap) {
         match self {
-            RowIDs::Bitmap(_self) => _self.or_inplace(other),
-            RowIDs::Vector(_self) => _self.extend_from_slice(other.to_vec().as_slice()),
+            Self::Bitmap(_self) => _self.or_inplace(other),
+            Self::Vector(_self) => _self.extend_from_slice(other.to_vec().as_slice()),
         }
     }
 
     pub fn intersect(&mut self, other: &RowIDs) {
         match (self, other) {
-            (RowIDs::Bitmap(_self), RowIDs::Bitmap(ref other)) => _self.and_inplace(other),
+            (Self::Bitmap(_self), RowIDs::Bitmap(ref other)) => _self.and_inplace(other),
             (_, _) => unimplemented!("currently unsupported"),
         };
     }
 
     pub fn union(&mut self, other: &RowIDs) {
         match (self, other) {
-            (RowIDs::Bitmap(_self), RowIDs::Bitmap(ref other)) => _self.or_inplace(other),
+            (Self::Bitmap(_self), RowIDs::Bitmap(other)) => _self.or_inplace(other),
+            // N.B this seems very inefficient. It should only be used for testing.
+            (Self::Vector(_self), Self::Bitmap(other)) => {
+                let mut bm: Bitmap = _self.iter().cloned().collect();
+                bm.or_inplace(other);
+
+                _self.clear();
+                _self.extend(bm.iter());
+            }
             (_, _) => unimplemented!("currently unsupported"),
         };
     }
