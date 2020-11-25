@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use arrow_deps::arrow::datatypes::SchemaRef;
 
 use crate::column::{
-    cmp::Operator, Column, OwnedValue, RowIDs, RowIDsOption, Scalar, Value, Values,
+    cmp::Operator, AggregateType, Column, OwnedValue, RowIDs, RowIDsOption, Scalar, Value, Values,
 };
 
 /// The name used for a timestamp column.
@@ -297,6 +297,30 @@ impl Segment {
             return RowIDsOption::All(result_row_ids);
         }
         RowIDsOption::Some(result_row_ids)
+    }
+
+    /// Returns a set of group keys and aggregated column data associated with
+    /// them.
+    ///
+    /// Right now, predicates are conjunctive (AND).
+    pub fn read_group<'a>(
+        &self,
+        predicates: &[Predicate<'_>],
+        group_columns: Vec<ColumnName<'a>>,
+        aggregates: Vec<(ColumnName<'a>, AggregateType)>,
+    ) -> Vec<(ColumnName<'a>, AggregateType, Values)> {
+        let row_ids = self.row_ids_from_predicates(predicates);
+        vec![]
+    }
+
+    fn group_by_column_ids(
+        &self,
+        name: &str,
+    ) -> Option<&std::collections::BTreeMap<u32, croaring::Bitmap>> {
+        // if let Some(c) = self.column(name) {
+        //     return Some(c.group_by_ids());
+        // }
+        None
     }
 }
 
