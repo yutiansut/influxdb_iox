@@ -630,7 +630,10 @@ impl Plain {
         dst.clear();
         dst.reserve(row_ids.len());
 
-        todo!()
+        for row_id in row_ids {
+            dst.push(self.encoded_data[*row_id as usize]);
+        }
+        dst
     }
 
     /// Returns all encoded values for the column including the encoded value

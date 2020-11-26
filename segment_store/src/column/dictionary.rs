@@ -902,6 +902,62 @@ mod test {
     }
 
     #[test]
+    fn encoded_values() {
+        let encodings = vec![
+            Encoding::RLE(RLE::default()),
+            Encoding::Plain(Plain::default()),
+        ];
+
+        for enc in encodings {
+            _encoded_values(enc);
+        }
+    }
+
+    fn _encoded_values(mut enc: Encoding) {
+        let name = enc.debug_name();
+
+        enc.push_additional(Some("east".to_string()), 3); // 0, 1, 2
+        enc.push_additional(Some("north".to_string()), 1); // 3
+        enc.push_additional(Some("east".to_string()), 5); // 4, 5, 6, 7, 8
+        enc.push_additional(Some("south".to_string()), 2); // 9, 10
+        enc.push_none(); // 11
+
+        let mut encoded = enc.encoded_values(&[0], vec![]);
+        assert_eq!(encoded, vec![1], "{}", name);
+
+        encoded = enc.encoded_values(&[1, 3, 5, 6], vec![]);
+        assert_eq!(encoded, vec![1, 2, 1, 1], "{}", name);
+
+        encoded = enc.encoded_values(&[9, 10, 11], vec![]);
+        assert_eq!(encoded, vec![3, 3, 0], "{}", name);
+    }
+
+    #[test]
+    fn all_encoded_values() {
+        let encodings = vec![
+            Encoding::RLE(RLE::default()),
+            Encoding::Plain(Plain::default()),
+        ];
+
+        for enc in encodings {
+            _all_encoded_values(enc);
+        }
+    }
+
+    fn _all_encoded_values(mut enc: Encoding) {
+        let name = enc.debug_name();
+
+        enc.push_additional(Some("east".to_string()), 3);
+        enc.push_additional(None, 2);
+        enc.push_additional(Some("north".to_string()), 2);
+
+        let dst = Vec::with_capacity(100);
+        let dst = enc.all_encoded_values(dst);
+        assert_eq!(dst, vec![1, 1, 1, 0, 0, 2, 2], "{}", name);
+        assert_eq!(dst.capacity(), 100, "{}", name);
+    }
+
+    #[test]
     fn distinct_values() {
         let mut enc = Encoding::RLE(RLE::default());
         enc.push_additional(Some("east".to_string()), 100);
@@ -1009,38 +1065,6 @@ mod test {
         enc.push_additional(None, 10);
         assert!(!enc.has_non_null_value(&[0]));
         assert!(!enc.has_non_null_value(&[4, 7]));
-    }
-
-    #[test]
-    fn encoded_values() {
-        let mut enc = Encoding::RLE(RLE::default());
-        enc.push_additional(Some("east".to_string()), 3); // 0, 1, 2
-        enc.push_additional(Some("north".to_string()), 1); // 3
-        enc.push_additional(Some("east".to_string()), 5); // 4, 5, 6, 7, 8
-        enc.push_additional(Some("south".to_string()), 2); // 9, 10
-        enc.push_none(); // 11
-
-        let mut encoded = enc.encoded_values(&[0], vec![]);
-        assert_eq!(encoded, vec![1]);
-
-        encoded = enc.encoded_values(&[1, 3, 5, 6], vec![]);
-        assert_eq!(encoded, vec![1, 2, 1, 1]);
-
-        encoded = enc.encoded_values(&[9, 10, 11], vec![]);
-        assert_eq!(encoded, vec![3, 3, 0]);
-    }
-
-    #[test]
-    fn all_encoded_values() {
-        let mut enc = Encoding::RLE(RLE::default());
-        enc.push_additional(Some("east".to_string()), 3);
-        enc.push_additional(None, 2);
-        enc.push_additional(Some("north".to_string()), 2);
-
-        let dst = Vec::with_capacity(100);
-        let dst = enc.all_encoded_values(dst);
-        assert_eq!(dst, vec![1, 1, 1, 0, 0, 2, 2]);
-        assert_eq!(dst.capacity(), 100);
     }
 
     #[test]
