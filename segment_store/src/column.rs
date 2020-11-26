@@ -216,8 +216,8 @@ impl Column {
             Self::Integer(_, data) => data.all_encoded_values(dst),
             // Right now it only makes sense to expose encoded values on columns
             // that are being used for grouping operations, which typically is
-            // are Tag Columns; they are `String` columns.
-            _ => unimplemented!("encoded values on other column types not supported"),
+            // are Tag Columns (Strings) or Time Columns (Integers).
+            _ => unimplemented!("encoded values on other column types not currently supported"),
         }
     }
 
@@ -2055,6 +2055,23 @@ pub enum AggregateType {
     // Percentile
 }
 
+impl std::fmt::Display for AggregateType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                AggregateType::Count => "count",
+                AggregateType::First => "first",
+                AggregateType::Last => "last",
+                AggregateType::Min => "min",
+                AggregateType::Max => "max",
+                AggregateType::Sum => "sum",
+            }
+        )
+    }
+}
+
 /// These variants hold aggregates, which are the results of applying aggregates
 /// to column data.
 pub enum AggregateResult<'a> {
@@ -2451,6 +2468,14 @@ pub enum EncodedValues {
 }
 
 impl EncodedValues {
+    pub fn with_capacity_i64(capacity: usize) -> Self {
+        Self::I64(Vec::with_capacity(capacity))
+    }
+
+    pub fn with_capacity_u32(capacity: usize) -> Self {
+        Self::U32(Vec::with_capacity(capacity))
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::I64(v) => v.len(),
