@@ -160,6 +160,18 @@ impl Column {
         }
     }
 
+    /// All logical values in the column.
+    pub fn all_values(&self) -> Values {
+        match &self {
+            Column::String(_, data) => data.all_values(),
+            Column::Float(_, data) => data.all_values(),
+            Column::Integer(_, data) => data.all_values(),
+            Column::Unsigned(_, data) => data.all_values(),
+            Column::Bool => todo!(),
+            Column::ByteArray(_, _) => todo!(),
+        }
+    }
+
     // The distinct set of values found at the logical row ids.
     pub fn distinct_values(&self, row_ids: &[u32]) -> ValueSet<'_> {
         assert!(
@@ -196,7 +208,7 @@ impl Column {
         match &self {
             Self::String(_, data) => match dst {
                 EncodedValues::U32(dst) => EncodedValues::U32(data.encoded_values(row_ids, dst)),
-                _ => unimplemented!("column type does not support requested encoding"),
+                typ => unimplemented!("column type String does not support {:?} encoding", typ),
             },
             Self::Integer(_, data) => data.encoded_values(row_ids, dst),
             // Right now it only makes sense to expose encoded values on columns
@@ -681,6 +693,16 @@ impl StringEncoding {
         }
     }
 
+    /// All values in the column.
+    ///
+    /// TODO(edd): perf - pooling of destination vectors.
+    pub fn all_values(&self) -> Values {
+        match &self {
+            Self::RLEDictionary(c) => Values::String(StringArray::from(c.all_values(vec![]))),
+            Self::Dictionary(c) => Values::String(StringArray::from(c.all_values(vec![]))),
+        }
+    }
+
     /// Returns the distinct set of values found at the provided row ids.
     ///
     /// TODO(edd): perf - pooling of destination sets.
@@ -1115,6 +1137,58 @@ impl IntegerEncoding {
         }
     }
 
+    /// Returns all logical values in the column.
+    ///
+    /// TODO(edd): perf - provide a pooling mechanism for these destination vectors
+    /// so that they can be re-used.
+    pub fn all_values(&self) -> Values {
+        match &self {
+            // signed 64-bit variants - logical type is i64 for all these
+            Self::I64I64(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+            Self::I64I32(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+            Self::I64U32(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+            Self::I64I16(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+            Self::I64U16(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+            Self::I64I8(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+            Self::I64U8(c) => Values::I64(Int64Array::from(c.all_values::<i64>(vec![]))),
+
+            // signed 32-bit variants - logical type is i32 for all these
+            Self::I32I32(c) => Values::I32(Int32Array::from(c.all_values::<i32>(vec![]))),
+            Self::I32I16(c) => Values::I32(Int32Array::from(c.all_values::<i32>(vec![]))),
+            Self::I32U16(c) => Values::I32(Int32Array::from(c.all_values::<i32>(vec![]))),
+            Self::I32I8(c) => Values::I32(Int32Array::from(c.all_values::<i32>(vec![]))),
+            Self::I32U8(c) => Values::I32(Int32Array::from(c.all_values::<i32>(vec![]))),
+
+            // signed 16-bit variants - logical type is i16 for all these
+            Self::I16I16(c) => Values::I16(Int16Array::from(c.all_values::<i16>(vec![]))),
+            Self::I16I8(c) => Values::I16(Int16Array::from(c.all_values::<i16>(vec![]))),
+            Self::I16U8(c) => Values::I16(Int16Array::from(c.all_values::<i16>(vec![]))),
+
+            // signed 8-bit variant - logical type is i8
+            Self::I8I8(c) => Values::I8(Int8Array::from(c.all_values::<i8>(vec![]))),
+
+            // unsigned 64-bit variants - logical type is u64 for all these
+            Self::U64U64(c) => Values::U64(UInt64Array::from(c.all_values::<u64>(vec![]))),
+            Self::U64U32(c) => Values::U64(UInt64Array::from(c.all_values::<u64>(vec![]))),
+            Self::U64U16(c) => Values::U64(UInt64Array::from(c.all_values::<u64>(vec![]))),
+            Self::U64U8(c) => Values::U64(UInt64Array::from(c.all_values::<u64>(vec![]))),
+
+            // unsigned 32-bit variants - logical type is u32 for all these
+            Self::U32U32(c) => Values::U32(UInt32Array::from(c.all_values::<u32>(vec![]))),
+            Self::U32U16(c) => Values::U32(UInt32Array::from(c.all_values::<u32>(vec![]))),
+            Self::U32U8(c) => Values::U32(UInt32Array::from(c.all_values::<u32>(vec![]))),
+
+            // unsigned 16-bit variants - logical type is u16 for all these
+            Self::U16U16(c) => Values::U16(UInt16Array::from(c.all_values::<u16>(vec![]))),
+            Self::U16U8(c) => Values::U16(UInt16Array::from(c.all_values::<u16>(vec![]))),
+
+            // unsigned 8-bit variant - logical type is u8
+            Self::U8U8(c) => Values::U8(UInt8Array::from(c.all_values::<u8>(vec![]))),
+
+            Self::I64I64N(c) => Values::I64(Int64Array::from(c.all_values(vec![]))),
+        }
+    }
+
     /// Returns the encoded values found at the provided row ids. For an
     /// `IntegerEncoding` the encoded values are typically just the raw values.
     pub fn encoded_values(&self, row_ids: &[u32], dst: EncodedValues) -> EncodedValues {
@@ -1457,6 +1531,16 @@ impl FloatEncoding {
         match &self {
             Self::Fixed64(c) => Values::F64(Float64Array::from(c.values::<f64>(row_ids, vec![]))),
             Self::Fixed32(c) => Values::F32(Float32Array::from(c.values::<f32>(row_ids, vec![]))),
+        }
+    }
+
+    /// Returns all logical values in the column.
+    ///
+    /// TODO(edd): perf - pooling of destination vectors.
+    pub fn all_values(&self) -> Values {
+        match &self {
+            Self::Fixed64(c) => Values::F64(Float64Array::from(c.all_values::<f64>(vec![]))),
+            Self::Fixed32(c) => Values::F32(Float32Array::from(c.all_values::<f32>(vec![]))),
         }
     }
 
@@ -2689,12 +2773,7 @@ mod test {
 
             assert_eq!(
                 enc.all_values(vec![]),
-                vec![
-                    None,
-                    Some(&"world".to_string()),
-                    None,
-                    Some(&"hello".to_string())
-                ]
+                vec![None, Some("world"), None, Some("hello")]
             );
 
             assert_eq!(enc.all_encoded_values(vec![]), vec![0, 2, 0, 1,]);
@@ -2717,10 +2796,7 @@ mod test {
                 }
             );
 
-            assert_eq!(
-                enc.all_values(vec![]),
-                vec![Some(&"world".to_string()), Some(&"hello".to_string())]
-            );
+            assert_eq!(enc.all_values(vec![]), vec![Some("world"), Some("hello")]);
 
             assert_eq!(enc.all_encoded_values(vec![]), vec![2, 1]);
         } else {

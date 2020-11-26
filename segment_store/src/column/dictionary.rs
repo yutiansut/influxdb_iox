@@ -205,7 +205,7 @@ impl Encoding {
     ///
     /// NULL values are represented by None.
     ///
-    fn all_values<'a>(&'a mut self, dst: Vec<Option<&'a String>>) -> Vec<Option<&'a String>> {
+    fn all_values<'a>(&'a mut self, dst: Vec<Option<&'a str>>) -> Vec<Option<&'a str>> {
         match self {
             Encoding::RLE(enc) => enc.all_values(dst),
             Encoding::Plain(enc) => enc.all_values(dst),
@@ -325,15 +325,15 @@ mod test {
         assert_eq!(
             enc.all_values(vec![]),
             [
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
+                Some("hello"),
+                Some("hello"),
+                Some("hello"),
+                Some("hello"),
+                Some("hello"),
                 None,
                 None,
                 None,
-                Some(&"world".to_string()),
+                Some("world"),
             ],
             "{}",
             name
@@ -344,18 +344,18 @@ mod test {
         assert_eq!(
             enc.all_values(vec![]),
             [
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
-                Some(&"hello".to_string()),
+                Some("hello"),
+                Some("hello"),
+                Some("hello"),
+                Some("hello"),
+                Some("hello"),
                 None,
                 None,
                 None,
-                Some(&"world".to_string()),
-                Some(&"zoo".to_string()),
-                Some(&"zoo".to_string()),
-                Some(&"zoo".to_string()),
+                Some("world"),
+                Some("zoo"),
+                Some("zoo"),
+                Some("zoo"),
                 None,
             ],
             "{}",
@@ -388,7 +388,7 @@ mod test {
 
         assert_eq!(
             enc.all_values(vec![]),
-            vec![Some(&"world".to_string()), Some(&"hello".to_string())],
+            vec![Some("world"), Some("hello")],
             "{}",
             name
         );
@@ -400,7 +400,7 @@ mod test {
 
         assert_eq!(
             enc.all_values(vec![]),
-            vec![Some(&"hello".to_string()), Some(&"world".to_string())],
+            vec![Some("hello"), Some("world")],
             "{}",
             name
         );
@@ -888,16 +888,11 @@ mod test {
 
         enc.push_none();
 
-        let zoo = "zoo".to_string();
-        let dst = vec![Some(&zoo), Some(&zoo), Some(&zoo), Some(&zoo)];
+        let zoo = Some("zoo");
+        let dst = vec![zoo; 4];
         let got = enc.all_values(dst);
 
-        assert_eq!(
-            got,
-            [Some(&"hello".to_string()), Some(&"zoo".to_string()), None],
-            "{}",
-            name
-        );
+        assert_eq!(got, [Some("hello"), zoo, None], "{}", name);
         assert_eq!(got.capacity(), 4, "{}", name);
     }
 

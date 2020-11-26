@@ -617,17 +617,14 @@ impl RLE {
     ///
     /// NULL values are represented by None.
     ///
-    pub fn all_values<'a>(
-        &'a mut self,
-        mut dst: Vec<Option<&'a String>>,
-    ) -> Vec<Option<&'a String>> {
+    pub fn all_values<'a>(&'a self, mut dst: Vec<Option<&'a str>>) -> Vec<Option<&'a str>> {
         dst.clear();
         dst.reserve(self.num_rows as usize);
 
         for (id, rl) in &self.run_lengths {
             let v = match *id {
                 NULL_ID => None,
-                id => Some(&self.index_entries[id as usize]),
+                id => Some(self.index_entries[id as usize].as_str()),
             };
 
             dst.extend(iter::repeat(v).take(*rl as usize));

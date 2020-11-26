@@ -579,22 +579,19 @@ impl Plain {
     ///
     /// NULL values are represented by None.
     ///
-    pub fn all_values<'a>(
-        &'a mut self,
-        mut dst: Vec<Option<&'a String>>,
-    ) -> Vec<Option<&'a String>> {
+    pub fn all_values<'a>(&'a self, mut dst: Vec<Option<&'a str>>) -> Vec<Option<&'a str>> {
         dst.clear();
         dst.reserve(self.entries.len());
 
         for chunks in self.encoded_data.chunks_exact(4) {
-            dst.push(self.entries[chunks[0] as usize].as_ref());
-            dst.push(self.entries[chunks[1] as usize].as_ref());
-            dst.push(self.entries[chunks[2] as usize].as_ref());
-            dst.push(self.entries[chunks[3] as usize].as_ref());
+            dst.push(self.entries[chunks[0] as usize].as_deref());
+            dst.push(self.entries[chunks[1] as usize].as_deref());
+            dst.push(self.entries[chunks[2] as usize].as_deref());
+            dst.push(self.entries[chunks[3] as usize].as_deref());
         }
 
         for &v in &self.encoded_data[dst.len()..self.encoded_data.len()] {
-            dst.push(self.entries[v as usize].as_ref());
+            dst.push(self.entries[v as usize].as_deref());
         }
         dst
     }
