@@ -317,6 +317,8 @@ impl Segment {
         group_columns: &[ColumnName<'a>],
         aggregates: &[(ColumnName<'a>, AggregateType)],
     ) -> ReadGroupResult<'a> {
+        let now = std::time::Instant::now();
+
         let row_ids = self.row_ids_from_predicates(predicates);
         let filter_row_ids = match row_ids {
             RowIDsOption::None(_) => return ReadGroupResult::default(), // no matching rows
@@ -431,7 +433,12 @@ impl Segment {
         //     group_keys: group_key_vec,
         //     aggregates: aggregate_vec,
         // }
-        println!("group keys {}", group_key_vec.len());
+        println!(
+            "time: {:?} group keys {} aggs {}",
+            now.elapsed(),
+            group_key_vec.len(),
+            aggregate_vec[0].len()
+        );
         ReadGroupResult::default()
     }
 }

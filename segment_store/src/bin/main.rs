@@ -25,7 +25,7 @@ const START_TIME: i64 = 1604188800000000000_i64;
 
 // determines how many rows will be in a single segment, which is set to one
 // hour.
-const ROWS_PER_HOUR: usize = 1_000_000;
+const ROWS_PER_HOUR: usize = 2_000_000;
 
 // minimum and maximum number of spans in a trace
 const SPANS_MIN: usize = 10;
@@ -51,13 +51,13 @@ fn main() {
     ];
 
     // uncomment this to generate a record batch.
-    let (rb, sample_trace_id) = generate_record_batch(&mut rng);
+    // let (rb, sample_trace_id) = generate_record_batch(&mut rng);
     // println!("Saving Arrow file");
     // save_record_batch(&rb[0]);
 
     // uncomment this to load record batch from file.
     // let sample_trace_id = "zzzzm6FK".to_string();
-    // let rb = load_record_batch();
+    let rb = load_record_batch("/Users/edd/tracing_10m-g6oHreN9.arrow");
 
     let now = Instant::now();
     let table = table::Table::with_record_batch("tracing".to_string(), column_names, &rb[0]);
@@ -477,9 +477,9 @@ fn save_record_batch(rb: &RecordBatch) {
     writer.finish().unwrap();
 }
 
-fn load_record_batch() -> Vec<RecordBatch> {
+fn load_record_batch(name: &str) -> Vec<RecordBatch> {
     let now = std::time::Instant::now();
-    let file = File::open("/Users/edd/tracing_100m-zzzzm6FK.arrow").unwrap();
+    let file = File::open(name).unwrap();
     let reader = reader::StreamReader::try_new(file).unwrap();
     let rbs = reader.map(|r| r.unwrap()).collect::<Vec<_>>();
     println!("Loading record batches from arrow took {:?}", now.elapsed());
