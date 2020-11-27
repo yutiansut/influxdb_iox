@@ -172,6 +172,15 @@ impl Column {
         }
     }
 
+    /// The value present at the provided logical row id.
+    pub fn decode_id(&self, encoded_id: u32) -> Value<'_> {
+        match &self {
+            Column::String(_, data) => data.decode_id(encoded_id),
+            Column::ByteArray(_, _) => todo!(),
+            _ => panic!("unsupported operation"),
+        }
+    }
+
     // The distinct set of values found at the logical row ids.
     pub fn distinct_values(&self, row_ids: &[u32]) -> ValueSet<'_> {
         assert!(
@@ -700,6 +709,20 @@ impl StringEncoding {
         match &self {
             Self::RLEDictionary(c) => Values::String(StringArray::from(c.all_values(vec![]))),
             Self::Dictionary(c) => Values::String(StringArray::from(c.all_values(vec![]))),
+        }
+    }
+
+    /// Returns the logical value for the specified encoded representation.
+    pub fn decode_id(&self, encoded_id: u32) -> Value<'_> {
+        match &self {
+            Self::RLEDictionary(c) => match c.decode_id(encoded_id) {
+                Some(v) => Value::String(v),
+                None => Value::Null,
+            },
+            Self::Dictionary(c) => match c.decode_id(encoded_id) {
+                Some(v) => Value::String(v),
+                None => Value::Null,
+            },
         }
     }
 
@@ -2158,6 +2181,7 @@ impl std::fmt::Display for AggregateType {
 
 /// These variants hold aggregates, which are the results of applying aggregates
 /// to column data.
+#[derive(Debug, Copy, Clone)]
 pub enum AggregateResult<'a> {
     // Any type of column can have rows counted. NULL values do not contribute
     // to the count. If all rows are NULL then count will be `0`.
@@ -2277,6 +2301,38 @@ impl<'a> AggregateResult<'a> {
                 (_, _) => unreachable!("not a possible variant combination"),
             },
             _ => unimplemented!("First and Last aggregates not implemented yet"),
+        }
+    }
+}
+
+impl From<&AggregateType> for AggregateResult<'_> {
+    fn from(typ: &AggregateType) -> Self {
+        match typ {
+            AggregateType::Count => Self::Count(0),
+            AggregateType::First => Self::First(None),
+            AggregateType::Last => Self::Last(None),
+            AggregateType::Min => Self::Min(Value::Null),
+            AggregateType::Max => Self::Max(Value::Null),
+            AggregateType::Sum => Self::Sum(Scalar::Null),
+        }
+    }
+}
+
+impl std::fmt::Display for AggregateResult<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregateResult::Count(v) => write!(f, "{}", v),
+            AggregateResult::First(v) => match v {
+                Some((_, v)) => write!(f, "{}", v),
+                None => write!(f, "NULL"),
+            },
+            AggregateResult::Last(v) => match v {
+                Some((_, v)) => write!(f, "{}", v),
+                None => write!(f, "NULL"),
+            },
+            AggregateResult::Min(v) => write!(f, "{}", v),
+            AggregateResult::Max(v) => write!(f, "{}", v),
+            AggregateResult::Sum(v) => write!(f, "{}", v),
         }
     }
 }
@@ -2448,6 +2504,24 @@ impl<'a> std::ops::AddAssign<&Scalar> for &mut Scalar {
     }
 }
 
+impl std::fmt::Display for Scalar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Scalar::Null => write!(f, "NULL"),
+            Scalar::I64(v) => write!(f, "{}", v),
+            Scalar::I32(v) => write!(f, "{}", v),
+            Scalar::I16(v) => write!(f, "{}", v),
+            Scalar::I8(v) => write!(f, "{}", v),
+            Scalar::U64(v) => write!(f, "{}", v),
+            Scalar::U32(v) => write!(f, "{}", v),
+            Scalar::U16(v) => write!(f, "{}", v),
+            Scalar::U8(v) => write!(f, "{}", v),
+            Scalar::F64(v) => write!(f, "{}", v),
+            Scalar::F32(v) => write!(f, "{}", v),
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, PartialOrd, Clone)]
 pub enum OwnedValue {
     // Represents a NULL value in a column row.
@@ -2487,7 +2561,7 @@ impl PartialOrd<Value<'_>> for OwnedValue {
 }
 
 /// Each variant is a possible value type that can be returned from a column.
-#[derive(Debug, PartialEq, PartialOrd, Clone)]
+#[derive(Debug, PartialEq, PartialOrd, Copy, Clone)]
 pub enum Value<'a> {
     // Represents a NULL value in a column row.
     Null,
@@ -2936,7 +3010,7 @@ mod test {
         let arr = StringArray::from(input);
 
         let col = Column::from(arr);
-        if let Column::String(meta, StringEncoding::RLEDictionary(mut enc)) = col {
+        if let Column::String(meta, StringEncoding::RLEDictionary(enc)) = col {
             assert_eq!(
                 meta,
                 super::MetaData::<String> {
@@ -2961,7 +3035,7 @@ mod test {
     fn from_strs() {
         let arr = vec!["world", "hello"];
         let col = Column::from(arr.as_slice());
-        if let Column::String(meta, StringEncoding::RLEDictionary(mut enc)) = col {
+        if let Column::String(meta, StringEncoding::RLEDictionary(enc)) = col {
             assert_eq!(
                 meta,
                 super::MetaData::<String> {

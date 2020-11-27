@@ -148,7 +148,7 @@ impl Encoding {
     /// Materialises the decoded value belonging to the provided encoded id.
     ///
     /// Panics if there is no decoded value for the provided id
-    fn decode_id(&self, encoded_id: u32) -> Option<String> {
+    fn decode_id(&self, encoded_id: u32) -> Option<&str> {
         match self {
             Encoding::RLE(enc) => enc.decode_id(encoded_id),
             Encoding::Plain(enc) => enc.decode_id(encoded_id),

@@ -521,8 +521,8 @@ impl Plain {
     /// Materialises the decoded value belonging to the provided encoded id.
     ///
     /// Panics if there is no decoded value for the provided id
-    pub fn decode_id(&self, encoded_id: u32) -> Option<String> {
-        self.entries[encoded_id as usize].clone()
+    pub fn decode_id(&self, encoded_id: u32) -> Option<&str> {
+        self.entries[encoded_id as usize].as_deref()
     }
 
     /// Materialises a vector of references to the decoded values in the

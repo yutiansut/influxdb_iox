@@ -423,10 +423,10 @@ impl RLE {
     /// Materialises the decoded value belonging to the provided encoded id.
     ///
     /// Panics if there is no decoded value for the provided id
-    pub fn decode_id(&self, encoded_id: u32) -> Option<String> {
+    pub fn decode_id(&self, encoded_id: u32) -> Option<&str> {
         match encoded_id {
             NULL_ID => None,
-            _ => Some(self.index_entries[encoded_id as usize].clone()),
+            _ => Some(self.index_entries[encoded_id as usize].as_str()),
         }
     }
 
