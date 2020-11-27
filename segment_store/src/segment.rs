@@ -1,10 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use arrow_deps::arrow::datatypes::SchemaRef;
 
 use crate::column::{
-    cmp::Operator, AggregateType, Column, EncodedValues, OwnedValue, RowIDs, RowIDsOption, Scalar,
-    Value, Values, ValuesIterator,
+    cmp::Operator, AggregateResult, AggregateType, Column, EncodedValues, OwnedValue, RowIDs,
+    RowIDsOption, Scalar, Value, Values, ValuesIterator,
 };
 
 /// The name used for a timestamp column.
@@ -301,11 +301,12 @@ impl Segment {
     /// them.
     ///
     /// Right now, predicates are conjunctive (AND).
+    #[allow(clippy::map_entry)]
     pub fn read_group<'a>(
-        &self,
-        predicates: &[Predicate<'_>],
-        group_columns: Vec<ColumnName<'a>>,
-        aggregates: Vec<(ColumnName<'a>, AggregateType)>,
+        &'a self,
+        predicates: &[Predicate<'a>],
+        group_columns: &[ColumnName<'a>],
+        aggregates: &[(ColumnName<'a>, AggregateType)],
     ) -> ReadGroupResult<'a> {
         let row_ids = self.row_ids_from_predicates(predicates);
         let filter_row_ids = match row_ids {
@@ -316,9 +317,9 @@ impl Segment {
 
         // materialise all encoded values for each column we are grouping on.
         let mut groupby_encoded_ids = Vec::with_capacity(group_columns.len());
-        for name in &group_columns {
+        for name in group_columns {
             let col = self.column_by_name(name);
-            let mut dst_buf = EncodedValues::with_capacity_i64(col.num_rows() as usize);
+            let mut dst_buf = EncodedValues::with_capacity_u32(col.num_rows() as usize);
 
             // do we want some rows for the column or all of them?
             match &filter_row_ids {
@@ -333,25 +334,101 @@ impl Segment {
             groupby_encoded_ids.push(dst_buf);
         }
 
+        // materialise decoded values in aggregate columns.
+        let mut aggregate_columns_data = Vec::with_capacity(aggregates.len());
+        for (name, agg_type) in aggregates {
+            let col = self.column_by_name(name);
+
+            //
+            // TODO(edd): this materialises a column per aggregate. If there are
+            // multiple aggregates for the same column then this will over-allocate
+            //
+            // Do we want some rows for the column or all of them?
+            let column_values = match &filter_row_ids {
+                Some(row_ids) => col.values(row_ids),
+                None => {
+                    // None implies "no partial set of row ids" meaning get all of them.
+                    col.all_values()
+                }
+            };
+            aggregate_columns_data.push(column_values);
+        }
+
+        let mut groups = HashMap::with_capacity(groupby_encoded_ids.len());
+        let mut key_buf = Vec::with_capacity(group_columns.len());
+        key_buf.resize(key_buf.capacity(), 0);
+
+        let total_rows = groupby_encoded_ids[0].len();
+        for row in 0..total_rows {
+            for (j, col_ids) in groupby_encoded_ids.iter().enumerate() {
+                match col_ids {
+                    EncodedValues::I64(ids) => {
+                        key_buf[j] = ids[row];
+                    }
+                    EncodedValues::U32(ids) => {
+                        // TODO(edd): hmmmm. This is unfortunate - we only need
+                        // the encoded values to be 64-bit integers if we are grouping
+                        // by time (i64 column).
+                        key_buf[j] = ids[row] as i64;
+                    }
+                }
+            }
+
+            if !groups.contains_key(&key_buf) {
+                // Initialise any aggregates for the group key
+                let mut group_key_aggs = Vec::with_capacity(aggregates.len());
+                for (_, agg_type) in aggregates {
+                    group_key_aggs.push(AggregateResult::from(agg_type));
+                }
+
+                for (i, values) in aggregate_columns_data.iter().enumerate() {
+                    group_key_aggs[i].update(values.value(row));
+                }
+
+                groups.insert(key_buf.clone(), group_key_aggs);
+                continue;
+            }
+
+            // Update all aggregates for the group key
+            let group_key_aggs = groups.get_mut(&key_buf).unwrap();
+            for (i, values) in aggregate_columns_data.iter().enumerate() {
+                group_key_aggs[i].update(values.value(row));
+            }
+        }
+
+        // Finally, build results set. Each encoded group key needs to be
+        // materialised into a logical group key
+        let col_buf = group_columns
+            .iter()
+            .map(|name| self.column_by_name(name))
+            .collect::<Vec<_>>();
+        let mut group_key_vec = Vec::with_capacity(groups.len());
+        let mut aggregate_vec = Vec::with_capacity(groups.len());
+
+        for (group_key, aggs) in groups.into_iter() {
+            let mut logical_key = Vec::with_capacity(group_key.len());
+            for (col_idx, &encoded_id) in group_key.iter().enumerate() {
+                // TODO(edd): address the cast to u32
+                logical_key.push(col_buf[col_idx].decode_id(encoded_id as u32));
+            }
+
+            group_key_vec.push(logical_key);
+            aggregate_vec.push(aggs.clone());
+        }
+
+        // ReadGroupResult {
+        //     group_keys: group_key_vec,
+        //     aggregates: aggregate_vec,
+        // }
         ReadGroupResult::default()
     }
-
-    // fn group_by_column_ids(
-    //     &self,
-    //     name: &str,
-    // ) -> Option<&std::collections::BTreeMap<u32, croaring::Bitmap>> {
-    //     if let Some(c) = self.column(name) {
-    //         return Some(c.group_by_ids());
-    //     }
-    //     None
-    // }
 }
 
 pub type Predicate<'a> = (ColumnName<'a>, (Operator, Value<'a>));
 
 // A GroupKey is an ordered collection of row values. The order determines which
 // columns the values originated from.
-pub type GroupKey = Vec<String>;
+pub type GroupKey<'a> = Vec<Value<'a>>;
 
 // A representation of a column name.
 pub type ColumnName<'a> = &'a str;
@@ -509,42 +586,20 @@ impl<'a> std::fmt::Debug for ReadFilterResult<'a> {
 
 #[derive(Default)]
 pub struct ReadGroupResult<'a> {
-    groupby_columns: Vec<ColumnName<'a>>,
+    // row-wise collection of group keys. Each group key contains column-wise
+    // values for each of the groupby_columns.
+    group_keys: Vec<GroupKey<'a>>,
 
-    groupby_values: Vec<Vec<&'a str>>,
-
-    // Aggregate column values for each group key
-    aggregates: Vec<(ColumnName<'a>, AggregateType, Values)>,
+    // row-wise collection of aggregates. Each aggregate contains column-wise
+    // values for each of the aggregate_columns.
+    aggregates: Vec<Vec<AggregateResult<'a>>>,
 }
 
 use std::iter::Iterator;
 impl<'a> std::fmt::Display for ReadGroupResult<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // header line - display group columns first
-        for (i, name) in self.groupby_columns.iter().enumerate() {
-            write!(f, "{},", name)?;
-        }
-
-        // then display aggregate columns
-        for (i, (col_name, col_agg, _)) in self.aggregates.iter().enumerate() {
-            write!(f, "{}_{}", col_name, col_agg)?;
-
-            if i < self.aggregates.len() - 1 {
-                write!(f, ",")?;
-            }
-        }
-        writeln!(f)?;
-
         // TODO: handle empty results?
-        let expected_rows = self.aggregates[0].2.len();
-
-        // A mapping of aggregate value iterators to their respective column
-        // name.
-        let mut agg_iter_map = self
-            .aggregates
-            .iter()
-            .map(|(name, agg, values)| (format!("{}_{}", name, agg), ValuesIterator::new(values)))
-            .collect::<BTreeMap<String, ValuesIterator<'_>>>();
+        let expected_rows = self.group_keys.len();
 
         let mut row = 0;
         while row < expected_rows {
@@ -553,18 +608,15 @@ impl<'a> std::fmt::Display for ReadGroupResult<'a> {
             }
 
             // write row for group by columns
-            for (i, values) in self.groupby_values.iter().enumerate() {
-                write!(f, "{},", values[row])?;
+            for value in &self.group_keys[row] {
+                write!(f, "{},", value)?;
             }
 
             // write row for aggregate columns
-            for (i, (name, agg, _)) in self.aggregates.iter().enumerate() {
-                let agg_col_name = format!("{}_{}", name, agg);
-                if let Some(itr) = agg_iter_map.get_mut(&agg_col_name) {
-                    write!(f, "{}", itr.next().unwrap())?;
-                    if i < self.aggregates.len() - 1 {
-                        write!(f, ",")?;
-                    }
+            for (col_i, agg) in self.aggregates[row].iter().enumerate() {
+                write!(f, "{}", agg)?;
+                if col_i < self.aggregates[row].len() - 1 {
+                    write!(f, ",")?;
                 }
             }
 
@@ -578,7 +630,6 @@ impl<'a> std::fmt::Display for ReadGroupResult<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use arrow_deps::arrow::array::PrimitiveArray;
 
     fn build_predicates(
         from: i64,
@@ -725,7 +776,7 @@ south,PUT,203",
         )];
 
         for (predicate, group_cols, aggs, expected) in cases {
-            let results = segment.read_group(&predicate, group_cols, aggs);
+            let results = segment.read_group(&predicate, &group_cols, &aggs);
             assert_eq!(format!("{}", results), expected);
         }
     }
@@ -792,27 +843,38 @@ south,PUT,203",
     #[test]
     fn read_group_result_display() {
         let result = ReadGroupResult {
-            groupby_columns: vec!["region", "host"],
-            groupby_values: vec![
-                vec!["east", "east", "west", "west", "west"],
-                vec!["host-a", "host-b", "host-a", "host-c", "host-d"],
+            group_keys: vec![
+                vec![Value::String("east"), Value::String("host-a")],
+                vec![Value::String("east"), Value::String("host-b")],
+                vec![Value::String("west"), Value::String("host-a")],
+                vec![Value::String("west"), Value::String("host-c")],
+                vec![Value::String("west"), Value::String("host-d")],
             ],
             aggregates: vec![
-                (
-                    "temp",
-                    AggregateType::Sum,
-                    Values::I64(PrimitiveArray::from(vec![10, 20, 25, 21, 11])),
-                ),
-                (
-                    "duration",
-                    AggregateType::Count,
-                    Values::U32(PrimitiveArray::from(vec![3, 4, 3, 1, 9])),
-                ),
+                vec![
+                    AggregateResult::Sum(Scalar::I64(10)),
+                    AggregateResult::Count(3),
+                ],
+                vec![
+                    AggregateResult::Sum(Scalar::I64(20)),
+                    AggregateResult::Count(4),
+                ],
+                vec![
+                    AggregateResult::Sum(Scalar::I64(25)),
+                    AggregateResult::Count(3),
+                ],
+                vec![
+                    AggregateResult::Sum(Scalar::I64(21)),
+                    AggregateResult::Count(1),
+                ],
+                vec![
+                    AggregateResult::Sum(Scalar::I64(11)),
+                    AggregateResult::Count(9),
+                ],
             ],
         };
 
-        let expected = "region,host,temp_sum,duration_count
-east,host-a,10,3
+        let expected = "east,host-a,10,3
 east,host-b,20,4
 west,host-a,25,3
 west,host-c,21,1

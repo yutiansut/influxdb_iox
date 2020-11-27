@@ -79,7 +79,7 @@ impl Partition {
         predicates: &[(&str, &str)],
         group_columns: Vec<ColumnName<'_>>,
         aggregates: Vec<(ColumnName<'_>, AggregateType)>,
-    ) -> BTreeMap<GroupKey, Vec<(ColumnName<'_>, AggregateResult<'_>)>> {
+    ) -> BTreeMap<GroupKey<'_>, Vec<(ColumnName<'_>, AggregateResult<'_>)>> {
         // Find the measurement name on the partition and dispatch query to the
         // table for that measurement if the partition's time range overlaps the
         // requested time range.
