@@ -2169,7 +2169,7 @@ pub enum AggregateResult<'a> {
     //
     // TODO(edd): I might explicitly add a Null variant to the Scalar enum like
     // we have with Value...
-    Sum(Option<Scalar>),
+    Sum(Scalar),
 
     // The minimum value in the column data.
     Min(Value<'a>),
@@ -2184,9 +2184,107 @@ pub enum AggregateResult<'a> {
     Last(Option<(i64, Value<'a>)>),
 }
 
+#[allow(unused_assignments)]
+impl<'a> AggregateResult<'a> {
+    pub fn update(&mut self, other: Value<'a>) {
+        if other.is_null() {
+            // a NULL value has no effect on aggregates
+            return;
+        }
+
+        match self {
+            Self::Count(v) => {
+                if !other.is_null() {
+                    *v += 1;
+                }
+            }
+            Self::Min(v) => match (&v, &other) {
+                (Value::Null, _) => {
+                    // something is always smaller than NULL
+                    *v = other.clone();
+                }
+                (Value::String(_), Value::Null) => {} // do nothing
+                (Value::String(a), Value::String(b)) => {
+                    if a.cmp(b) == std::cmp::Ordering::Greater {
+                        *v = other;
+                    }
+                }
+                (Value::String(a), Value::ByteArray(b)) => {
+                    if a.as_bytes().cmp(b) == std::cmp::Ordering::Greater {
+                        *v = other;
+                    }
+                }
+                (Value::ByteArray(_), Value::Null) => {} // do nothing
+                (Value::ByteArray(a), Value::String(b)) => {
+                    if a.cmp(&b.as_bytes()) == std::cmp::Ordering::Greater {
+                        *v = other;
+                    }
+                }
+                (Value::ByteArray(a), Value::ByteArray(b)) => {
+                    if a.cmp(b) == std::cmp::Ordering::Greater {
+                        *v = other;
+                    }
+                }
+                (Value::Scalar(_), Value::Null) => {} // do nothing
+                (Value::Scalar(a), Value::Scalar(b)) => {
+                    if a > b {
+                        *v = other;
+                    }
+                }
+                (_, _) => unreachable!("not a possible variant combination"),
+            },
+            Self::Max(v) => match (&v, &other) {
+                (Value::Null, _) => {
+                    // something is always larger than NULL
+                    *v = other.clone();
+                }
+                (Value::String(_), Value::Null) => {} // do nothing
+                (Value::String(a), Value::String(b)) => {
+                    if a.cmp(b) == std::cmp::Ordering::Less {
+                        *v = other;
+                    }
+                }
+                (Value::String(a), Value::ByteArray(b)) => {
+                    if a.as_bytes().cmp(b) == std::cmp::Ordering::Less {
+                        *v = other;
+                    }
+                }
+                (Value::ByteArray(_), Value::Null) => {} // do nothing
+                (Value::ByteArray(a), Value::String(b)) => {
+                    if a.cmp(&b.as_bytes()) == std::cmp::Ordering::Less {
+                        *v = other;
+                    }
+                }
+                (Value::ByteArray(a), Value::ByteArray(b)) => {
+                    if a.cmp(b) == std::cmp::Ordering::Less {
+                        *v = other;
+                    }
+                }
+                (Value::Scalar(_), Value::Null) => {} // do nothing
+                (Value::Scalar(a), Value::Scalar(b)) => {
+                    if a < b {
+                        *v = other;
+                    }
+                }
+                (_, _) => unreachable!("not a possible variant combination"),
+            },
+            Self::Sum(v) => match (&v, &other) {
+                (Scalar::Null, Value::Scalar(other_scalar)) => {
+                    // NULL + something  == something
+                    *v = *other_scalar;
+                }
+                (_, Value::Scalar(b)) => *v += b,
+                (_, _) => unreachable!("not a possible variant combination"),
+            },
+            _ => unimplemented!("First and Last aggregates not implemented yet"),
+        }
+    }
+}
+
 /// A scalar is a numerical value that can be aggregated.
-#[derive(Debug, PartialEq, PartialOrd, Clone)]
+#[derive(Debug, PartialEq, PartialOrd, Copy, Clone)]
 pub enum Scalar {
+    Null,
     I64(i64),
     I32(i32),
     I16(i16),
@@ -2214,8 +2312,9 @@ macro_rules! typed_scalar_converters {
                     Self::U32(v) => $type::try_from(*v).unwrap(),
                     Self::U16(v) => $type::try_from(*v).unwrap(),
                     Self::U8(v) => $type::try_from(*v).unwrap(),
-                    Self::F64(v) => panic!("cannot convert Self::F64"),
+                    Self::F64(v) => panic!("cannot convert Scalar::F64"),
                     Self::F32(v) => panic!("cannot convert Scalar::F32"),
+                    Self::Null => panic!("cannot convert Scalar::Null"),
                 }
             }
 
@@ -2231,6 +2330,7 @@ macro_rules! typed_scalar_converters {
                     Self::U8(v) => $type::try_from(*v).ok(),
                     Self::F64(v) => panic!("cannot convert Self::F64"),
                     Self::F32(v) => panic!("cannot convert Scalar::F32"),
+                    Self::Null => panic!("cannot convert Scalar::Null"),
                 }
             }
         )*
@@ -2238,6 +2338,10 @@ macro_rules! typed_scalar_converters {
 }
 
 impl Scalar {
+    pub fn is_null(&self) -> bool {
+        matches!(self, Self::Null)
+    }
+
     // Implementations of all the accessors for the variants of `Scalar`.
     typed_scalar_converters! {
         (as_i64, try_as_i64, i64),
@@ -2277,6 +2381,69 @@ impl Scalar {
             Scalar::F64(v) => Some(*v),
             Scalar::F32(v) => Some(f64::from(*v)),
             _ => unimplemented!("converting integer Scalar to f64 unsupported"),
+        }
+    }
+}
+
+impl<'a> std::ops::AddAssign<&Scalar> for Scalar {
+    fn add_assign(&mut self, _rhs: &Scalar) {
+        if _rhs.is_null() {
+            // Adding NULL does nothing.
+            return;
+        }
+
+        match self {
+            Scalar::F64(v) => {
+                if let Scalar::F64(other) = _rhs {
+                    *v += *other;
+                } else {
+                    panic!("invalid AddAssign types");
+                };
+            }
+            Scalar::I64(v) => {
+                if let Scalar::I64(other) = _rhs {
+                    *v += *other;
+                } else {
+                    panic!("invalid AddAssign types");
+                };
+            }
+            Scalar::U64(v) => {
+                if let Scalar::U64(other) = _rhs {
+                    *v += *other;
+                } else {
+                    panic!("invalid AddAssign types");
+                };
+            }
+            _ => unimplemented!("unsupported and to be removed"),
+        }
+    }
+}
+
+impl<'a> std::ops::AddAssign<&Scalar> for &mut Scalar {
+    fn add_assign(&mut self, _rhs: &Scalar) {
+        match self {
+            Scalar::F64(v) => {
+                if let Scalar::F64(other) = _rhs {
+                    *v += *other;
+                } else {
+                    panic!("invalid AddAssign types");
+                };
+            }
+            Scalar::I64(v) => {
+                if let Scalar::I64(other) = _rhs {
+                    *v += *other;
+                } else {
+                    panic!("invalid AddAssign types");
+                };
+            }
+            Scalar::U64(v) => {
+                if let Scalar::U64(other) = _rhs {
+                    *v += *other;
+                } else {
+                    panic!("invalid AddAssign types");
+                };
+            }
+            _ => unimplemented!("unsupported and to be removed"),
         }
     }
 }
@@ -2339,14 +2506,21 @@ pub enum Value<'a> {
 }
 
 impl Value<'_> {
-    fn scalar(&self) -> &Scalar {
+    pub fn is_null(&self) -> bool {
+        if let Self::Null = self {
+            return true;
+        }
+        false
+    }
+
+    pub fn scalar(&self) -> &Scalar {
         if let Self::Scalar(s) = self {
             return s;
         }
         panic!("cannot unwrap Value to Scalar");
     }
 
-    fn string(&self) -> &str {
+    pub fn string(&self) -> &str {
         if let Self::String(s) = self {
             return s;
         }
@@ -2372,6 +2546,7 @@ impl std::fmt::Display for Value<'_> {
                 Scalar::U8(v) => write!(f, "{}", v),
                 Scalar::F64(v) => write!(f, "{}", v),
                 Scalar::F32(v) => write!(f, "{}", v),
+                Scalar::Null => write!(f, "NULL"),
             },
         }
     }
@@ -3864,5 +4039,73 @@ mod test {
         let col = Column::from(arr);
         assert_eq!(col.count(&[0, 1, 2][..]), 1);
         assert_eq!(col.count(&[0, 2][..]), 0);
+    }
+
+    #[test]
+    fn aggregate_result() {
+        let mut res = AggregateResult::Count(0);
+        res.update(Value::Null);
+        assert!(matches!(res, AggregateResult::Count(0)));
+        res.update(Value::String("hello"));
+        assert!(matches!(res, AggregateResult::Count(1)));
+
+        let mut res = AggregateResult::Min(Value::Null);
+        res.update(Value::String("Dance Yrself Clean"));
+        assert!(matches!(
+            res,
+            AggregateResult::Min(Value::String("Dance Yrself Clean"))
+        ));
+        res.update(Value::String("All My Friends"));
+        assert!(matches!(
+            res,
+            AggregateResult::Min(Value::String("All My Friends"))
+        ));
+        res.update(Value::String("Dance Yrself Clean"));
+        assert!(matches!(
+            res,
+            AggregateResult::Min(Value::String("All My Friends"))
+        ));
+        res.update(Value::Null);
+        assert!(matches!(
+            res,
+            AggregateResult::Min(Value::String("All My Friends"))
+        ));
+
+        let mut res = AggregateResult::Max(Value::Null);
+        res.update(Value::Scalar(Scalar::I64(20)));
+        assert!(matches!(
+            res,
+            AggregateResult::Max(Value::Scalar(Scalar::I64(20)))
+        ));
+        res.update(Value::Scalar(Scalar::I64(39)));
+        assert!(matches!(
+            res,
+            AggregateResult::Max(Value::Scalar(Scalar::I64(39)))
+        ));
+        res.update(Value::Scalar(Scalar::I64(20)));
+        assert!(matches!(
+            res,
+            AggregateResult::Max(Value::Scalar(Scalar::I64(39)))
+        ));
+        res.update(Value::Null);
+        assert!(matches!(
+            res,
+            AggregateResult::Max(Value::Scalar(Scalar::I64(39)))
+        ));
+
+        let mut res = AggregateResult::Sum(Scalar::Null);
+        res.update(Value::Null);
+        assert!(matches!(res, AggregateResult::Sum(Scalar::Null)));
+        res.update(Value::Scalar(Scalar::Null));
+        assert!(matches!(res, AggregateResult::Sum(Scalar::Null)));
+
+        res.update(Value::Scalar(Scalar::I64(20)));
+        assert!(matches!(res, AggregateResult::Sum(Scalar::I64(20))));
+
+        res.update(Value::Scalar(Scalar::I64(-5)));
+        assert!(matches!(res, AggregateResult::Sum(Scalar::I64(15))));
+
+        res.update(Value::Scalar(Scalar::Null));
+        assert!(matches!(res, AggregateResult::Sum(Scalar::I64(15))));
     }
 }
