@@ -1,8 +1,9 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use arrow_deps::arrow::datatypes::SchemaRef;
 
-use fxhash::FxHashMap;
+// use fxhash::FxHashMap;
+use hashbrown::{hash_map::DefaultHashBuilder, HashMap};
 
 use crate::column::{
     cmp::Operator, AggregateResult, AggregateType, Column, EncodedValues, OwnedValue, RowIDs,
@@ -365,7 +366,7 @@ impl Segment {
             aggregate_columns_data.push(column_values);
         }
 
-        let mut groups = FxHashMap::default();
+        let mut groups: HashMap<Vec<i64>, Vec<AggregateResult<'_>>> = HashMap::default();
         let mut key_buf = Vec::with_capacity(group_columns.len());
         key_buf.resize(key_buf.capacity(), 0);
 
@@ -385,25 +386,24 @@ impl Segment {
                 }
             }
 
-            if !groups.contains_key(&key_buf) {
-                // Initialise any aggregates for the group key
-                let mut group_key_aggs = Vec::with_capacity(aggregates.len());
-                for (_, agg_type) in aggregates {
-                    group_key_aggs.push(AggregateResult::from(agg_type));
+            match groups.raw_entry_mut().from_key(&key_buf) {
+                hashbrown::hash_map::RawEntryMut::Occupied(mut entry) => {
+                    for (i, values) in aggregate_columns_data.iter().enumerate() {
+                        entry.get_mut()[i].update(values.value(row));
+                    }
                 }
+                hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
+                    let mut group_key_aggs = Vec::with_capacity(aggregates.len());
+                    for (_, agg_type) in aggregates {
+                        group_key_aggs.push(AggregateResult::from(agg_type));
+                    }
 
-                for (i, values) in aggregate_columns_data.iter().enumerate() {
-                    group_key_aggs[i].update(values.value(row));
+                    for (i, values) in aggregate_columns_data.iter().enumerate() {
+                        group_key_aggs[i].update(values.value(row));
+                    }
+
+                    entry.insert(key_buf.clone(), group_key_aggs);
                 }
-
-                groups.insert(key_buf.clone(), group_key_aggs);
-                continue;
-            }
-
-            // Update all aggregates for the group key
-            let group_key_aggs = groups.get_mut(&key_buf).unwrap();
-            for (i, values) in aggregate_columns_data.iter().enumerate() {
-                group_key_aggs[i].update(values.value(row));
             }
         }
 
