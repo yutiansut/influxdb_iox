@@ -13,6 +13,7 @@ packers = { path = "../packers" }
 croaring = "0.4.5"
 rand = "0.7.3"
 rand_distr = "0.3.0"
+fxhash = "0.2.1"
 
 [dev-dependencies]
 criterion = "0.3"

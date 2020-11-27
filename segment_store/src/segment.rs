@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use arrow_deps::arrow::datatypes::SchemaRef;
 
+use fxhash::FxHashMap;
+
 use crate::column::{
     cmp::Operator, AggregateResult, AggregateType, Column, EncodedValues, OwnedValue, RowIDs,
     RowIDsOption, Scalar, Value, Values, ValuesIterator,
@@ -361,7 +363,7 @@ impl Segment {
             aggregate_columns_data.push(column_values);
         }
 
-        let mut groups = HashMap::with_capacity(groupby_encoded_ids.len());
+        let mut groups = FxHashMap::default();
         let mut key_buf = Vec::with_capacity(group_columns.len());
         key_buf.resize(key_buf.capacity(), 0);
 
@@ -420,7 +422,7 @@ impl Segment {
             }
 
             group_key_vec.push(logical_key);
-            aggregate_vec.push(aggs.clone());
+            aggregate_vec.push(aggs);
         }
 
         // ReadGroupResult {
