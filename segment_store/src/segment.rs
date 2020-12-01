@@ -620,7 +620,7 @@ impl<'a> ReadFilterResult<'a> {
     }
 }
 
-impl<'a> std::fmt::Debug for &ReadFilterResult<'a> {
+impl<'a> std::fmt::Debug for ReadFilterResult<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // header line.
         for (i, (k, _)) in self.0.iter().enumerate() {
