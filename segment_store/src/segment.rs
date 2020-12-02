@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use arrow_deps::arrow::datatypes::SchemaRef;
 
 use crate::column::{
-    cmp::Operator, Column, OwnedValue, RowIDs, RowIDsOption, Scalar, Value, Values,
+    cmp::Operator, Column, EncodedValues, OwnedValue, RowIDs, RowIDsOption, Scalar, Value, Values,
 };
 
 /// The name used for a timestamp column.
