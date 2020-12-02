@@ -682,7 +682,7 @@ pub struct ReadGroupResult<'a> {
 
     // row-wise collection of group keys. Each group key contains column-wise
     // values for each of the groupby_columns.
-    group_keys: Vec<GroupKey<'a>>,
+    pub group_keys: Vec<GroupKey<'a>>,
 
     // row-wise collection of aggregates. Each aggregate contains column-wise
     // values for each of the aggregate_columns.

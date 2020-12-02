@@ -2,9 +2,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::slice::Iter;
 
-use arrow_deps::arrow::record_batch::RecordBatch;
+use arrow_deps::{arrow, arrow::record_batch::RecordBatch};
 
-use crate::segment::{ColumnName, GroupKey, Predicate, Segment};
+use crate::{
+    column::Column,
+    segment::{self, ColumnName, GroupKey, Predicate, Segment},
+};
 use crate::{
     column::{AggregateResult, AggregateType, OwnedValue, Scalar, Value},
     segment::{ReadFilterResult, ReadGroupResult},
@@ -46,6 +49,58 @@ impl Table {
         }
     }
 
+    // TODO(edd): error handling
+    pub fn with_record_batch(name: String, col_types: Vec<ColumnType>, rb: &RecordBatch) -> Self {
+        let rows = rb.num_rows();
+        let mut columns = BTreeMap::new();
+        for (i, ct) in col_types.into_iter().enumerate() {
+            match ct {
+                ColumnType::Tag(name) => {
+                    let arrow_column = rb.column(i);
+                    assert_eq!(arrow_column.data_type(), &arrow::datatypes::DataType::Utf8);
+                    let arr: &arrow::array::StringArray = arrow_column
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap();
+
+                    let column_data = Column::from(arr);
+
+                    columns.insert(name, segment::ColumnType::Tag(column_data));
+                }
+                ColumnType::Field(name) => {
+                    let arrow_column = rb.column(i);
+                    let column_data = Column::from(match arrow_column.data_type() {
+                        arrow::datatypes::DataType::Int64 => arrow_column
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .unwrap(),
+                        _ => unimplemented!("TODO: currently unsupported data type for field"),
+                    });
+
+                    columns.insert(name, segment::ColumnType::Field(column_data));
+                }
+                ColumnType::Time => {
+                    let arrow_column = rb.column(i);
+                    let column_data = Column::from(match arrow_column.data_type() {
+                        arrow::datatypes::DataType::Int64 => arrow_column
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .unwrap(),
+                        _ => unimplemented!("TODO: currently unsupported data type for field"),
+                    });
+
+                    columns.insert(
+                        segment::TIME_COLUMN_NAME.to_string(),
+                        segment::ColumnType::Time(column_data),
+                    );
+                }
+            }
+        }
+
+        let segment = Segment::new(rows as u32, columns);
+        Self::new(name, segment)
+    }
+
     /// Add a new segment to this table.
     pub fn add_segment(&mut self, segment: Segment) {
         self.segments.push(segment);
@@ -78,7 +133,7 @@ impl Table {
 
     /// The total size of the table in bytes.
     pub fn size(&self) -> u64 {
-        todo!()
+        self.segments.iter().map(|s| s.size()).sum()
     }
 
     /// The number of rows in this table.
@@ -92,8 +147,8 @@ impl Table {
     }
 
     /// The ranges on each column in the table (across all segments).
-    pub fn column_ranges(&self) -> BTreeMap<String, (OwnedValue, OwnedValue)> {
-        todo!()
+    pub fn column_ranges(&self) -> &BTreeMap<String, (OwnedValue, OwnedValue)> {
+        &self.meta.column_ranges
     }
 
     // Determines if schema contains all the provided column names.
@@ -114,6 +169,10 @@ impl Table {
             // check all provided predicates
             for (col_name, pred) in predicates {
                 if !segment.column_could_satisfy_predicate(col_name, pred) {
+                    println!(
+                        "segment {:?} could not contain predicate {:?}",
+                        col_name, pred
+                    );
                     continue 'seg;
                 }
             }
@@ -133,9 +192,9 @@ impl Table {
     /// since the epoch. Results are included if they satisfy the predicate and
     /// fall with the [min, max) time range domain.
     pub fn select<'a>(
-        &'a self,
-        columns: &[ColumnName<'a>],
-        predicates: &[Predicate<'_>],
+        &'a self, // TODO(edd): this lifetime doesn't seem right
+        columns: &'a [ColumnName<'a>],
+        predicates: &'a [Predicate<'a>],
     ) -> ReadFilterResults<'a> {
         // identify segments where time range and predicates match could match
         // using segment meta data, and then execute against those segments and
@@ -548,13 +607,13 @@ impl<'a> Display for ReadFilterResults<'a> {
 #[derive(Default)]
 pub struct ReadGroupResults<'a> {
     // column-wise collection of columns being grouped by
-    groupby_columns: &'a [ColumnName<'a>],
+    pub groupby_columns: &'a [ColumnName<'a>],
 
     // column-wise collection of columns being aggregated on
-    aggregate_columns: &'a [(ColumnName<'a>, AggregateType)],
+    pub aggregate_columns: &'a [(ColumnName<'a>, AggregateType)],
 
     // segment-wise result sets containing grouped values and aggregates
-    values: Vec<ReadGroupResult<'a>>,
+    pub values: Vec<ReadGroupResult<'a>>,
 }
 
 impl<'a> std::fmt::Display for ReadGroupResults<'a> {
@@ -580,6 +639,12 @@ impl<'a> std::fmt::Display for ReadGroupResults<'a> {
         }
         Ok(())
     }
+}
+
+pub enum ColumnType {
+    Tag(String),
+    Field(String),
+    Time,
 }
 
 #[cfg(test)]

@@ -305,6 +305,11 @@ where
         PackerIterator::new(&self)
     }
 
+    // move values out of Packer
+    pub fn owned(self) -> Vec<Option<T>> {
+        self.values
+    }
+
     // TODO(edd): I don't like these getters. They're only needed so we can
     // write the data into a parquet writer. We should have a method on Packer
     // that accepts some implementation of a trait that a parquet writer satisfies
