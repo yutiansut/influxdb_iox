@@ -1951,14 +1951,94 @@ impl From<arrow::array::Int64Array> for Column {
             _ => unreachable!("min/max must both be Some or None"),
         };
 
-        let data = fixed_null::FixedNull::<arrow::datatypes::Int64Type>::from(arr);
-        let meta = MetaData {
-            size: data.size(),
-            rows: data.num_rows(),
-            range,
-            ..MetaData::default()
+        let (meta, data) = match arr.null_count() {
+            0 => {
+                let data = fixed::Fixed::from(arr);
+                let meta = MetaData {
+                    size: data.size(),
+                    rows: data.num_rows(),
+                    range,
+                    ..MetaData::default()
+                };
+                (meta, IntegerEncoding::I64I64(data))
+            }
+            _ => {
+                let data = fixed_null::FixedNull::<arrow::datatypes::Int64Type>::from(arr);
+                let meta = MetaData {
+                    size: data.size(),
+                    rows: data.num_rows(),
+                    range,
+                    ..MetaData::default()
+                };
+                (meta, IntegerEncoding::I64I64N(data))
+            }
         };
-        Column::Integer(meta, IntegerEncoding::I64I64N(data))
+
+        Column::Integer(meta, data)
+    }
+}
+
+impl From<&arrow::array::Int64Array> for Column {
+    fn from(arr: &arrow::array::Int64Array) -> Self {
+        // determine min and max values.
+        let mut min: Option<i64> = None;
+        let mut max: Option<i64> = None;
+
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+
+            let v = arr.value(i);
+            match min {
+                Some(m) => {
+                    if v < m {
+                        min = Some(v);
+                    }
+                }
+                None => min = Some(v),
+            };
+
+            match max {
+                Some(m) => {
+                    if v > m {
+                        max = Some(v)
+                    }
+                }
+                None => max = Some(v),
+            };
+        }
+
+        let range = match (min, max) {
+            (None, None) => None,
+            (Some(min), Some(max)) => Some((min, max)),
+            _ => unreachable!("min/max must both be Some or None"),
+        };
+
+        let (meta, data) = match arr.null_count() {
+            0 => {
+                let data = fixed::Fixed::from(arr);
+                let meta = MetaData {
+                    size: data.size(),
+                    rows: data.num_rows(),
+                    range,
+                    ..MetaData::default()
+                };
+                (meta, IntegerEncoding::I64I64(data))
+            }
+            _ => {
+                todo!("figure out how to run off of a borrowed arrow array");
+                // let data = fixed_null::FixedNull::<arrow::datatypes::Int64Type>::from(arr);
+                // let meta = MetaData {
+                //     size: data.size(),
+                //     rows: data.num_rows(),
+                //     range,
+                // };
+                // (meta, IntegerEncoding::I64I64N(data))
+            }
+        };
+
+        Column::Integer(meta, data)
     }
 }
 
