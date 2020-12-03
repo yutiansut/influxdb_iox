@@ -814,7 +814,7 @@ impl StringEncoding {
         }
     }
 
-    fn from_arrow_string_array(arr: arrow::array::StringArray) -> Self {
+    fn from_arrow_string_array(arr: &arrow::array::StringArray) -> Self {
         //
         // TODO(edd): potentially switch on things like cardinality in the input
         // and encode in different ways. Right now we only encode with RLE.
@@ -1444,6 +1444,13 @@ impl FloatEncoding {
 // ideally it's a "write once read many" scenario.
 impl From<arrow::array::StringArray> for Column {
     fn from(arr: arrow::array::StringArray) -> Self {
+        let data = StringEncoding::from_arrow_string_array(&arr);
+        Column::String(StringEncoding::meta_from_data(&data), data)
+    }
+}
+
+impl From<&arrow::array::StringArray> for Column {
+    fn from(arr: &arrow::array::StringArray) -> Self {
         let data = StringEncoding::from_arrow_string_array(arr);
         Column::String(StringEncoding::meta_from_data(&data), data)
     }
