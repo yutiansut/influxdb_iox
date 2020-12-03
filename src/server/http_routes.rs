@@ -20,6 +20,7 @@ use influxdb_line_protocol::parse_lines;
 use object_store;
 use storage::{org_and_bucket_to_database, Database, DatabaseStore};
 use data_types::partition_metadata::Partition;
+use server::snapshot::snapshot_partition;
 
 use bytes::{Bytes, BytesMut};
 use futures::{self, StreamExt};
@@ -407,110 +408,10 @@ async fn snapshot_partition<T: DatabaseStore>(
             bucket: &snapshot.bucket,
         })?;
 
-    // TODO: refactor this to happen in the background. Move this logic to the
-    //       cluster (soon to be called server) package
-    let tables = db
-        .table_names_for_partition(&snapshot.partition)
-        .await
-        .map_err(|e| Box::new(e) as _)
-        .context(DatabaseError{database: &db_name})?;
+    let partition = db.as_any().downcast_ref::<write_buffer::Db>().unwrap().remove_partition(&snapshot.partition).await.unwrap();
+    let snapshot = server::snapshot::snapshot_partition;
 
-    let mut partition_meta = Partition::new(snapshot.partition.clone());
-
-    for table in tables {
-        let (batch, meta) = db
-            .partition_table_to_arrow_with_meta(&table, &snapshot.partition)
-            .await
-            .map_err(|e| Box::new(e) as _)
-            .context(DatabaseError{database: &db_name})?;
-
-
-        partition_meta.tables.push(meta);
-
-        let mem_writer = MemWriter::default();
-        {
-            let mut writer =
-                ArrowWriter::try_new(mem_writer.clone(), batch.schema().clone(), None).unwrap();
-            writer.write(&batch).unwrap();
-            writer.close().unwrap();
-        } // drop the reference to the MemWriter that the SerializedFileWriter has
-
-        let data = mem_writer
-            .into_inner()
-            .expect("Nothing else should have a reference here");
-        let len = data.len();
-        let data = Bytes::from(data);
-        let stream_data = std::io::Result::Ok(data);
-
-        let table_path = format!("{}/data/{}/{}.parquet", db_name, &snapshot.partition, &table);
-
-        server
-            .object_store
-            .put(
-                &table_path,
-                futures::stream::once(async move { stream_data }),
-                len)
-            .await
-            .unwrap();
-    }
-
-    let meta_data_path = format!("{}/meta/{}.json", db_name, &snapshot.partition);
-    let json_data = serde_json::to_vec(&partition_meta).context(JsonGenerationError)?;
-    let data = Bytes::from(json_data.clone());
-    let len = data.len();
-    let stream_data = std::io::Result::Ok(data);
-    server.object_store
-        .put(
-            &meta_data_path,
-            futures::stream::once(async move { stream_data }),
-            len,
-        )
-        .await
-        .unwrap();
-
-    Ok(Some(json_data.into()))
-}
-
-#[derive(Debug, Default, Clone)]
-struct MemWriter {
-    mem: Arc<Mutex<Cursor<Vec<u8>>>>,
-}
-
-impl MemWriter {
-    /// Returns the inner buffer as long as there are no other references to the Arc.
-    pub fn into_inner(self) -> Option<Vec<u8>> {
-        Arc::try_unwrap(self.mem)
-            .ok()
-            .and_then(|mutex| mutex.into_inner().ok())
-            .map(|cursor| cursor.into_inner())
-    }
-}
-
-impl Write for MemWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut inner = self.mem.lock().unwrap();
-        inner.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        let mut inner = self.mem.lock().unwrap();
-        inner.flush()
-    }
-}
-
-impl Seek for MemWriter {
-    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        let mut inner = self.mem.lock().unwrap();
-        inner.seek(pos)
-    }
-}
-
-impl TryClone for MemWriter {
-    fn try_clone(&self) -> std::io::Result<Self> {
-        Ok(Self {
-            mem: self.mem.clone(),
-        })
-    }
+    Ok(Some("".into()))
 }
 
 pub async fn service<T: DatabaseStore>(
@@ -525,13 +426,13 @@ pub async fn service<T: DatabaseStore>(
         (&Method::POST, "/api/v2/buckets") => no_op("create bucket"),
         (&Method::GET, "/ping") => ping(req).await,
         (&Method::GET, "/api/v2/read") => read(req, server).await,
+        // TODO: implement routing to change this API
+        (&Method::GET, "/api/v1/partitions") => list_partitions(req, server).await,
+        (&Method::GET, "/api/v1/snapshot") => snapshot_partition(req, server).await,
         _ => Err(ApplicationError::RouteNotFound {
             method: method.clone(),
             path: uri.to_string(),
         }),
-        // TODO: implement routing to change this API
-        (&Method::GET, "/api/v1/partitions") => list_partitions(req, server).await,
-        (&Method::GET, "/api/v1/snapshot") => snapshot_partition(req, server).await,
     };
 
     let result = match response {
@@ -628,7 +529,6 @@ mod tests {
 
     fn gzip_str(s: &str) -> Vec<u8> {
         use libflate::gzip::Encoder;
-        use std::io::Write;
 
         let mut encoder = Encoder::new(Vec::new()).expect("creating gzip encoder");
         write!(encoder, "{}", s).expect("writing into encoder");

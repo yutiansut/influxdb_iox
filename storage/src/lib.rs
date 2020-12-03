@@ -125,6 +125,8 @@ pub trait Database: Debug + Send + Sync {
 
     /// Return the table names that are in a given partition key
     async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error>;
+
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 #[async_trait]

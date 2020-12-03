@@ -22,3 +22,4 @@ arrow_deps = { path = "../arrow_deps" }
 futures = "0.3.7"
 bytes = "0.5"
 chrono = "0.4"
+uuid = { version = "0.8", features = ["serde", "v4"]}

@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wal::{Entry as WalEntry, Result as WalResult};
 
 use data_types::{
-    partition_metadata::{Column as ColumnStats, Table as TableStats},
+    partition_metadata::Table as TableStats,
     TIME_COLUMN_NAME,
 };
 use storage::{
@@ -16,8 +16,11 @@ use storage::{
     util::{visit_expression, AndExprBuilder, ExpressionVisitor},
 };
 
-use crate::dictionary::Dictionary;
-use crate::{column::Column, table::Table};
+use crate::dictionary::{
+    Dictionary,
+    Error as DictionaryError,
+};
+use crate::table::Table;
 
 use snafu::{OptionExt, ResultExt, Snafu};
 
@@ -61,6 +64,17 @@ pub enum Error {
         table: String,
         partition: String,
         source: crate::dictionary::Error,
+    },
+
+    #[snafu(display(
+        "Table ID {} not found in dictionary of partition {}",
+        table,
+        partition
+    ))]
+    TableIdNotFoundInDictionary {
+        table: u32,
+        partition: String,
+        source: DictionaryError,
     },
 
     #[snafu(display("Table {} not found in partition {}", table, partition))]
@@ -355,6 +369,24 @@ impl Partition {
             .context(NamedTableError { table_name })
     }
 
+    /// Returns a vec of the summary statistics of the tables in this partition
+    pub fn table_stats(&self) -> Result<Vec<TableStats>> {
+        let mut stats = Vec::with_capacity(self.tables.len());
+
+        for (id, table) in &self.tables {
+            let name = self
+                .dictionary
+                .lookup_id(*id)
+                .context(TableIdNotFoundInDictionary {table: *id, partition: &self.key})?;
+
+            let columns = table.stats();
+
+            stats.push(TableStats{name: name.to_string(), columns});
+        }
+
+        Ok(stats)
+    }
+
     /// Convert the table specified into arrow record batch and return partition metadata with
     /// summary statistics.
     pub fn partition_table_to_arrow_with_meta(
@@ -367,20 +399,8 @@ impl Partition {
             .to_arrow(&self, &[])
             .context(NamedTableError { table_name })?;
 
-        let columns = table
-            .columns
-            .iter()
-            .map(|c| match c {
-                Column::F64(_, stats) => ColumnStats::F64(stats.clone()),
-                Column::I64(_, stats) => ColumnStats::I64(stats.clone()),
-                Column::Bool(_, stats) => ColumnStats::Bool(stats.clone()),
-                Column::String(_, stats) | Column::Tag(_, stats) => {
-                    ColumnStats::String(stats.clone())
-                }
-            })
-            .collect();
-
-        let table_stats = TableStats {
+        let columns = table.stats();
+        let table_stats = TableStats{
             name: table_name.to_string(),
             columns,
         };

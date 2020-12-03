@@ -63,4 +63,5 @@
 )]
 
 pub mod buffer;
-pub mod server;
+pub mod app_server;
+pub mod snapshot;

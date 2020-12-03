@@ -354,6 +354,16 @@ impl Db {
 
         Ok(())
     }
+
+    pub async fn remove_partition(&self, partition_key: &str) -> Result<Partition> {
+        let mut partitions = self.partitions.write().await;
+        let pos = partitions
+            .iter()
+            .position(|p| &p.key == partition_key)
+            .context(PartitionNotFound{partition_key})?;
+
+        Ok(partitions.remove(pos))
+    }
 }
 
 #[async_trait]
@@ -617,6 +627,10 @@ impl Database for Db {
             .context(QueryError { query })?;
 
         ctx.collect(plan).await.context(QueryError { query })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

@@ -11,7 +11,10 @@ use crate::{
     partition::PartitionIdSet,
     partition::{Partition, PartitionPredicate},
 };
-use data_types::TIME_COLUMN_NAME;
+use data_types::{
+    TIME_COLUMN_NAME,
+    partition_metadata::Column as ColumnStats,
+};
 use snafu::{OptionExt, ResultExt, Snafu};
 
 use arrow_deps::{
@@ -925,6 +928,21 @@ impl Table {
                     })
             }
         }
+    }
+
+    pub fn stats(&self) -> Vec<ColumnStats> {
+        self
+            .columns
+            .iter()
+            .map(|c| match c {
+                Column::F64(_, stats) => ColumnStats::F64(stats.clone()),
+                Column::I64(_, stats) => ColumnStats::I64(stats.clone()),
+                Column::Bool(_, stats) => ColumnStats::Bool(stats.clone()),
+                Column::String(_, stats) | Column::Tag(_, stats) => {
+                    ColumnStats::String(stats.clone())
+                }
+            })
+            .collect()
     }
 }
 
