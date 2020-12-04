@@ -9,13 +9,13 @@ use generated_types::wal as wb;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wal::{Entry as WalEntry, Result as WalResult};
 
-use data_types::TIME_COLUMN_NAME;
+use data_types::{partition_metadata::Table as TableStats, TIME_COLUMN_NAME};
 use query::{
     predicate::{Predicate, TimestampRange},
     util::{visit_expression, AndExprBuilder, ExpressionVisitor},
 };
 
-use crate::dictionary::Dictionary;
+use crate::dictionary::{Dictionary, Error as DictionaryError};
 use crate::table::Table;
 
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -60,6 +60,17 @@ pub enum Error {
         table: String,
         partition: String,
         source: crate::dictionary::Error,
+    },
+
+    #[snafu(display(
+        "Table ID {} not found in dictionary of partition {}",
+        table,
+        partition
+    ))]
+    TableIdNotFoundInDictionary {
+        table: u32,
+        partition: String,
+        source: DictionaryError,
     },
 
     #[snafu(display("Table {} not found in partition {}", table, partition))]
@@ -329,6 +340,59 @@ impl Partition {
 
     /// Convert the table specified in this partition into an arrow record batch
     pub fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch> {
+        let table = self.table(table_name)?;
+
+        table
+            .to_arrow(&self, columns)
+            .context(NamedTableError { table_name })
+    }
+
+    /// Returns a vec of the summary statistics of the tables in this partition
+    pub fn table_stats(&self) -> Result<Vec<TableStats>> {
+        let mut stats = Vec::with_capacity(self.tables.len());
+
+        for (id, table) in &self.tables {
+            let name = self
+                .dictionary
+                .lookup_id(*id)
+                .context(TableIdNotFoundInDictionary {
+                    table: *id,
+                    partition: &self.key,
+                })?;
+
+            let columns = table.stats();
+
+            stats.push(TableStats {
+                name: name.to_string(),
+                columns,
+            });
+        }
+
+        Ok(stats)
+    }
+
+    /// Convert the table specified into arrow record batch and return partition metadata with
+    /// summary statistics.
+    pub fn partition_table_to_arrow_with_meta(
+        &self,
+        table_name: &str,
+    ) -> Result<(RecordBatch, TableStats)> {
+        let table = self.table(table_name)?;
+
+        let batch = table
+            .to_arrow(&self, &[])
+            .context(NamedTableError { table_name })?;
+
+        let columns = table.stats();
+        let table_stats = TableStats {
+            name: table_name.to_string(),
+            columns,
+        };
+
+        Ok((batch, table_stats))
+    }
+
+    fn table(&self, table_name: &str) -> Result<&Table> {
         let table_id =
             self.dictionary
                 .lookup_value(table_name)
@@ -344,9 +408,8 @@ impl Partition {
                 table: table_id,
                 partition: &self.key,
             })?;
-        table
-            .to_arrow(&self, columns)
-            .context(NamedTableError { table_name })
+
+        Ok(table)
     }
 
     /// Translate a bunch of strings into a set of ids relative to this partition
@@ -364,6 +427,26 @@ impl Partition {
         }
 
         PartitionIdSet::Present(symbols)
+    }
+}
+
+impl query::Partition for Partition {
+    type Error = Error;
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn table_stats(&self) -> Result<Vec<TableStats>, Self::Error> {
+        self.table_stats()
+    }
+
+    fn table_to_arrow(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+    ) -> Result<RecordBatch, Self::Error> {
+        self.table_to_arrow(table_name, columns)
     }
 }
 

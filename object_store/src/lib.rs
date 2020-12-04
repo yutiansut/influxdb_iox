@@ -491,6 +491,12 @@ impl File {
         );
 
         let path = self.path(location);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(&parent)
+                .await
+                .context(UnableToCreateDir { path: parent })?;
+        }
+
         let mut file = fs::File::create(&path)
             .await
             .context(UnableToCreateFile { path })?;
@@ -649,6 +655,11 @@ enum InternalError {
 
     #[snafu(display("Unable to create file {}: {}", path.display(), source))]
     UnableToCreateFile {
+        source: io::Error,
+        path: PathBuf,
+    },
+    #[snafu(display("Unable to create dir {}: {}", path.display(), source))]
+    UnableToCreateDir {
         source: io::Error,
         path: PathBuf,
     },
