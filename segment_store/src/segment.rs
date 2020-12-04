@@ -452,7 +452,10 @@ impl Segment {
             for (agg_col, typ) in &aggregate_columns {
                 aggregates.push(match typ {
                     AggregateType::Count => {
-                        AggregateResult::Count(agg_col.count(&aggregate_row_ids.to_vec()) as u64)
+                        // If the column has no NULL values then we could get an answer
+                        // without having to materialise a vector of row_ids. So use
+                        // the specialised bitmap method.
+                        AggregateResult::Count(agg_col.count_from_bitmap(&aggregate_row_ids) as u64)
                     }
                     AggregateType::First => todo!(),
                     AggregateType::Last => todo!(),

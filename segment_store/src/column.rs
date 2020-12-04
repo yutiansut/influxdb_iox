@@ -114,6 +114,17 @@ impl Column {
         }
     }
 
+    pub fn contains_null(&self) -> bool {
+        match &self {
+            Column::String(_, data) => data.contains_null(),
+            Column::Float(_, data) => data.contains_null(),
+            Column::Integer(_, data) => data.contains_null(),
+            Column::Unsigned(_, data) => data.contains_null(),
+            Column::Bool => todo!(),
+            Column::ByteArray(_, _) => todo!(),
+        }
+    }
+
     pub fn column_min(&self) -> Value<'_> {
         todo!()
     }
@@ -574,6 +585,24 @@ impl Column {
             Column::Float(_, data) => data.count(row_ids),
             Column::Integer(_, data) => data.count(row_ids),
             Column::Unsigned(_, data) => data.count(row_ids),
+            Column::Bool => todo!(),
+            Column::ByteArray(_, _) => todo!(),
+        }
+    }
+
+    /// The count of all non-null values located at the provided rows.
+    pub fn count_from_bitmap(&self, row_ids: &Bitmap) -> u32 {
+        assert!(row_ids.cardinality() as u32 <= self.num_rows());
+
+        if !self.contains_null() {
+            return row_ids.cardinality() as u32;
+        }
+
+        match &self {
+            Column::String(_, data) => data.count(row_ids.to_vec().as_slice()),
+            Column::Float(_, data) => data.count(row_ids.to_vec().as_slice()),
+            Column::Integer(_, data) => data.count(row_ids.to_vec().as_slice()),
+            Column::Unsigned(_, data) => data.count(row_ids.to_vec().as_slice()),
             Column::Bool => todo!(),
             Column::ByteArray(_, _) => todo!(),
         }
