@@ -20,7 +20,6 @@ use influxdb_line_protocol::parse_lines;
 use object_store;
 use storage::{org_and_bucket_to_database, Database, DatabaseStore};
 use data_types::partition_metadata::Partition;
-use server::snapshot::snapshot_partition;
 
 use bytes::{Bytes, BytesMut};
 use futures::{self, StreamExt};
@@ -408,10 +407,16 @@ async fn snapshot_partition<T: DatabaseStore>(
             bucket: &snapshot.bucket,
         })?;
 
-    let partition = db.as_any().downcast_ref::<write_buffer::Db>().unwrap().remove_partition(&snapshot.partition).await.unwrap();
-    let snapshot = server::snapshot::snapshot_partition;
+    let partition = db.remove_partition(&snapshot.partition).await.unwrap();
+    let snapshot = server::snapshot::snapshot_partition(
+        format!("1/{}/meta", db_name),
+        format!("1/{}/data", db_name),
+        server.object_store.clone(),
+        partition.clone(),
+        None,
+    ).unwrap();
 
-    Ok(Some("".into()))
+    Ok(Some(format!("{}", snapshot.id).as_bytes().into()))
 }
 
 pub async fn service<T: DatabaseStore>(

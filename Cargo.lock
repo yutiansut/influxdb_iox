@@ -418,28 +418,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cluster"
-version = "0.1.0"
-dependencies = [
- "arrow_deps",
- "async-trait",
- "bytes",
- "chrono",
- "data_types",
- "futures",
- "generated_types",
- "influxdb_line_protocol",
- "object_store",
- "serde",
- "serde_json",
- "snafu",
- "storage",
- "tokio",
- "uuid",
- "write_buffer",
-]
-
-[[package]]
 name = "colored"
 version = "1.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1337,6 +1315,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_urlencoded 0.7.0",
+ "server",
  "snafu",
  "storage",
  "tempfile",
@@ -2765,6 +2744,28 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "server"
+version = "0.1.0"
+dependencies = [
+ "arrow_deps",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "data_types",
+ "futures",
+ "generated_types",
+ "influxdb_line_protocol",
+ "object_store",
+ "serde",
+ "serde_json",
+ "snafu",
+ "storage",
+ "tokio",
+ "uuid",
+ "write_buffer",
 ]
 
 [[package]]

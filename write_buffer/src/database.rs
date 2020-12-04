@@ -368,6 +368,7 @@ impl Db {
 
 #[async_trait]
 impl Database for Db {
+    type Partition = crate::partition::Partition;
     type Error = Error;
 
     // TODO: writes lines creates a column named "time" for the timestmap data. If
@@ -409,6 +410,59 @@ impl Database for Db {
         }
 
         Ok(())
+    }
+
+    async fn query(&self, query: &str) -> Result<Vec<RecordBatch>, Self::Error> {
+        let mut tables = vec![];
+
+        let dialect = GenericDialect {};
+        let ast = Parser::parse_sql(&dialect, query).context(InvalidSqlQuery { query })?;
+
+        for statement in ast {
+            match statement {
+                Statement::Query(q) => {
+                    if let SetExpr::Select(q) = q.body {
+                        for item in q.from {
+                            if let TableFactor::Table { name, .. } = item.relation {
+                                let name = name.to_string();
+                                let data = self.table_to_arrow(&name, &[]).await?;
+                                tables.push(ArrowTable {
+                                    name,
+                                    schema: data[0].schema().clone(),
+                                    data,
+                                });
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    return UnsupportedStatement {
+                        query: query.to_string(),
+                        statement,
+                    }
+                    .fail()
+                }
+            }
+        }
+
+        let config = ExecutionConfig::new().with_batch_size(1024 * 1024);
+        let mut ctx = ExecutionContext::with_config(config);
+
+        for table in tables {
+            let provider =
+                MemTable::new(table.schema, vec![table.data]).context(QueryError { query })?;
+            ctx.register_table(&table.name, Box::new(provider));
+        }
+
+        let plan = ctx
+            .create_logical_plan(&query)
+            .context(QueryError { query })?;
+        let plan = ctx.optimize(&plan).context(QueryError { query })?;
+        let plan = ctx
+            .create_physical_plan(&plan)
+            .context(QueryError { query })?;
+
+        ctx.collect(plan).await.context(QueryError { query })
     }
 
     async fn table_names(&self, predicate: Predicate) -> Result<StringSetPlan, Self::Error> {
@@ -576,61 +630,14 @@ impl Database for Db {
         Ok(tables)
     }
 
-    async fn query(&self, query: &str) -> Result<Vec<RecordBatch>, Self::Error> {
-        let mut tables = vec![];
+    async fn remove_partition(&self, partition_key: &str) -> Result<Arc<Partition>> {
+        let mut partitions = self.partitions.write().await;
+        let pos = partitions
+            .iter()
+            .position(|p| p.key == partition_key)
+            .context(PartitionNotFound { partition_key })?;
 
-        let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, query).context(InvalidSqlQuery { query })?;
-
-        for statement in ast {
-            match statement {
-                Statement::Query(q) => {
-                    if let SetExpr::Select(q) = q.body {
-                        for item in q.from {
-                            if let TableFactor::Table { name, .. } = item.relation {
-                                let name = name.to_string();
-                                let data = self.table_to_arrow(&name, &[]).await?;
-                                tables.push(ArrowTable {
-                                    name,
-                                    schema: data[0].schema().clone(),
-                                    data,
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    return UnsupportedStatement {
-                        query: query.to_string(),
-                        statement,
-                    }
-                    .fail()
-                }
-            }
-        }
-
-        let config = ExecutionConfig::new().with_batch_size(1024 * 1024);
-        let mut ctx = ExecutionContext::with_config(config);
-
-        for table in tables {
-            let provider =
-                MemTable::new(table.schema, vec![table.data]).context(QueryError { query })?;
-            ctx.register_table(&table.name, Box::new(provider));
-        }
-
-        let plan = ctx
-            .create_logical_plan(&query)
-            .context(QueryError { query })?;
-        let plan = ctx.optimize(&plan).context(QueryError { query })?;
-        let plan = ctx
-            .create_physical_plan(&plan)
-            .context(QueryError { query })?;
-
-        ctx.collect(plan).await.context(QueryError { query })
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
+        Ok(Arc::new(partitions.remove(pos)))
     }
 }
 

@@ -8,7 +8,10 @@
 
 use arrow_deps::arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use data_types::data::ReplicatedWrite;
+use data_types::{
+    partition_metadata::Table as TableStats,
+    data::ReplicatedWrite,
+};
 use exec::{FieldListPlan, GroupedSeriesSetPlans, SeriesSetPlans, StringSetPlan};
 use influxdb_line_protocol::ParsedLine;
 
@@ -45,6 +48,9 @@ use self::predicate::{Predicate, TimestampRange};
 /// categories with the same data type, columns of different
 /// categories are treated differently in the different query types.
 pub trait Database: Debug + Send + Sync {
+    /// the type of partition that is stored by this database
+    type Partition: Partition;
+
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// writes parsed lines into this database
@@ -126,7 +132,19 @@ pub trait Database: Debug + Send + Sync {
     /// Return the table names that are in a given partition key
     async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error>;
 
-    fn as_any(&self) -> &dyn std::any::Any;
+    /// Removes the partition from the database and returns it
+    async fn remove_partition(&self, partition_key: &str) -> Result<Arc<Self::Partition>, Self::Error>;
+}
+
+/// Collection of data that shares the same partition key
+pub trait Partition: Debug + Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    fn key(&self) -> &str;
+
+    fn table_stats(&self) -> Result<Vec<TableStats>, Self::Error>;
+
+    fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch, Self::Error>;
 }
 
 #[async_trait]

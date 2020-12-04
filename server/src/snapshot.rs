@@ -6,7 +6,7 @@ use data_types::partition_metadata::{
     Table,
 };
 use object_store::ObjectStore;
-use write_buffer::partition::Partition;
+use storage::Partition;
 use arrow_deps::{
     arrow::record_batch::RecordBatch,
     parquet::{
@@ -120,19 +120,19 @@ impl Status {
     }
 }
 
-pub async fn snapshot_partition(
+pub fn snapshot_partition<T: Send + Sync + Partition>(
     metadata_path: impl Into<String>,
     data_path: impl Into<String>,
-    partition: Arc<Partition>,
     store: Arc<ObjectStore>,
+    partition: Arc<T>,
     notify: Option<oneshot::Sender<()>>,
 ) -> Result<Arc<Snapshot>> {
     let metadata_path = metadata_path.into();
     let data_path = data_path.into();
 
-    let table_stats = partition.table_stats().context(PartitionError)?;
+    let table_stats = partition.table_stats().unwrap();
 
-    let snapshot = Snapshot::new(partition.key.clone(), table_stats);
+    let snapshot = Snapshot::new(partition.key().to_string(), table_stats);
     let snapshot = Arc::new(snapshot);
 
     let return_snapshot = snapshot.clone();
@@ -150,7 +150,7 @@ pub async fn snapshot_partition(
             snapshot.mark_table_finished(pos).unwrap();
         }
 
-        let partition_meta_path = format!("{}/{}.json", &metadata_path, &partition.key);
+        let partition_meta_path = format!("{}/{}.json", &metadata_path, &partition.key());
         let json_data = serde_json::to_vec(&snapshot.partition_meta).context(JsonGenerationError).unwrap();
         let data = Bytes::from(json_data);
         let len = data.len();
@@ -283,7 +283,7 @@ mem,host=A,region=west used=45 1
             partition.clone(),
             store.clone(),
             Some(tx)
-        ).await.unwrap();
+        ).unwrap();
 
         rx.await.unwrap();
 

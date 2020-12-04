@@ -446,6 +446,22 @@ impl Partition {
     }
 }
 
+impl storage::Partition for Partition {
+    type Error = Error;
+
+    fn key(&self) -> &str {
+        &self.key
+    }
+
+    fn table_stats(&self) -> Result<Vec<TableStats>, Self::Error> {
+        self.table_stats()
+    }
+
+    fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch, Self::Error> {
+        self.table_to_arrow(table_name, columns)
+    }
+}
+
 /// Used to figure out if we know how to deal with this kind of
 /// predicate in the write buffer
 struct SupportVisitor {}

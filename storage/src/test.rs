@@ -3,14 +3,10 @@
 
 use arrow_deps::arrow::record_batch::RecordBatch;
 
-use crate::{
-    exec::FieldListPlan,
-    exec::{
-        stringset::{StringSet, StringSetRef},
-        GroupedSeriesSetPlans, SeriesSetPlans, StringSetPlan,
-    },
-    Database, DatabaseStore, Predicate, TimestampRange,
-};
+use crate::{exec::FieldListPlan, exec::{
+    stringset::{StringSet, StringSetRef},
+    GroupedSeriesSetPlans, SeriesSetPlans, StringSetPlan,
+}, Database, DatabaseStore, Predicate, TimestampRange, Partition};
 
 use data_types::data::ReplicatedWrite;
 use influxdb_line_protocol::{parse_lines, ParsedLine};
@@ -244,6 +240,7 @@ fn predicate_to_test_string(predicate: &Predicate) -> String {
 
 #[async_trait]
 impl Database for TestDatabase {
+    type Partition = TestPartition;
     type Error = TestError;
 
     /// Writes parsed lines into this database
@@ -428,6 +425,29 @@ impl Database for TestDatabase {
     /// Return the table names that are in a given partition key
     async fn table_names_for_partition(&self, _partition_key: &str) -> Result<Vec<String>, Self::Error> {
         unimplemented!("table_names_for_partitino not yet implemented for test database");
+    }
+
+    async fn remove_partition(&self, partition_key: &str) -> Result<Arc<Self::Partition>, Self::Error> {
+        unimplemented!()
+    }
+}
+
+#[derive(Debug)]
+pub struct TestPartition {}
+
+impl Partition for TestPartition {
+    type Error = TestError;
+
+    fn key(&self) -> &str {
+        unimplemented!()
+    }
+
+    fn table_stats(&self) -> Result<Vec<data_types::partition_metadata::Table>, Self::Error> {
+        unimplemented!()
+    }
+
+    fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch, Self::Error> {
+        unimplemented!()
     }
 }
 
