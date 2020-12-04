@@ -11,10 +11,7 @@ use crate::{
     partition::PartitionIdSet,
     partition::{Partition, PartitionPredicate},
 };
-use data_types::{
-    TIME_COLUMN_NAME,
-    partition_metadata::Column as ColumnStats,
-};
+use data_types::{partition_metadata::Column as ColumnStats, TIME_COLUMN_NAME};
 use snafu::{OptionExt, ResultExt, Snafu};
 
 use arrow_deps::{
@@ -931,8 +928,7 @@ impl Table {
     }
 
     pub fn stats(&self) -> Vec<ColumnStats> {
-        self
-            .columns
+        self.columns
             .iter()
             .map(|c| match c {
                 Column::F64(_, stats) => ColumnStats::F64(stats.clone()),

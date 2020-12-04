@@ -17,9 +17,7 @@ use tracing::{debug, error, info};
 
 use arrow_deps::arrow;
 use influxdb_line_protocol::parse_lines;
-use object_store;
 use storage::{org_and_bucket_to_database, Database, DatabaseStore};
-use data_types::partition_metadata::Partition;
 
 use bytes::{Bytes, BytesMut};
 use futures::{self, StreamExt};
@@ -27,10 +25,7 @@ use hyper::{Body, Method, StatusCode};
 use serde::Deserialize;
 use snafu::{OptionExt, ResultExt, Snafu};
 use std::str;
-use std::sync::{Arc, Mutex};
-use std::io::{Write, Seek, SeekFrom, Cursor};
-use arrow_deps::parquet::file::writer::TryClone;
-use arrow_deps::parquet::arrow::ArrowWriter;
+use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum ApplicationError {
@@ -125,18 +120,14 @@ pub enum ApplicationError {
     #[snafu(display("Internal error creating gzip decoder: {:?}", source))]
     CreatingGzipDecoder { source: std::io::Error },
 
-    #[snafu(display(
-        "Internal error from database {}:  {}",
-        database,
-        source
-    ))]
+    #[snafu(display("Internal error from database {}:  {}", database, source))]
     DatabaseError {
         database: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Error generating json response: {}", source))]
-    JsonGenerationError{ source: serde_json::Error },
+    JsonGenerationError { source: serde_json::Error },
 }
 
 impl ApplicationError {
@@ -370,7 +361,7 @@ async fn list_partitions<T: DatabaseStore>(
         .partition_keys()
         .await
         .map_err(|e| Box::new(e) as _)
-        .context(DatabaseError{database: &db_name})?;
+        .context(DatabaseError { database: &db_name })?;
 
     let result = serde_json::to_string(&partition_keys).context(JsonGenerationError)?;
 
@@ -407,16 +398,20 @@ async fn snapshot_partition<T: DatabaseStore>(
             bucket: &snapshot.bucket,
         })?;
 
+    let metadata_path = format!("{}/meta", db_name);
+    let data_path = format!("{}/data", db_name);
     let partition = db.remove_partition(&snapshot.partition).await.unwrap();
     let snapshot = server::snapshot::snapshot_partition(
-        format!("1/{}/meta", db_name),
-        format!("1/{}/data", db_name),
+        metadata_path,
+        data_path,
         server.object_store.clone(),
-        partition.clone(),
+        partition,
         None,
-    ).unwrap();
+    )
+    .unwrap();
 
-    Ok(Some(format!("{}", snapshot.id).as_bytes().into()))
+    let ret = format!("{}", snapshot.id);
+    Ok(Some(ret.into_bytes().into()))
 }
 
 pub async fn service<T: DatabaseStore>(
@@ -433,7 +428,7 @@ pub async fn service<T: DatabaseStore>(
         (&Method::GET, "/api/v2/read") => read(req, server).await,
         // TODO: implement routing to change this API
         (&Method::GET, "/api/v1/partitions") => list_partitions(req, server).await,
-        (&Method::GET, "/api/v1/snapshot") => snapshot_partition(req, server).await,
+        (&Method::POST, "/api/v1/snapshot") => snapshot_partition(req, server).await,
         _ => Err(ApplicationError::RouteNotFound {
             method: method.clone(),
             path: uri.to_string(),
@@ -472,15 +467,15 @@ mod tests {
     use hyper::service::{make_service_fn, service_fn};
     use hyper::Server;
 
+    use object_store::{InMemory, ObjectStore};
     use storage::{test::TestDatabaseStore, DatabaseStore};
-    use object_store::{ObjectStore, InMemory};
 
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
     type Result<T, E = Error> = std::result::Result<T, E>;
 
     #[tokio::test]
     async fn test_ping() -> Result<()> {
-        let test_storage = Arc::new(AppServer{
+        let test_storage = Arc::new(AppServer {
             write_buffer: Arc::new(TestDatabaseStore::new()),
             object_store: Arc::new(ObjectStore::new_in_memory(InMemory::new())),
         });
@@ -496,7 +491,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_write() -> Result<()> {
-        let test_storage = Arc::new(AppServer{
+        let test_storage = Arc::new(AppServer {
             write_buffer: Arc::new(TestDatabaseStore::new()),
             object_store: Arc::new(ObjectStore::new_in_memory(InMemory::new())),
         });
@@ -534,6 +529,7 @@ mod tests {
 
     fn gzip_str(s: &str) -> Vec<u8> {
         use libflate::gzip::Encoder;
+        use std::io::Write;
 
         let mut encoder = Encoder::new(Vec::new()).expect("creating gzip encoder");
         write!(encoder, "{}", s).expect("writing into encoder");
@@ -545,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gzip_write() -> Result<()> {
-        let test_storage = Arc::new(AppServer{
+        let test_storage = Arc::new(AppServer {
             write_buffer: Arc::new(TestDatabaseStore::new()),
             object_store: Arc::new(ObjectStore::new_in_memory(InMemory::new())),
         });

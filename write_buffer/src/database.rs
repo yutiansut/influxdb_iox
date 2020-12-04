@@ -359,8 +359,8 @@ impl Db {
         let mut partitions = self.partitions.write().await;
         let pos = partitions
             .iter()
-            .position(|p| &p.key == partition_key)
-            .context(PartitionNotFound{partition_key})?;
+            .position(|p| p.key == partition_key)
+            .context(PartitionNotFound { partition_key })?;
 
         Ok(partitions.remove(pos))
     }
@@ -609,7 +609,10 @@ impl Database for Db {
     }
 
     /// Return the table names that are in a given partition key
-    async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error> {
+    async fn table_names_for_partition(
+        &self,
+        partition_key: &str,
+    ) -> Result<Vec<String>, Self::Error> {
         let partitions = self.partitions.read().await;
         let partition = partitions
             .iter()
@@ -618,11 +621,15 @@ impl Database for Db {
 
         let mut tables = Vec::with_capacity(partition.tables.len());
 
-        for (id, _) in &partition.tables {
-            let name = partition
-                .dictionary
-                .lookup_id(*id)
-                .context(TableIdNotFoundInDictionary {table: *id, partition: &partition.key})?;
+        for id in partition.tables.keys() {
+            let name =
+                partition
+                    .dictionary
+                    .lookup_id(*id)
+                    .context(TableIdNotFoundInDictionary {
+                        table: *id,
+                        partition: &partition.key,
+                    })?;
 
             tables.push(name.to_string());
         }

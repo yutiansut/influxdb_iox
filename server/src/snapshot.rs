@@ -1,22 +1,15 @@
-/// This module contains code for snapshotting a database partition to Parquet files in object
-/// storage.
-
-use data_types::partition_metadata::{
-    Partition as PartitionMeta,
-    Table,
-};
-use object_store::ObjectStore;
-use storage::Partition;
 use arrow_deps::{
     arrow::record_batch::RecordBatch,
-    parquet::{
-        file::writer::TryClone,
-        arrow::ArrowWriter,
-    }
+    parquet::{arrow::ArrowWriter, file::writer::TryClone},
 };
+/// This module contains code for snapshotting a database partition to Parquet files in object
+/// storage.
+use data_types::partition_metadata::{Partition as PartitionMeta, Table};
+use object_store::ObjectStore;
+use storage::Partition;
 
+use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
-use std::io::{Write, Seek, SeekFrom, Cursor};
 
 use bytes::Bytes;
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -26,13 +19,15 @@ use uuid::Uuid;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Partition error creating snapshot: {}", source))]
-    PartitionError{ source: write_buffer::partition::Error },
+    PartitionError {
+        source: write_buffer::partition::Error,
+    },
 
     #[snafu(display("Table not found running: {}", table))]
-    TableNotFound{ table: usize },
+    TableNotFound { table: usize },
 
     #[snafu(display("Error generating json response: {}", source))]
-    JsonGenerationError{ source: serde_json::Error },
+    JsonGenerationError { source: serde_json::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -47,14 +42,14 @@ pub struct Snapshot {
 impl Snapshot {
     fn new(partition_key: String, tables: Vec<Table>) -> Self {
         let remaining_tables: Vec<_> = (0..tables.len()).collect();
-        let status = Status{
+        let status = Status {
             remaining_tables,
             ..Default::default()
         };
 
-        Self{
+        Self {
             id: Uuid::new_v4(),
-            partition_meta: PartitionMeta{
+            partition_meta: PartitionMeta {
                 key: partition_key,
                 tables,
             },
@@ -64,9 +59,10 @@ impl Snapshot {
 
     fn next_table(&self) -> Option<(usize, &str)> {
         let mut status = self.status.lock().expect("mutex poisoned");
-        status.next_table_position().map_or(None, |pos| {
-            Some((pos, &self.partition_meta.tables[pos].name))
-        })
+        match status.next_table_position(){
+            Some(pos) => Some((pos, &self.partition_meta.tables[pos].name)),
+            None => None,
+        }
     }
 
     fn mark_table_finished(&self, table_position: usize) -> Result<()> {
@@ -96,9 +92,9 @@ pub struct Status {
 
 impl Status {
     fn next_table_position(&mut self) -> Option<usize> {
-        self.remaining_tables.pop().map_or(None, |t| {
-            self.running_tables.push(t.clone());
-            Some(t)
+        self.remaining_tables.pop().map(|pos| {
+            self.running_tables.push(pos);
+            pos
         })
     }
 
@@ -107,7 +103,7 @@ impl Status {
             .running_tables
             .iter()
             .position(|t| *t == position)
-            .context(TableNotFound{ table: position })?;
+            .context(TableNotFound { table: position })?;
 
         let _ = self.running_tables.remove(pos);
         self.finished_tables.push(position);
@@ -120,7 +116,7 @@ impl Status {
     }
 }
 
-pub fn snapshot_partition<T: Send + Sync + Partition>(
+pub fn snapshot_partition<T: Send + Sync + 'static + Partition>(
     metadata_path: impl Into<String>,
     data_path: impl Into<String>,
     store: Arc<ObjectStore>,
@@ -151,7 +147,9 @@ pub fn snapshot_partition<T: Send + Sync + Partition>(
         }
 
         let partition_meta_path = format!("{}/{}.json", &metadata_path, &partition.key());
-        let json_data = serde_json::to_vec(&snapshot.partition_meta).context(JsonGenerationError).unwrap();
+        let json_data = serde_json::to_vec(&snapshot.partition_meta)
+            .context(JsonGenerationError)
+            .unwrap();
         let data = Bytes::from(json_data);
         let len = data.len();
         let stream_data = std::io::Result::Ok(data);
@@ -175,11 +173,16 @@ pub fn snapshot_partition<T: Send + Sync + Partition>(
     Ok(return_snapshot)
 }
 
-async fn write_batch(batch: RecordBatch, snapshot: Arc<Snapshot>, file_name: &str, store: Arc<ObjectStore>) -> Result<()> {
+async fn write_batch(
+    batch: RecordBatch,
+    _snapshot: Arc<Snapshot>,
+    file_name: &str,
+    store: Arc<ObjectStore>,
+) -> Result<()> {
     let mem_writer = MemWriter::default();
     {
         let mut writer =
-            ArrowWriter::try_new(mem_writer.clone(), batch.schema().clone(), None).unwrap();
+            ArrowWriter::try_new(mem_writer.clone(), batch.schema(), None).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     } // drop the reference to the MemWriter that the SerializedFileWriter has
@@ -196,7 +199,8 @@ async fn write_batch(batch: RecordBatch, snapshot: Arc<Snapshot>, file_name: &st
         .put(
             &file_name,
             futures::stream::once(async move { stream_data }),
-            len)
+            len,
+        )
         .await
         .unwrap();
 
@@ -248,11 +252,12 @@ impl TryClone for MemWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use influxdb_line_protocol::parse_lines;
     use data_types::data::lines_to_replicated_write;
     use data_types::database_rules::DatabaseRules;
-    use object_store::InMemory;
     use futures::TryStreamExt;
+    use influxdb_line_protocol::parse_lines;
+    use object_store::InMemory;
+    use write_buffer::partition::Partition as PartitionWB;
 
     #[tokio::test]
     async fn snapshot() {
@@ -265,7 +270,7 @@ mem,host=A,region=west used=45 1
 
         let lines: Vec<_> = parse_lines(lp).map(|l| l.unwrap()).collect();
         let write = lines_to_replicated_write(1, 1, &lines, &DatabaseRules::default());
-        let mut partition = Partition::new("testaroo");
+        let mut partition = PartitionWB::new("testaroo");
 
         for e in write.write_buffer_batch().unwrap().entries().unwrap() {
             partition.write_entry(&e).unwrap();
@@ -280,10 +285,11 @@ mem,host=A,region=west used=45 1
         let snapshot = snapshot_partition(
             metadata_path,
             data_path,
-            partition.clone(),
             store.clone(),
-            Some(tx)
-        ).unwrap();
+            partition.clone(),
+            Some(tx),
+        )
+        .unwrap();
 
         rx.await.unwrap();
 

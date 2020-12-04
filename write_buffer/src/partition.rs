@@ -7,19 +7,13 @@ use generated_types::wal as wb;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use wal::{Entry as WalEntry, Result as WalResult};
 
-use data_types::{
-    partition_metadata::Table as TableStats,
-    TIME_COLUMN_NAME,
-};
+use data_types::{partition_metadata::Table as TableStats, TIME_COLUMN_NAME};
 use storage::{
     predicate::{Predicate, TimestampRange},
     util::{visit_expression, AndExprBuilder, ExpressionVisitor},
 };
 
-use crate::dictionary::{
-    Dictionary,
-    Error as DictionaryError,
-};
+use crate::dictionary::{Dictionary, Error as DictionaryError};
 use crate::table::Table;
 
 use snafu::{OptionExt, ResultExt, Snafu};
@@ -377,11 +371,17 @@ impl Partition {
             let name = self
                 .dictionary
                 .lookup_id(*id)
-                .context(TableIdNotFoundInDictionary {table: *id, partition: &self.key})?;
+                .context(TableIdNotFoundInDictionary {
+                    table: *id,
+                    partition: &self.key,
+                })?;
 
             let columns = table.stats();
 
-            stats.push(TableStats{name: name.to_string(), columns});
+            stats.push(TableStats {
+                name: name.to_string(),
+                columns,
+            });
         }
 
         Ok(stats)
@@ -400,7 +400,7 @@ impl Partition {
             .context(NamedTableError { table_name })?;
 
         let columns = table.stats();
-        let table_stats = TableStats{
+        let table_stats = TableStats {
             name: table_name.to_string(),
             columns,
         };
@@ -457,7 +457,11 @@ impl storage::Partition for Partition {
         self.table_stats()
     }
 
-    fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch, Self::Error> {
+    fn table_to_arrow(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+    ) -> Result<RecordBatch, Self::Error> {
         self.table_to_arrow(table_name, columns)
     }
 }

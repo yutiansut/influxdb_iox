@@ -8,10 +8,7 @@ use std::{
     },
 };
 
-use crate::{
-    buffer::Buffer,
-    snapshot::Snapshot,
-};
+use crate::buffer::Buffer;
 use arrow_deps::arrow::record_batch::RecordBatch;
 use data_types::{
     data::{lines_to_replicated_write, ReplicatedWrite},
@@ -223,13 +220,6 @@ impl<M: ConnectionManager> Server<M> {
             .await
             .map_err(|e| Box::new(e) as DatabaseError)
             .context(UnknownDatabaseError {})
-    }
-
-    /// Starts a background task to convert the data for a given partition in the DB to Parquet
-    /// files in object storage. Returns a string identifier that can be used to ask for updated
-    /// status.
-    pub async fn snapshot_partition(&self, db_name: &str, partition_key: &str) -> Result<String> {
-        Ok(String::new())
     }
 
     pub async fn handle_replicated_write(

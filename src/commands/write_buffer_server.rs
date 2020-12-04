@@ -11,7 +11,7 @@ use crate::server::rpc::storage;
 use ::storage::exec::Executor as StorageExecutor;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::Server;
-use object_store::{self, ObjectStore};
+use object_store::{self, GoogleCloudStorage, ObjectStore};
 use write_buffer::{Db, WriteBufferDatabases};
 
 use snafu::{ResultExt, Snafu};
@@ -75,7 +75,16 @@ pub async fn main() -> Result<()> {
     debug!("InfluxDB IOx Server using database directory: {:?}", db_dir);
 
     let storage = Arc::new(WriteBufferDatabases::new(&db_dir));
-    let object_storage = Arc::new(ObjectStore::new_file(object_store::File::new(&db_dir)));
+
+    let object_store = if let Ok(bucket) = std::env::var("INFLUXDB_IOX_GCP_BUCKET") {
+        info!("Using GCP bucket {} for storage", &bucket);
+        ObjectStore::new_google_cloud_storage(GoogleCloudStorage::new(bucket))
+    } else {
+        info!("Using local dir {} for storage", &db_dir);
+        ObjectStore::new_file(object_store::File::new(&db_dir))
+    };
+    let object_storage = Arc::new(object_store);
+
     let dirs = storage
         .wal_dirs()
         .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)

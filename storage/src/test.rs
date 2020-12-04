@@ -3,10 +3,14 @@
 
 use arrow_deps::arrow::record_batch::RecordBatch;
 
-use crate::{exec::FieldListPlan, exec::{
-    stringset::{StringSet, StringSetRef},
-    GroupedSeriesSetPlans, SeriesSetPlans, StringSetPlan,
-}, Database, DatabaseStore, Predicate, TimestampRange, Partition};
+use crate::{
+    exec::FieldListPlan,
+    exec::{
+        stringset::{StringSet, StringSetRef},
+        GroupedSeriesSetPlans, SeriesSetPlans, StringSetPlan,
+    },
+    Database, DatabaseStore, Partition, Predicate, TimestampRange,
+};
 
 use data_types::data::ReplicatedWrite;
 use influxdb_line_protocol::{parse_lines, ParsedLine};
@@ -423,11 +427,17 @@ impl Database for TestDatabase {
     }
 
     /// Return the table names that are in a given partition key
-    async fn table_names_for_partition(&self, _partition_key: &str) -> Result<Vec<String>, Self::Error> {
+    async fn table_names_for_partition(
+        &self,
+        _partition_key: &str,
+    ) -> Result<Vec<String>, Self::Error> {
         unimplemented!("table_names_for_partitino not yet implemented for test database");
     }
 
-    async fn remove_partition(&self, partition_key: &str) -> Result<Arc<Self::Partition>, Self::Error> {
+    async fn remove_partition(
+        &self,
+        _partition_key: &str,
+    ) -> Result<Arc<Self::Partition>, Self::Error> {
         unimplemented!()
     }
 }
@@ -446,7 +456,11 @@ impl Partition for TestPartition {
         unimplemented!()
     }
 
-    fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch, Self::Error> {
+    fn table_to_arrow(
+        &self,
+        _table_name: &str,
+        _columns: &[&str],
+    ) -> Result<RecordBatch, Self::Error> {
         unimplemented!()
     }
 }

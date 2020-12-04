@@ -1,6 +1,5 @@
 #![deny(rust_2018_idioms)]
 #![warn(
-    missing_copy_implementations,
     missing_debug_implementations,
     clippy::explicit_iter_loop,
     clippy::use_self
@@ -8,10 +7,7 @@
 
 use arrow_deps::arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
-use data_types::{
-    partition_metadata::Table as TableStats,
-    data::ReplicatedWrite,
-};
+use data_types::{data::ReplicatedWrite, partition_metadata::Table as TableStats};
 use exec::{FieldListPlan, GroupedSeriesSetPlans, SeriesSetPlans, StringSetPlan};
 use influxdb_line_protocol::ParsedLine;
 
@@ -49,7 +45,7 @@ use self::predicate::{Predicate, TimestampRange};
 /// categories are treated differently in the different query types.
 pub trait Database: Debug + Send + Sync {
     /// the type of partition that is stored by this database
-    type Partition: Partition;
+    type Partition: Send + Sync + 'static + Partition;
 
     type Error: std::error::Error + Send + Sync + 'static;
 
@@ -130,21 +126,34 @@ pub trait Database: Debug + Send + Sync {
     async fn partition_keys(&self) -> Result<Vec<String>, Self::Error>;
 
     /// Return the table names that are in a given partition key
-    async fn table_names_for_partition(&self, partition_key: &str) -> Result<Vec<String>, Self::Error>;
+    async fn table_names_for_partition(
+        &self,
+        partition_key: &str,
+    ) -> Result<Vec<String>, Self::Error>;
 
     /// Removes the partition from the database and returns it
-    async fn remove_partition(&self, partition_key: &str) -> Result<Arc<Self::Partition>, Self::Error>;
+    async fn remove_partition(
+        &self,
+        partition_key: &str,
+    ) -> Result<Arc<Self::Partition>, Self::Error>;
 }
 
 /// Collection of data that shares the same partition key
 pub trait Partition: Debug + Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// returns the partition key
     fn key(&self) -> &str;
 
+    /// returns the partition metadata stats for every table in the partition
     fn table_stats(&self) -> Result<Vec<TableStats>, Self::Error>;
 
-    fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<RecordBatch, Self::Error>;
+    /// converts the table to an Arrow RecordBatch
+    fn table_to_arrow(
+        &self,
+        table_name: &str,
+        columns: &[&str],
+    ) -> Result<RecordBatch, Self::Error>;
 }
 
 #[async_trait]

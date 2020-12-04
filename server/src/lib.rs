@@ -62,6 +62,6 @@
     clippy::use_self
 )]
 
-pub mod buffer;
 pub mod app_server;
+pub mod buffer;
 pub mod snapshot;
