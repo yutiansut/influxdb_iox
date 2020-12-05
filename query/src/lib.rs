@@ -46,7 +46,7 @@ use self::predicate::{Predicate, TimestampRange};
 #[async_trait]
 pub trait TSDatabase: Debug + Send + Sync {
     /// the type of partition that is stored by this database
-    type Partition: Send + Sync + 'static + Partition;
+    type Partition: Send + Sync + 'static + PartitionChunk;
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// writes parsed lines into this database
@@ -108,7 +108,7 @@ pub trait TSDatabase: Debug + Send + Sync {
 #[async_trait]
 pub trait SQLDatabase: Debug + Send + Sync {
     /// the type of partition that is stored by this database
-    type Partition: Send + Sync + 'static + Partition;
+    type Partition: Send + Sync + 'static + PartitionChunk;
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Execute the specified query and return arrow record batches with the result
@@ -146,7 +146,7 @@ pub trait SQLDatabase: Debug + Send + Sync {
 }
 
 /// Collection of data that shares the same partition key
-pub trait Partition: Debug + Send + Sync {
+pub trait PartitionChunk: Debug + Send + Sync {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// returns the partition key

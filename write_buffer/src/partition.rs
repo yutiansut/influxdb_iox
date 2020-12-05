@@ -430,7 +430,7 @@ impl Partition {
     }
 }
 
-impl query::Partition for Partition {
+impl query::PartitionChunk for Partition {
     type Error = Error;
 
     fn key(&self) -> &str {

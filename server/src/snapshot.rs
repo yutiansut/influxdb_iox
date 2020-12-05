@@ -6,7 +6,7 @@ use arrow_deps::{
 /// storage.
 use data_types::partition_metadata::{Partition as PartitionMeta, Table};
 use object_store::ObjectStore;
-use query::Partition;
+use query::PartitionChunk;
 
 use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -116,7 +116,7 @@ pub struct Status {
     errors: Vec<Error>,
 }
 
-pub fn snapshot_partition<T: Send + Sync + 'static + Partition>(
+pub fn snapshot_partition<T: Send + Sync + 'static + PartitionChunk>(
     metadata_path: impl Into<String>,
     data_path: impl Into<String>,
     store: Arc<ObjectStore>,

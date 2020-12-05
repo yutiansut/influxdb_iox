@@ -10,7 +10,7 @@ use crate::{
         stringset::{StringSet, StringSetRef},
         SeriesSetPlans, StringSetPlan,
     },
-    DatabaseStore, Partition, Predicate, SQLDatabase, TSDatabase, TimestampRange,
+    DatabaseStore, PartitionChunk, Predicate, SQLDatabase, TSDatabase, TimestampRange,
 };
 
 use data_types::data::ReplicatedWrite;
@@ -451,7 +451,7 @@ impl SQLDatabase for TestDatabase {
 #[derive(Debug)]
 pub struct TestPartition {}
 
-impl Partition for TestPartition {
+impl PartitionChunk for TestPartition {
     type Error = TestError;
 
     fn key(&self) -> &str {
