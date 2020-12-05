@@ -1,6 +1,6 @@
 use arrow_deps::{
     arrow::record_batch::RecordBatch,
-    parquet::{arrow::ArrowWriter, file::writer::TryClone},
+    parquet::{self, arrow::ArrowWriter, file::writer::TryClone},
 };
 /// This module contains code for snapshotting a database partition to Parquet files in object
 /// storage.
@@ -14,13 +14,14 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::oneshot;
+use tracing::{error, info};
 use uuid::Uuid;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Partition error creating snapshot: {}", source))]
     PartitionError {
-        source: write_buffer::partition::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display("Table position out of bounds: {}", position))]
@@ -28,19 +29,48 @@ pub enum Error {
 
     #[snafu(display("Error generating json response: {}", source))]
     JsonGenerationError { source: serde_json::Error },
+
+    #[snafu(display("Error opening Parquet Writer: {}", source))]
+    OpeningParquetWriter {
+        source: parquet::errors::ParquetError,
+    },
+
+    #[snafu(display("Error writing Parquet to memory: {}", source))]
+    WritingParquetToMemory {
+        source: parquet::errors::ParquetError,
+    },
+
+    #[snafu(display("Error closing Parquet Writer: {}", source))]
+    ClosingParquetWriter {
+        source: parquet::errors::ParquetError,
+    },
+
+    #[snafu(display("Error writing to object store: {}", source))]
+    WritingToObjectStore { source: object_store::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug)]
-pub struct Snapshot {
+pub struct Snapshot<T: Send + Sync + 'static + PartitionChunk> {
     pub id: Uuid,
     pub partition_meta: PartitionMeta,
+    pub metadata_path: String,
+    pub data_path: String,
+    store: Arc<ObjectStore>,
+    partition: Arc<T>,
     status: Mutex<Status>,
 }
 
-impl Snapshot {
-    fn new(partition_key: impl Into<String>, tables: Vec<Table>) -> Self {
+impl<T: Send + Sync + 'static + PartitionChunk> Snapshot<T> {
+    fn new(
+        partition_key: String,
+        metadata_path: String,
+        data_path: String,
+        store: Arc<ObjectStore>,
+        partition: Arc<T>,
+        tables: Vec<Table>,
+    ) -> Self {
         let table_states = vec![TableState::NotStarted; tables.len()];
 
         let status = Status {
@@ -51,9 +81,13 @@ impl Snapshot {
         Self {
             id: Uuid::new_v4(),
             partition_meta: PartitionMeta {
-                key: partition_key.into(),
+                key: partition_key,
                 tables,
             },
+            metadata_path,
+            data_path,
+            store,
+            partition,
             status: Mutex::new(status),
         }
     }
@@ -99,6 +133,80 @@ impl Snapshot {
 
         true
     }
+
+    async fn run(&self, notify: Option<oneshot::Sender<()>>) -> Result<()> {
+        while let Some((pos, table_name)) = self.next_table() {
+            let batch = self
+                .partition
+                .table_to_arrow(table_name, &[])
+                .map_err(|e| Box::new(e) as _)
+                .context(PartitionError)?;
+
+            let file_name = format!("{}/{}.parquet", &self.data_path, table_name);
+
+            self.write_batch(batch, &file_name).await?;
+            self.mark_table_finished(pos);
+        }
+
+        let partition_meta_path =
+            format!("{}/{}.json", &self.metadata_path, &self.partition_meta.key);
+        let json_data = serde_json::to_vec(&self.partition_meta).context(JsonGenerationError)?;
+        let data = Bytes::from(json_data);
+        let len = data.len();
+        let stream_data = std::io::Result::Ok(data);
+        self.store
+            .put(
+                &partition_meta_path,
+                futures::stream::once(async move { stream_data }),
+                len,
+            )
+            .await
+            .context(WritingToObjectStore)?;
+
+        self.mark_meta_written();
+
+        if let Some(notify) = notify {
+            if let Err(e) = notify.send(()) {
+                error!("error sending notify: {:?}", e);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn write_batch(&self, batch: RecordBatch, file_name: &str) -> Result<()> {
+        let mem_writer = MemWriter::default();
+        {
+            let mut writer = ArrowWriter::try_new(mem_writer.clone(), batch.schema(), None)
+                .context(OpeningParquetWriter)?;
+            writer.write(&batch).context(WritingParquetToMemory)?;
+            writer.close().context(ClosingParquetWriter)?;
+        } // drop the reference to the MemWriter that the SerializedFileWriter has
+
+        let data = mem_writer
+            .into_inner()
+            .expect("Nothing else should have a reference here");
+
+        let len = data.len();
+        let data = Bytes::from(data);
+        let stream_data = std::io::Result::Ok(data);
+
+        self.store
+            .put(
+                &file_name,
+                futures::stream::once(async move { stream_data }),
+                len,
+            )
+            .await
+            .context(WritingToObjectStore)?;
+
+        Ok(())
+    }
+
+    fn set_error(&self, e: Error) {
+        let mut status = self.status.lock().expect("mutex poisoned");
+        status.error = Some(e);
+    }
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -113,7 +221,7 @@ pub struct Status {
     table_states: Vec<TableState>,
     meta_written: bool,
     stop_on_next_update: bool,
-    errors: Vec<Error>,
+    error: Option<Error>,
 }
 
 pub fn snapshot_partition<T: Send + Sync + 'static + PartitionChunk>(
@@ -122,88 +230,36 @@ pub fn snapshot_partition<T: Send + Sync + 'static + PartitionChunk>(
     store: Arc<ObjectStore>,
     partition: Arc<T>,
     notify: Option<oneshot::Sender<()>>,
-) -> Result<Arc<Snapshot>> {
-    let metadata_path = metadata_path.into();
-    let data_path = data_path.into();
+) -> Result<Arc<Snapshot<T>>> {
+    let table_stats = partition
+        .table_stats()
+        .map_err(|e| Box::new(e) as _)
+        .context(PartitionError)?;
 
-    let table_stats = partition.table_stats().unwrap();
-
-    let snapshot = Snapshot::new(partition.key().to_string(), table_stats);
+    let snapshot = Snapshot::new(
+        partition.key().to_string(),
+        metadata_path.into(),
+        data_path.into(),
+        store,
+        partition,
+        table_stats,
+    );
     let snapshot = Arc::new(snapshot);
 
     let return_snapshot = snapshot.clone();
 
     tokio::spawn(async move {
-        while let Some((pos, table_name)) = snapshot.next_table() {
-            let batch = partition.table_to_arrow(table_name, &[]).unwrap();
-
-            let file_name = format!("{}/{}.parquet", &data_path, table_name);
-
-            write_batch(batch, snapshot.clone(), &file_name, store.clone())
-                .await
-                .unwrap();
-
-            snapshot.mark_table_finished(pos);
-        }
-
-        let partition_meta_path = format!("{}/{}.json", &metadata_path, &partition.key());
-        let json_data = serde_json::to_vec(&snapshot.partition_meta)
-            .context(JsonGenerationError)
-            .unwrap();
-        let data = Bytes::from(json_data);
-        let len = data.len();
-        let stream_data = std::io::Result::Ok(data);
-        store
-            .put(
-                &partition_meta_path,
-                futures::stream::once(async move { stream_data }),
-                len,
-            )
-            .await
-            .unwrap();
-
-        snapshot.mark_meta_written();
-
-        if let Some(notify) = notify {
-            // TODO: log this error only to the log
-            let _ = notify.send(());
+        info!(
+            "starting snapshot of {} to {}",
+            &snapshot.partition_meta.key, &snapshot.data_path
+        );
+        if let Err(e) = snapshot.run(notify).await {
+            error!("error running snapshot: {:?}", e);
+            snapshot.set_error(e);
         }
     });
 
     Ok(return_snapshot)
-}
-
-async fn write_batch(
-    batch: RecordBatch,
-    _snapshot: Arc<Snapshot>,
-    file_name: &str,
-    store: Arc<ObjectStore>,
-) -> Result<()> {
-    let mem_writer = MemWriter::default();
-    {
-        let mut writer = ArrowWriter::try_new(mem_writer.clone(), batch.schema(), None).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    } // drop the reference to the MemWriter that the SerializedFileWriter has
-
-    let data = mem_writer
-        .into_inner()
-        .expect("Nothing else should have a reference here");
-
-    let len = data.len();
-    let data = Bytes::from(data);
-    let stream_data = std::io::Result::Ok(data);
-
-    store
-        .put(
-            &file_name,
-            futures::stream::once(async move { stream_data }),
-            len,
-        )
-        .await
-        .unwrap();
-
-    Ok(())
 }
 
 #[derive(Debug, Default, Clone)]
@@ -322,7 +378,19 @@ mem,host=A,region=west used=45 1
             },
         ];
 
-        let snapshot = Snapshot::new("partition", tables);
+        let store = Arc::new(ObjectStore::new_in_memory(InMemory::new()));
+        let partition = Arc::new(PartitionWB::new("testaroo"));
+        let metadata_path = "/meta".to_string();
+        let data_path = "/data".to_string();
+
+        let snapshot = Snapshot::new(
+            partition.key.clone(),
+            metadata_path,
+            data_path,
+            store,
+            partition,
+            tables,
+        );
 
         let (pos, name) = snapshot.next_table().unwrap();
         assert_eq!(0, pos);
