@@ -12,7 +12,7 @@ use std::io::{Cursor, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use snafu::{OptionExt, ResultExt, Snafu};
+use snafu::{ResultExt, Snafu};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
@@ -23,8 +23,8 @@ pub enum Error {
         source: write_buffer::partition::Error,
     },
 
-    #[snafu(display("Table not found running: {}", table))]
-    TableNotFound { table: usize },
+    #[snafu(display("Table position out of bounds: {}", position))]
+    TablePositionOutOfBounds { position: usize },
 
     #[snafu(display("Error generating json response: {}", source))]
     JsonGenerationError { source: serde_json::Error },
@@ -40,17 +40,18 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    fn new(partition_key: String, tables: Vec<Table>) -> Self {
-        let remaining_tables: Vec<_> = (0..tables.len()).collect();
+    fn new(partition_key: impl Into<String>, tables: Vec<Table>) -> Self {
+        let table_states = vec![TableState::NotStarted; tables.len()];
+
         let status = Status {
-            remaining_tables,
+            table_states,
             ..Default::default()
         };
 
         Self {
             id: Uuid::new_v4(),
             partition_meta: PartitionMeta {
-                key: partition_key,
+                key: partition_key.into(),
                 tables,
             },
             status: Mutex::new(status),
@@ -59,15 +60,26 @@ impl Snapshot {
 
     fn next_table(&self) -> Option<(usize, &str)> {
         let mut status = self.status.lock().expect("mutex poisoned");
-        match status.next_table_position() {
-            Some(pos) => Some((pos, &self.partition_meta.tables[pos].name)),
+
+        match status
+            .table_states
+            .iter()
+            .position(|s| s == &TableState::NotStarted)
+        {
+            Some(pos) => {
+                status.table_states[pos] = TableState::Running;
+                Some((pos, &self.partition_meta.tables[pos].name))
+            }
             None => None,
         }
     }
 
-    fn mark_table_finished(&self, table_position: usize) -> Result<()> {
+    fn mark_table_finished(&self, position: usize) {
         let mut status = self.status.lock().expect("mutex poisoned");
-        status.mark_table_finished(table_position)
+
+        if status.table_states.len() > position {
+            status.table_states[position] = TableState::Finished;
+        }
     }
 
     fn mark_meta_written(&self) {
@@ -76,44 +88,32 @@ impl Snapshot {
     }
 
     pub fn finished(&self) -> bool {
-        self.status.lock().expect("mutex poisoned").finished()
+        let status = self.status.lock().expect("mutex poisoned");
+
+        for s in &status.table_states {
+            match s {
+                TableState::Finished => continue,
+                _ => return false,
+            }
+        }
+
+        true
     }
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum TableState {
+    NotStarted,
+    Running,
+    Finished,
 }
 
 #[derive(Debug, Default)]
 pub struct Status {
-    remaining_tables: Vec<usize>,
-    running_tables: Vec<usize>,
-    finished_tables: Vec<usize>,
+    table_states: Vec<TableState>,
     meta_written: bool,
     stop_on_next_update: bool,
     errors: Vec<Error>,
-}
-
-impl Status {
-    fn next_table_position(&mut self) -> Option<usize> {
-        self.remaining_tables.pop().map(|pos| {
-            self.running_tables.push(pos);
-            pos
-        })
-    }
-
-    fn mark_table_finished(&mut self, position: usize) -> Result<()> {
-        let pos = self
-            .running_tables
-            .iter()
-            .position(|t| *t == position)
-            .context(TableNotFound { table: position })?;
-
-        let _ = self.running_tables.remove(pos);
-        self.finished_tables.push(position);
-
-        Ok(())
-    }
-
-    fn finished(&self) -> bool {
-        self.remaining_tables.is_empty() && self.running_tables.is_empty() && self.meta_written
-    }
 }
 
 pub fn snapshot_partition<T: Send + Sync + 'static + Partition>(
@@ -143,7 +143,7 @@ pub fn snapshot_partition<T: Send + Sync + 'static + Partition>(
                 .await
                 .unwrap();
 
-            snapshot.mark_table_finished(pos).unwrap();
+            snapshot.mark_table_finished(pos);
         }
 
         let partition_meta_path = format!("{}/{}.json", &metadata_path, &partition.key());
@@ -303,5 +303,47 @@ mem,host=A,region=west used=45 1
 
         let meta: PartitionMeta = serde_json::from_slice(&*summary).unwrap();
         assert_eq!(meta, snapshot.partition_meta);
+    }
+
+    #[test]
+    fn snapshot_states() {
+        let tables = vec![
+            Table {
+                name: "foo".to_string(),
+                columns: vec![],
+            },
+            Table {
+                name: "bar".to_string(),
+                columns: vec![],
+            },
+            Table {
+                name: "asdf".to_string(),
+                columns: vec![],
+            },
+        ];
+
+        let snapshot = Snapshot::new("partition", tables);
+
+        let (pos, name) = snapshot.next_table().unwrap();
+        assert_eq!(0, pos);
+        assert_eq!("foo", name);
+
+        let (pos, name) = snapshot.next_table().unwrap();
+        assert_eq!(1, pos);
+        assert_eq!("bar", name);
+
+        snapshot.mark_table_finished(1);
+        assert!(!snapshot.finished());
+
+        let (pos, name) = snapshot.next_table().unwrap();
+        assert_eq!(2, pos);
+        assert_eq!("asdf", name);
+
+        assert!(snapshot.next_table().is_none());
+        assert!(!snapshot.finished());
+
+        snapshot.mark_table_finished(0);
+        snapshot.mark_table_finished(2);
+        assert!(snapshot.finished());
     }
 }
