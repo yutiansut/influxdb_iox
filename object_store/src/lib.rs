@@ -494,19 +494,19 @@ impl File {
 
         let mut file = match fs::File::create(&path).await {
             Ok(f) => f,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => match path.parent() {
-                Some(parent) => {
-                    fs::create_dir_all(&parent)
-                        .await
-                        .context(UnableToCreateDir { path: parent })?;
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let parent = path
+                    .parent()
+                    .context(UnableToCreateFile { path: &path, err })?;
+                fs::create_dir_all(&parent)
+                    .await
+                    .context(UnableToCreateDir { path: parent })?;
 
-                    match fs::File::create(&path).await {
-                        Ok(f) => f,
-                        Err(err) => return UnableToCreateFile { path, err }.fail(),
-                    }
+                match fs::File::create(&path).await {
+                    Ok(f) => f,
+                    Err(err) => return UnableToCreateFile { path, err }.fail(),
                 }
-                None => return UnableToCreateFile { path, err }.fail(),
-            },
+            }
             Err(err) => return UnableToCreateFile { path, err }.fail(),
         };
 
