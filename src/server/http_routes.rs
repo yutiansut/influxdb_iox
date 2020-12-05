@@ -120,9 +120,6 @@ pub enum ApplicationError {
     #[snafu(display("No handler for {:?} {}", method, path))]
     RouteNotFound { method: Method, path: String },
 
-    #[snafu(display("Internal error creating gzip decoder: {:?}", source))]
-    CreatingGzipDecoder { source: std::io::Error },
-
     #[snafu(display("Internal error from database {}:  {}", database, source))]
     DatabaseError {
         database: String,
@@ -153,7 +150,6 @@ impl ApplicationError {
             Self::ParsingLineProtocol { .. } => StatusCode::BAD_REQUEST,
             Self::ReadingBodyAsGzip { .. } => StatusCode::BAD_REQUEST,
             Self::RouteNotFound { .. } => StatusCode::NOT_FOUND,
-            Self::CreatingGzipDecoder { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::DatabaseError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::JsonGenerationError { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
