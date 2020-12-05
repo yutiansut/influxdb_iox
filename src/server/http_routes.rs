@@ -396,6 +396,7 @@ async fn snapshot_partition<T: DatabaseStore>(
     let db_name =
         org_and_bucket_to_database(&snapshot.org, &snapshot.bucket).context(BucketMappingError)?;
 
+    // TODO: refactor the rest of this out of the http route and into the server crate.
     let db = server
         .write_buffer
         .db(&db_name)
@@ -406,7 +407,7 @@ async fn snapshot_partition<T: DatabaseStore>(
         })?;
 
     let metadata_path = format!("{}/meta", &db_name);
-    let data_path = format!("{}/data", &db_name);
+    let data_path = format!("{}/data/{}", &db_name, &snapshot.partition);
     let partition = db.remove_partition(&snapshot.partition).await.unwrap();
     let snapshot = server::snapshot::snapshot_partition(
         metadata_path,
