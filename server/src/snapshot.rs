@@ -47,6 +47,9 @@ pub enum Error {
 
     #[snafu(display("Error writing to object store: {}", source))]
     WritingToObjectStore { source: object_store::Error },
+
+    #[snafu(display("Stopped early"))]
+    StoppedEarly,
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -92,6 +95,7 @@ impl<T: Send + Sync + 'static + PartitionChunk> Snapshot<T> {
         }
     }
 
+    // returns the position of the next table
     fn next_table(&self) -> Option<(usize, &str)> {
         let mut status = self.status.lock().expect("mutex poisoned");
 
@@ -134,6 +138,11 @@ impl<T: Send + Sync + 'static + PartitionChunk> Snapshot<T> {
         true
     }
 
+    fn should_stop(&self) -> bool {
+        let status = self.status.lock().expect("mutex poisoned");
+        status.stop_on_next_update
+    }
+
     async fn run(&self, notify: Option<oneshot::Sender<()>>) -> Result<()> {
         while let Some((pos, table_name)) = self.next_table() {
             let batch = self
@@ -146,6 +155,10 @@ impl<T: Send + Sync + 'static + PartitionChunk> Snapshot<T> {
 
             self.write_batch(batch, &file_name).await?;
             self.mark_table_finished(pos);
+
+            if self.should_stop() {
+                return StoppedEarly.fail();
+            }
         }
 
         let partition_meta_path =
