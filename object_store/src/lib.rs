@@ -23,6 +23,7 @@ use snafu::{ensure, futures::TryStreamExt as _, OptionExt, ResultExt, Snafu};
 use std::{collections::BTreeMap, fmt, io, path::PathBuf};
 use tokio::{fs, sync::RwLock};
 use tokio_util::codec::{BytesCodec, FramedRead};
+use tracing::info;
 
 /// Universal interface to multiple object store services.
 #[derive(Debug)]
@@ -492,6 +493,8 @@ impl File {
 
         let path = self.path(location);
 
+        info!("object_store::File::put path = {:?}", path);
+
         let mut file = match fs::File::create(&path).await {
             Ok(f) => f,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -805,6 +808,56 @@ mod tests {
             let integration =
                 ObjectStore::new_google_cloud_storage(GoogleCloudStorage::new(&bucket_name));
             put_get_delete_list(&integration).await?;
+            Ok(())
+        }
+
+        #[tokio::test]
+        async fn blargh() -> Result<()> {
+            let bucket_name = bucket_name()?;
+
+            let integration =
+                ObjectStore::new_google_cloud_storage(GoogleCloudStorage::new(&bucket_name));
+
+            let data = Bytes::from("arbitrary data");
+
+            let locations = [
+                "test_file/foo",
+                "test_file\\foo",
+                "/test_file/foo",
+                "\\test_file\\foo",
+            ];
+
+            for location in &locations {
+                let stream_data = std::io::Result::Ok(data.clone());
+                integration
+                    .put(
+                        location,
+                        futures::stream::once(async move { stream_data }),
+                        data.len(),
+                    )
+                    .await?;
+            }
+
+            // List everything
+            let content_list = flatten_list_stream(&integration, None).await?;
+
+            assert_eq!(content_list.len(), 4);
+            assert_eq!(content_list, locations);
+
+// In the gcs web ui, this looks like:
+//
+// - folder named `/`
+//   - folder named `test_file/`
+//     - file named `foo`, URI `gs://i32-influx-test//test_file/foo`
+// - file named `\test_file\foo`, URI `gs://i32-influx-test/\test_file\foo`
+// - folder named `test_file/`
+//   - file named `foo`, URI `gs://i32-influx-test/test_file/foo`
+// - file named `test_file\foo`, URI `gs://i32-influx-test/test_file\foo`
+//
+// Because these locations are treated as separate, that says to me locations for GCS *MUST NOT*
+// use file path joining APIs, or using an IOx on both Windows and Linux using the same GCS object
+// store won't share data
+
             Ok(())
         }
     }

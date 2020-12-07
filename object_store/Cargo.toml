@@ -21,6 +21,8 @@ tokio = { version = "0.2", features = ["full"] }
 # Filesystem integration
 tokio-util = "0.3.1"
 
+tracing = "*"
+
 [dev-dependencies]
 tempfile = "3.1.0"
 dotenv = "0.15.0"

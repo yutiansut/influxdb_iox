@@ -324,7 +324,7 @@ mod tests {
     use data_types::database_rules::DatabaseRules;
     use futures::TryStreamExt;
     use influxdb_line_protocol::parse_lines;
-    use object_store::InMemory;
+    use object_store::{InMemory, GoogleCloudStorage};
     use write_buffer::partition::Partition as PartitionWB;
 
     #[tokio::test]
@@ -345,6 +345,107 @@ mem,host=A,region=west used=45 1
         }
 
         let store = Arc::new(ObjectStore::new_in_memory(InMemory::new()));
+        let partition = Arc::new(partition);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let metadata_path = "/meta";
+        let data_path = "/data";
+
+        let snapshot = snapshot_partition(
+            metadata_path,
+            data_path,
+            store.clone(),
+            partition.clone(),
+            Some(tx),
+        )
+        .unwrap();
+
+        rx.await.unwrap();
+
+        let summary = store
+            .get("/meta/testaroo.json")
+            .await
+            .unwrap()
+            .map_ok(|b| bytes::BytesMut::from(&b[..]))
+            .try_concat()
+            .await
+            .unwrap();
+
+        let meta: PartitionMeta = serde_json::from_slice(&*summary).unwrap();
+        assert_eq!(meta, snapshot.partition_meta);
+    }
+
+    #[tokio::test]
+    async fn snapshot_gcs() {
+        dotenv::dotenv().ok();
+
+        let store = Arc::new(ObjectStore::new_google_cloud_storage(
+            GoogleCloudStorage::new(std::env::var("GCS_BUCKET_NAME").unwrap()),
+        ));
+
+        let lp = r#"
+cpu,host=A,region=west user=23.2,system=55.1 1
+cpu,host=A,region=west user=3.2,system=50.1 10
+cpu,host=B,region=east user=10.0,system=74.1 1
+mem,host=A,region=west used=45 1
+        "#;
+
+        let lines: Vec<_> = parse_lines(lp).map(|l| l.unwrap()).collect();
+        let write = lines_to_replicated_write(1, 1, &lines, &DatabaseRules::default());
+        let mut partition = PartitionWB::new("testaroo");
+
+        for e in write.write_buffer_batch().unwrap().entries().unwrap() {
+            partition.write_entry(&e).unwrap();
+        }
+
+        let partition = Arc::new(partition);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let metadata_path = "/meta";
+        let data_path = "/data";
+
+        let snapshot = snapshot_partition(
+            metadata_path,
+            data_path,
+            store.clone(),
+            partition.clone(),
+            Some(tx),
+        )
+        .unwrap();
+
+        rx.await.unwrap();
+
+        let summary = store
+            .get("/meta/testaroo.json")
+            .await
+            .unwrap()
+            .map_ok(|b| bytes::BytesMut::from(&b[..]))
+            .try_concat()
+            .await
+            .unwrap();
+
+        let meta: PartitionMeta = serde_json::from_slice(&*summary).unwrap();
+        assert_eq!(meta, snapshot.partition_meta);
+    }
+
+    #[tokio::test]
+    async fn snapshot_file() {
+         tracing_subscriber::fmt::init();
+        let store = Arc::new(ObjectStore::new_file(object_store::File::new("foobar")));
+
+        let lp = r#"
+cpu,host=A,region=west user=23.2,system=55.1 1
+cpu,host=A,region=west user=3.2,system=50.1 10
+cpu,host=B,region=east user=10.0,system=74.1 1
+mem,host=A,region=west used=45 1
+        "#;
+
+        let lines: Vec<_> = parse_lines(lp).map(|l| l.unwrap()).collect();
+        let write = lines_to_replicated_write(1, 1, &lines, &DatabaseRules::default());
+        let mut partition = PartitionWB::new("testaroo");
+
+        for e in write.write_buffer_batch().unwrap().entries().unwrap() {
+            partition.write_entry(&e).unwrap();
+        }
+
         let partition = Arc::new(partition);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let metadata_path = "/meta";
