@@ -504,6 +504,142 @@ fn print_segment(segment: &mut Vec<Packers>) {
     }
 }
 
+fn print_segment_line_protocol(
+    col_names: Vec<String>,
+    col_data: &mut Vec<Packers>,
+    measurement: &str,
+    tag_range: std::ops::Range<usize>,
+    field_range: std::ops::Range<usize>,
+    time_col: usize,
+) {
+    let total_rows = col_data[0].num_rows();
+    let mut rows = 0;
+
+    let mut tag_col_itrs = vec![];
+    let mut field_col_itrs = vec![];
+    let mut time_col_itr = None;
+
+    for (i, p) in col_data.iter_mut().enumerate() {
+        if tag_range.contains(&i) {
+            tag_col_itrs.push(p.iter());
+        } else if field_range.contains(&i) {
+            field_col_itrs.push(p.iter());
+        } else if i == time_col {
+            time_col_itr = Some(p.iter());
+        } else {
+            unreachable!("missing indexes covering this column");
+        }
+    }
+    let mut time_col_itr = time_col_itr.unwrap();
+
+    while rows < total_rows {
+        if rows > 0 {
+            println!();
+        }
+
+        // Write the measurement.
+        print!("{},", measurement);
+
+        // Write the tags out.
+        let tags = tag_col_itrs.len();
+        for (i, itr) in &mut tag_col_itrs.iter_mut().enumerate() {
+            let name = &col_names[i];
+
+            match itr {
+                packers::packers::PackersIterator::Float(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+                packers::packers::PackersIterator::Integer(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+                packers::packers::PackersIterator::Bytes(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v.as_utf8().unwrap()),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+                packers::packers::PackersIterator::String(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v.as_str()),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+                packers::packers::PackersIterator::Boolean(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+            }
+
+            if i < tags - 1 {
+                print!(",");
+            }
+        }
+
+        // Write the fields out.
+        let fields = field_col_itrs.len();
+        for (i, itr) in &mut field_col_itrs.iter_mut().enumerate() {
+            let name = &col_names[i + tag_col_itrs.len()];
+
+            match itr {
+                packers::packers::PackersIterator::Float(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+                packers::packers::PackersIterator::Integer(itr) => {
+                    if let Some(v) = itr.next() {
+                        match v {
+                            Some(v) => print!("{}={}", name, v),
+                            None => print!("NULL"),
+                        }
+                    }
+                }
+                _ => panic!("not supported at the moment"),
+            }
+
+            if i < fields - 1 {
+                print!(",");
+            }
+        }
+
+        // write timestamp out.
+        match &mut time_col_itr {
+            packers::packers::PackersIterator::Integer(itr) => {
+                if let Some(v) = itr.next() {
+                    match v {
+                        Some(v) => println!("{:?}", v),
+                        None => panic!("nope"),
+                    }
+                }
+            }
+            _ => panic!("not supported at the moment"),
+        }
+
+        rows += 1;
+    }
+}
+
 fn save_record_batch(rb: &RecordBatch) {
     let file = File::create("/Users/edd/tracing_100m.arrow").unwrap();
     let mut writer = writer::StreamWriter::try_new(file, &rb.schema()).unwrap();

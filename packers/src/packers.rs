@@ -105,7 +105,7 @@ impl<'a> Packers {
     }
 
     /// Creates an iterator from the `Packer`.
-    pub fn iter(&'a mut self) -> PackersIterator<'a> {
+    pub fn iter(&'a self) -> PackersIterator<'a> {
         match self {
             Self::Float(p) => PackersIterator::Float(p.iter()),
             Self::Integer(p) => PackersIterator::Integer(p.iter()),
