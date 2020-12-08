@@ -50,8 +50,46 @@ fn main() {
         ColumnType::Time,
     ];
 
+    let packers = generate_packers(START_TIME, ROWS_PER_HOUR, &mut rng);
+
+    // sort packer tags so they're in lexicographic order.
+    let packers = vec![
+        packers.get(2).unwrap(),
+        packers.get(1).unwrap(),
+        packers.get(0).unwrap(),
+        packers.get(6).unwrap(),
+        packers.get(7).unwrap(),
+        packers.get(4).unwrap(),
+        packers.get(8).unwrap(),
+        packers.get(5).unwrap(),
+        packers.get(3).unwrap(),
+        packers.get(9).unwrap(),
+        packers.get(10).unwrap(),
+    ];
+
+    print_segment_line_protocol(
+        &[
+            "cluster",
+            "data_centre",
+            "env",
+            "node_id",
+            "pod_id",
+            "request_id",
+            "span_id",
+            "trace_id",
+            "user_id",
+            "duration",
+            "time",
+        ],
+        packers,
+        "traces",
+        0..9,
+        9..10,
+        10,
+    );
+
     // uncomment this to generate a record batch.
-    let (rb, sample_trace_id) = generate_record_batch(&mut rng);
+    // let (rb, sample_trace_id) = generate_record_batch(&mut rng);
     // println!("Saving Arrow file");
     // save_record_batch(&rb[0]);
 
@@ -59,26 +97,26 @@ fn main() {
     // let sample_trace_id = "zzzzm6FK".to_string();
     // let rb = load_record_batch("/Users/edd/tracing_10m-g6oHreN9.arrow");
 
-    let now = Instant::now();
-    let table = table::Table::with_record_batch("tracing".to_string(), column_names, &rb[0]);
-    println!("Record batch to segment took {:?}", now.elapsed());
-    println!("Segment size is {:?} bytes", table.size());
+    // let now = Instant::now();
+    // let table = table::Table::with_record_batch("tracing".to_string(), column_names, &rb[0]);
+    // println!("Record batch to segment took {:?}", now.elapsed());
+    // println!("Segment size is {:?} bytes", table.size());
 
-    // loop {
-    for _ in 0..1000000 {
-        // execute_select(&table, sample_trace_id.as_str());
-        // println!("{}", execute_read_group(&table));
-        println!(
-            "{}",
-            execute_read_group_rle_only(
-                &table,
-                &["data_centre", "cluster"],
-                &[("duration", AggregateType::Count)]
-            )
-        );
+    // // loop {
+    // for _ in 0..1000000 {
+    //     // execute_select(&table, sample_trace_id.as_str());
+    //     // println!("{}", execute_read_group(&table));
+    //     println!(
+    //         "{}",
+    //         execute_read_group_rle_only(
+    //             &table,
+    //             &["data_centre", "cluster"],
+    //             &[("duration", AggregateType::Count)]
+    //         )
+    //     );
 
-        // println!("{:?}", results);
-    }
+    //     // println!("{:?}", results);
+    // }
 }
 
 fn execute_select<'a>(table: &'a table::Table, sample_trace_id: &'a str) {
@@ -505,8 +543,8 @@ fn print_segment(segment: &mut Vec<Packers>) {
 }
 
 fn print_segment_line_protocol(
-    col_names: Vec<String>,
-    col_data: &mut Vec<Packers>,
+    col_names: &[&str],
+    col_data: Vec<&Packers>,
     measurement: &str,
     tag_range: std::ops::Range<usize>,
     field_range: std::ops::Range<usize>,
@@ -519,12 +557,15 @@ fn print_segment_line_protocol(
     let mut field_col_itrs = vec![];
     let mut time_col_itr = None;
 
-    for (i, p) in col_data.iter_mut().enumerate() {
+    for (i, p) in col_data.iter().enumerate() {
         if tag_range.contains(&i) {
+            println!("pushing tag {:?}", col_names[i]);
             tag_col_itrs.push(p.iter());
         } else if field_range.contains(&i) {
+            println!("pushing field {:?}", col_names[i]);
             field_col_itrs.push(p.iter());
         } else if i == time_col {
+            println!("pushing time {:?}", col_names[i]);
             time_col_itr = Some(p.iter());
         } else {
             unreachable!("missing indexes covering this column");
@@ -590,6 +631,8 @@ fn print_segment_line_protocol(
 
             if i < tags - 1 {
                 print!(",");
+            } else {
+                print!(" ");
             }
         }
 
@@ -610,7 +653,7 @@ fn print_segment_line_protocol(
                 packers::packers::PackersIterator::Integer(itr) => {
                     if let Some(v) = itr.next() {
                         match v {
-                            Some(v) => print!("{}={}", name, v),
+                            Some(v) => print!("{}={}i", name, v),
                             None => print!("NULL"),
                         }
                     }
@@ -620,6 +663,8 @@ fn print_segment_line_protocol(
 
             if i < fields - 1 {
                 print!(",");
+            } else {
+                print!(" ");
             }
         }
 
@@ -628,7 +673,7 @@ fn print_segment_line_protocol(
             packers::packers::PackersIterator::Integer(itr) => {
                 if let Some(v) = itr.next() {
                     match v {
-                        Some(v) => println!("{:?}", v),
+                        Some(v) => print!("{:?}", v),
                         None => panic!("nope"),
                     }
                 }
