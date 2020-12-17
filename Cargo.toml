@@ -95,6 +95,10 @@ tempfile = "3.1.0"
 name = "cpu_feature_check"
 path = "src/cpu_feature_check/main.rs"
 
+[[bin]]
+name = "grpc_test_client"
+path = "src/grpc_test_client/main.rs"
+
 
 [[bench]]
 name = "encoders"
