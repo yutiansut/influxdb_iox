@@ -27,6 +27,12 @@ ReadGroupRequest,
 
 
 
+type StorageClient = storage_client::StorageClient<tonic::transport::Channel>;
+
+
+
+
+
 
 use futures::TryStreamExt;
 
@@ -37,7 +43,16 @@ use tokio;
 async fn main() {
 
     // this is the port that the gRPC storage service listens to
-    let host = "http://127.0.0.1:8086";
+    let url = "http://127.0.0.1:8086";
+
+    let mut client = match StorageClient::connect(url).await {
+        Ok(client) => client,
+        Err(e) => {
+            println!("Error connecting: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
 
     let org_id  = 0x26f7e5a4b7be365b;
     let bucket_id  = 0x917b97a92e883afc;
@@ -67,6 +82,17 @@ async fn main() {
         }),
         hints: 0,
     };
+
+    let results = match read_group(&mut client, request).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results:\n{}", results.join("\n"));
 }
 
 
@@ -93,7 +119,7 @@ fn make_read_source(org_id: u64, bucket_id: u64, partition_id: u64) -> prost_typ
 
 /// return a predicate like
 ///
-/// _m="MA"
+/// _m=measurement_name
 fn make_measurement_predicate(measurement_name: &str) -> Option<Predicate> {
     use node::{Comparison, Type, Value};
     let root = Node {
@@ -116,39 +142,29 @@ fn make_measurement_predicate(measurement_name: &str) -> Option<Predicate> {
     }
 
 
-type StorageClient = storage_client::StorageClient<tonic::transport::Channel>;
 
 
-/// Wrapper around a StorageClient that does the various tonic /
-/// futures dance
-struct StorageClientWrapper {
-    inner: StorageClient,
-}
 
+/// Make a request to query::query_groups and do the
+/// required async dance to flatten the resulting stream
+async fn read_group(
+    client: &mut StorageClient,
+    request: ReadGroupRequest,
+) -> Result<Vec<String>, tonic::Status> {
+    let responses: Vec<_> = client
+        .read_group(request)
+        .await?
+        .into_inner()
+        .try_collect()
+        .await?;
 
-impl StorageClientWrapper {
-    /// Make a request to query::query_groups and do the
-    /// required async dance to flatten the resulting stream
-    async fn read_group(
-        &mut self,
-        request: ReadGroupRequest,
-    ) -> Result<Vec<String>, tonic::Status> {
-        let responses: Vec<_> = self
-            .inner
-            .read_group(request)
-            .await?
-            .into_inner()
-            .try_collect()
-            .await?;
+    let data_frames: Vec<frame::Data> = responses
+        .into_iter()
+        .flat_map(|r| r.frames)
+        .flat_map(|f| f.data)
+        .collect();
 
-        let data_frames: Vec<frame::Data> = responses
-            .into_iter()
-            .flat_map(|r| r.frames)
-            .flat_map(|f| f.data)
-            .collect();
+    let s = format!("{} group frames", data_frames.len());
 
-        let s = format!("{} group frames", data_frames.len());
-
-        Ok(vec![s])
-    }
+    Ok(vec![s])
 }
