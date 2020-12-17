@@ -1,4 +1,10 @@
 // This is a simple command line program that sends queries via gRPC and prints the results
+// run with
+//   cargo run --bin grpc_test_client
+//
+// Run with much logness:
+//   RUST_LOG=trace cargo run --bin grpc_test_client
+
 
 use generated_types::{
     node,
@@ -13,7 +19,8 @@ use generated_types::{
     //Window as RPCWindow,
 //     i_ox_testing_server::{IOxTesting, IOxTestingServer},
 //     storage_server::{Storage, StorageServer},
-//     CapabilitiesResponse, Capability, Int64ValuesResponse, MeasurementFieldsRequest,
+    CapabilitiesResponse,
+    //Capability, Int64ValuesResponse, MeasurementFieldsRequest,
 //     MeasurementFieldsResponse, MeasurementNamesRequest, MeasurementTagKeysRequest,
     //     MeasurementTagValuesRequest,
     Predicate,
@@ -24,15 +31,13 @@ ReadGroupRequest,
     //     TagValuesRequest, TestErrorRequest, TestErrorResponse,
     TimestampRange,
 };
+use tracing_subscriber::EnvFilter;
 
 
 
 type StorageClient = storage_client::StorageClient<tonic::transport::Channel>;
 
-
-
-
-
+use std::collections::HashMap;
 
 use futures::TryStreamExt;
 
@@ -41,9 +46,19 @@ use tokio;
 
 #[tokio::main]
 async fn main() {
+    use tracing_subscriber::prelude::*;
 
-    // this is the port that the gRPC storage service listens to
-    let url = "http://127.0.0.1:8086";
+    // Setup logging...
+    let logger = tracing_subscriber::fmt::layer().with_writer(std::io::stderr);
+    tracing_subscriber::registry()
+        //.with(opentelemetry)
+        .with(EnvFilter::from_default_env())
+        .with(logger)
+        .init();
+
+
+    // 8082 is the port that the gRPC storage service listens to
+    let url = "http://127.0.0.1:8082";
 
     let mut client = match StorageClient::connect(url).await {
         Ok(client) => client,
@@ -54,14 +69,25 @@ async fn main() {
         }
     };
 
+    println!("Sucessfully connected to server {}. Client: {:?}", url, client);
+
+    println!("Checking capabilities...");
+    let caps = match capabilities(&mut client).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running capabilities: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+    println!("Capabilities:\n{:#?}", caps);
+
+
     let org_id  = 0x26f7e5a4b7be365b;
     let bucket_id  = 0x917b97a92e883afc;
     let partition_id = 0;
 
     let read_source = make_read_source(org_id, bucket_id, partition_id);
-
-
-
 
     let group = generated_types::read_group_request::Group::By as i32;
 
@@ -139,10 +165,24 @@ fn make_measurement_predicate(measurement_name: &str) -> Option<Predicate> {
         ],
     };
     Some(Predicate { root: Some(root) })
-    }
+}
 
 
 
+/// return the capabilities of the server as a hash map
+async fn capabilities(client: &mut StorageClient) -> Result<HashMap<String, Vec<String>>, tonic::Status> {
+    let response = client.capabilities(()).await?.into_inner();
+
+    let CapabilitiesResponse { caps } = response;
+
+    // unwrap the Vec of Strings inside each `Capability`
+    let caps = caps
+        .into_iter()
+        .map(|(name, capability)| (name, capability.features))
+        .collect();
+
+    Ok(caps)
+}
 
 
 /// Make a request to query::query_groups and do the
