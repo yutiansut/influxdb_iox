@@ -114,7 +114,7 @@ async fn main() {
         hints: 0,
     };
 
-    // Check first:
+    println!("------ first -------");
     let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::First, &[])).await {
         Ok(results) =>  results,
         Err(e) => {
@@ -125,6 +125,45 @@ async fn main() {
     };
 
     println!("Results for first:\n{}", results.join("\n"));
+
+
+    println!("------ last -------");
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::Last, &[])).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for last:\n{}", results.join("\n"));
+
+
+    println!("------ min -------");
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::Min, &[])).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for min:\n{}", results.join("\n"));
+
+    println!("------ max -------");
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::Max, &[])).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for max:\n{}", results.join("\n"));
+
 }
 
 // Takes the request and replaces the aggregate and group keys list
