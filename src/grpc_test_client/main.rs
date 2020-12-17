@@ -11,7 +11,7 @@ use generated_types::{
     Node,
     aggregate::AggregateType,
     //i_ox_testing_client,
-    read_response::frame,
+    //read_response::frame,
     storage_client,
     Aggregate as RPCAggregate,
     //Duration as RPCDuration,
@@ -30,6 +30,11 @@ ReadGroupRequest,
 //     ReadSeriesCardinalityRequest, ReadWindowAggregateRequest, StringValuesResponse, TagKeysRequest,
     //     TagValuesRequest, TestErrorRequest, TestErrorResponse,
     TimestampRange,
+    read_response::{
+        frame::Data, BooleanPointsFrame, FloatPointsFrame, Frame, GroupFrame,
+        IntegerPointsFrame, SeriesFrame, StringPointsFrame,
+    },
+    Tag,
 };
 use tracing_subscriber::EnvFilter;
 
@@ -104,12 +109,13 @@ async fn main() {
         group_keys: vec![],
         group,
         aggregate: Some(RPCAggregate {
-            r#type: AggregateType::Sum as i32,
+            r#type: AggregateType::First as i32,
         }),
         hints: 0,
     };
 
-    let results = match read_group(&mut client, request).await {
+    // Check first:
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::First, &[])).await {
         Ok(results) =>  results,
         Err(e) => {
             println!("Error running read group: {}", e);
@@ -118,7 +124,23 @@ async fn main() {
         }
     };
 
-    println!("Results:\n{}", results.join("\n"));
+    println!("Results for first:\n{}", results.join("\n"));
+}
+
+// Takes the request and replaces the aggregate and group keys list
+fn make_request_from_template(request: ReadGroupRequest, agg: AggregateType, group_keys: &[&str]) -> ReadGroupRequest {
+    let group_keys = group_keys.iter().map(|s|s.to_string())
+        .collect::<Vec<_>>();
+
+    ReadGroupRequest {
+        aggregate: Some(RPCAggregate {
+            r#type: agg as i32,
+        }),
+        group_keys,
+        ..request
+    }
+
+
 }
 
 
@@ -136,7 +158,7 @@ fn make_read_source(org_id: u64, bucket_id: u64, partition_id: u64) -> prost_typ
         .encode(&mut d)
         .expect("encoded read source appropriately");
     prost_types::Any {
-        type_url: "/TODO".to_string(),
+        type_url: "/com.github.influxdata.idpe.storage.read.ReadSource".to_string(),
         value: d,
     }
 }
@@ -198,13 +220,84 @@ async fn read_group(
         .try_collect()
         .await?;
 
-    let data_frames: Vec<frame::Data> = responses
+    let data_frames= responses
         .into_iter()
         .flat_map(|r| r.frames)
-        .flat_map(|f| f.data)
+        .map(|frame| dump_frame(&frame))
         .collect();
 
-    let s = format!("{} group frames", data_frames.len());
+    Ok(data_frames)
+}
 
-    Ok(vec![s])
+
+fn dump_frame(frame: &Frame) -> String {
+    let data = &frame.data;
+    match data {
+        Some(Data::Series(SeriesFrame { tags, data_type })) => format!(
+            "SeriesFrame, tags: {}, type: {:?}",
+            dump_tags(tags),
+            data_type
+        ),
+        Some(Data::FloatPoints(FloatPointsFrame { timestamps, values })) => format!(
+            "FloatPointsFrame, timestamps: {:?}, values: {:?}",
+            timestamps,
+            dump_values(values)
+        ),
+        Some(Data::IntegerPoints(IntegerPointsFrame { timestamps, values })) => format!(
+            "IntegerPointsFrame, timestamps: {:?}, values: {:?}",
+            timestamps,
+            dump_values(values)
+        ),
+        Some(Data::BooleanPoints(BooleanPointsFrame { timestamps, values })) => format!(
+            "BooleanPointsFrame, timestamps: {:?}, values: {}",
+            timestamps,
+            dump_values(values)
+        ),
+        Some(Data::StringPoints(StringPointsFrame { timestamps, values })) => format!(
+            "StringPointsFrame, timestamps: {:?}, values: {}",
+            timestamps,
+            dump_values(values)
+        ),
+        Some(Data::Group(GroupFrame {
+            tag_keys,
+            partition_key_vals,
+        })) => format!(
+            "GroupFrame, tag_keys: {}, partition_key_vals: {}",
+            dump_u8_vec(tag_keys),
+            dump_u8_vec(partition_key_vals),
+        ),
+        None => "<NO data field>".into(),
+        _ => ":thinking_face: unknown frame type".into(),
+    }
+}
+
+fn dump_values<T>(v: &[T]) -> String
+where
+    T: std::fmt::Display,
+{
+    v.iter()
+        .map(|item| format!("{}", item))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn dump_u8_vec(encoded_strings: &[Vec<u8>]) -> String {
+    encoded_strings
+        .iter()
+        .map(|b| String::from_utf8_lossy(b))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn dump_tags(tags: &[Tag]) -> String {
+    tags.iter()
+        .map(|tag| {
+            format!(
+                "{}={}",
+                String::from_utf8_lossy(&tag.key),
+                String::from_utf8_lossy(&tag.value),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
