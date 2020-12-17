@@ -164,6 +164,63 @@ async fn main() {
 
     println!("Results for max:\n{}", results.join("\n"));
 
+    // ---------------------------------
+    // ------- now test with group keys
+    // ---------------------------------
+
+    let group_keys = &["city"];
+
+    println!("------ first with group_keys = {:?} -------", group_keys);
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::First, group_keys)).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for first:\n{}", results.join("\n"));
+
+
+    println!("------ last with group_keys = {:?} -------", group_keys);
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::Last, group_keys)).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for last:\n{}", results.join("\n"));
+
+
+    println!("------ min with group_keys = {:?} -------", group_keys);
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::Min, group_keys)).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for min:\n{}", results.join("\n"));
+
+    println!("------ max with group_keys = {:?} -------", group_keys);
+    let results = match read_group(&mut client, make_request_from_template(request.clone(), AggregateType::Max, group_keys)).await {
+        Ok(results) =>  results,
+        Err(e) => {
+            println!("Error running read group: {}", e);
+            println!("   {:?}", e);
+            return ();
+        }
+    };
+
+    println!("Results for max:\n{}", results.join("\n"));
+
+
 }
 
 // Takes the request and replaces the aggregate and group keys list
