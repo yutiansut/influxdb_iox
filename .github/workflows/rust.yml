@@ -15,7 +15,7 @@
 # Cargo's build artefacts are cached to reduce the build time, see
 # https://github.com/actions/cache for more info.
 
-on: [push]
+on: [pull_request]
 
 name: ci
 
