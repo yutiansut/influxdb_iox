@@ -502,6 +502,83 @@ pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> 
     })
 }
 
+// State for splitting characters into lines using the protocol buf
+#[derive(Debug, Clone, Copy)]
+pub struct LineSplitter {
+    // NB: This is ported as closely as possibly from the original Go code:
+    quoted: bool,
+    fields: bool,
+
+    // tracks how many '=' and commas we've seen
+    // this duplicates some of the functionality in scanFields
+    equals: usize,
+    commas: usize,
+
+    in_escape: bool,
+}
+
+impl Default for LineSplitter {
+    fn default() -> Self {
+        Self {
+            quoted: false,
+            fields: false,
+            equals: 0,
+            commas: 0,
+            in_escape: false,
+        }
+    }
+}
+
+impl LineSplitter {
+    /// feed a single character into the line splitter, returning true
+    /// if we found the end of a line
+    #[inline]
+    pub fn feed_char(&mut self, c: char) -> bool {
+        // skip past escaped characters
+        if self.in_escape {
+            self.in_escape = false;
+            return false;
+        }
+
+        if c == '\\' {
+            self.in_escape = true;
+            return false;
+        }
+
+        if c == ' ' {
+            self.fields = true;
+            return false;
+        }
+
+        // If we see a double quote, makes sure it is not escaped
+        if self.fields {
+            if !self.quoted && c == '=' {
+                self.equals += 1;
+                return false;
+            } else if !self.quoted && c == ',' {
+                self.commas += 1;
+                return false;
+            } else if c == '"' && self.equals > self.commas {
+                self.quoted = !self.quoted;
+                return false;
+            }
+        }
+
+        if c == '\n' && !self.quoted {
+            // reset all the state -- we found a line
+            self.quoted = false;
+            self.fields = false;
+            self.equals = 0;
+            self.commas = 0;
+            assert!(!self.in_escape);
+            self.in_escape = false;
+            return true;
+        }
+
+        false
+    }
+}
+
 /// Split `input` into invidividual lines to be parsed, based on the
 /// rules of the Line Protocol format.
 ///
@@ -513,63 +590,12 @@ pub fn parse_lines(input: &str) -> impl Iterator<Item = Result<ParsedLine<'_>>> 
 /// we can be more sure of the compatibility of the rust parser and
 /// the canonical Go parser.
 fn split_lines(input: &str) -> impl Iterator<Item = &str> {
-    // NB: This is ported as closely as possibly from the original Go code:
-    let mut quoted = false;
-    let mut fields = false;
+    let mut splitter = LineSplitter::default();
 
-    // tracks how many '=' and commas we've seen
-    // this duplicates some of the functionality in scanFields
-    let mut equals = 0;
-    let mut commas = 0;
-
-    let mut in_escape = false;
-    input.split(move |c| {
-        // skip past escaped characters
-        if in_escape {
-            in_escape = false;
-            return false;
-        }
-
-        if c == '\\' {
-            in_escape = true;
-            return false;
-        }
-
-        if c == ' ' {
-            fields = true;
-            return false;
-        }
-
-        // If we see a double quote, makes sure it is not escaped
-        if fields {
-            if !quoted && c == '=' {
-                equals += 1;
-                return false;
-            } else if !quoted && c == ',' {
-                commas += 1;
-                return false;
-            } else if c == '"' && equals > commas {
-                quoted = !quoted;
-                return false;
-            }
-        }
-
-        if c == '\n' && !quoted {
-            // reset all the state -- we found a line
-            quoted = false;
-            fields = false;
-            equals = 0;
-            commas = 0;
-            assert!(!in_escape);
-            in_escape = false;
-            return true;
-        }
-
-        false
-    })
+    input.split(move |c| splitter.feed_char(c))
 }
 
-fn parse_line(i: &str) -> IResult<&str, ParsedLine<'_>> {
+pub fn parse_line(i: &str) -> IResult<&str, ParsedLine<'_>> {
     let field_set = preceded(whitespace, field_set);
     let timestamp = preceded(whitespace, terminated(timestamp, opt(whitespace)));
 
