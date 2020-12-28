@@ -66,6 +66,11 @@ pub struct Chunk {
     /// this is not the same as the timestamps on the data itself
     pub time_of_first_write: Option<Instant>,
 
+    /// Most recent time at which data write was initiated into this
+    /// chunk. Note this is not the same as the timestamps on the data
+    /// itself
+    pub time_of_last_write: Option<Instant>,
+
     /// Time at which this chunk became immutable (no new data was
     /// written after this time). Note this is not the same as the
     /// timestamps on the data itself
@@ -184,12 +189,19 @@ impl Chunk {
             dictionary: Dictionary::new(),
             tables: HashMap::new(),
             time_of_first_write: None,
+            time_of_last_write: None,
             time_became_immutable: None,
         }
     }
 
     pub fn write_entry(&mut self, entry: &wb::WriteBufferEntry<'_>) -> Result<()> {
         if let Some(table_batches) = entry.table_batches() {
+            let now = Instant::now();
+            if self.time_of_first_write.is_none() {
+                self.time_of_first_write = Some(now);
+            }
+            self.time_of_last_write = Some(now);
+
             for batch in table_batches {
                 self.write_table_batch(&batch)?;
             }
@@ -199,10 +211,6 @@ impl Chunk {
     }
 
     fn write_table_batch(&mut self, batch: &wb::TableWriteBatch<'_>) -> Result<()> {
-        if self.time_of_first_write.is_none() {
-            self.time_of_first_write = Some(Instant::now())
-        }
-
         let table_name = batch.name().context(TableWriteWithoutName)?;
         let table_id = self.dictionary.lookup_value_or_insert(table_name);
 

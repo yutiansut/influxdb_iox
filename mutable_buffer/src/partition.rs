@@ -549,7 +549,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rollover_chunk_timestamps() {
+    async fn test_chunk_timestamps() {
         let start = Instant::now();
         let mut partition = Partition::new("a_key");
         let after_partition_creation = Instant::now();
@@ -578,24 +578,43 @@ mod tests {
         assert!(start < chunk.time_of_first_write.unwrap());
         assert!(after_partition_creation < chunk.time_of_first_write.unwrap());
         assert!(chunk.time_of_first_write.unwrap() < after_data_load);
+        assert!(chunk.time_of_first_write.unwrap() == chunk.time_of_last_write.unwrap());
         assert!(after_data_load < chunk.time_became_immutable.unwrap());
         assert!(chunk.time_became_immutable.unwrap() < after_rollover);
     }
 
     #[tokio::test]
-    async fn test_rollover_chunk_timestamps_empty() {
+    async fn test_chunk_timestamps_last_write() {
+        let mut partition = Partition::new("a_key");
+
+        // Given data loaded into two chunks
+        load_data(&mut partition, &["o2,state=MA,city=Boston temp=71.4 100"]).await;
+        let after_data_load_1 = Instant::now();
+
+        load_data(&mut partition, &["o2,state=MA,city=Boston temp=72.4 200"]).await;
+        let after_data_load_2 = Instant::now();
+        let chunk = partition.rollover_chunk();
+
+        assert!(chunk.time_of_first_write.unwrap() < after_data_load_1);
+        assert!(chunk.time_of_first_write.unwrap() < chunk.time_of_last_write.unwrap());
+        assert!(chunk.time_of_last_write.unwrap() < after_data_load_2);
+    }
+
+    #[tokio::test]
+    async fn test_chunk_timestamps_empty() {
         let mut partition = Partition::new("a_key");
         let after_partition_creation = Instant::now();
 
         let chunk = partition.rollover_chunk();
         let after_rollover = Instant::now();
         assert!(chunk.time_of_first_write.is_none());
+        assert!(chunk.time_of_last_write.is_none());
         assert!(after_partition_creation < chunk.time_became_immutable.unwrap());
         assert!(chunk.time_became_immutable.unwrap() < after_rollover);
     }
 
     #[tokio::test]
-    async fn test_rollover_chunk_timestamps_empty_write() {
+    async fn test_chunk_timestamps_empty_write() {
         let mut partition = Partition::new("a_key");
         let after_partition_creation = Instant::now();
 
@@ -606,6 +625,7 @@ mod tests {
         let after_rollover = Instant::now();
 
         assert!(chunk.time_of_first_write.is_none());
+        assert!(chunk.time_of_last_write.is_none());
         assert!(after_partition_creation < chunk.time_became_immutable.unwrap());
         assert!(chunk.time_became_immutable.unwrap() < after_rollover);
     }
