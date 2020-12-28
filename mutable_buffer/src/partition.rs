@@ -233,9 +233,8 @@ impl<'a> Iterator for ChunkIter<'a> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
-
     use super::*;
+    use chrono::Utc;
     use data_types::data::split_lines_into_write_entry_partitions;
 
     use arrow_deps::{
@@ -550,9 +549,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_chunk_timestamps() {
-        let start = Instant::now();
+        let start = Utc::now();
         let mut partition = Partition::new("a_key");
-        let after_partition_creation = Instant::now();
+        let after_partition_creation = Utc::now();
 
         // Given data loaded into two chunks
         load_data(
@@ -564,11 +563,11 @@ mod tests {
             ],
         )
         .await;
-        let after_data_load = Instant::now();
+        let after_data_load = Utc::now();
 
         // When the chunk is rolled over
         let chunk = partition.rollover_chunk();
-        let after_rollover = Instant::now();
+        let after_rollover = Utc::now();
 
         println!("start: {:?}, after_partition_creation: {:?}, after_data_load: {:?}, after_rollover: {:?}",
                  start, after_partition_creation, after_data_load, after_rollover);
@@ -589,10 +588,10 @@ mod tests {
 
         // Given data loaded into two chunks
         load_data(&mut partition, &["o2,state=MA,city=Boston temp=71.4 100"]).await;
-        let after_data_load_1 = Instant::now();
+        let after_data_load_1 = Utc::now();
 
         load_data(&mut partition, &["o2,state=MA,city=Boston temp=72.4 200"]).await;
-        let after_data_load_2 = Instant::now();
+        let after_data_load_2 = Utc::now();
         let chunk = partition.rollover_chunk();
 
         assert!(chunk.time_of_first_write.unwrap() < after_data_load_1);
@@ -603,10 +602,10 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_timestamps_empty() {
         let mut partition = Partition::new("a_key");
-        let after_partition_creation = Instant::now();
+        let after_partition_creation = Utc::now();
 
         let chunk = partition.rollover_chunk();
-        let after_rollover = Instant::now();
+        let after_rollover = Utc::now();
         assert!(chunk.time_of_first_write.is_none());
         assert!(chunk.time_of_last_write.is_none());
         assert!(after_partition_creation < chunk.time_became_immutable.unwrap());
@@ -616,13 +615,13 @@ mod tests {
     #[tokio::test]
     async fn test_chunk_timestamps_empty_write() {
         let mut partition = Partition::new("a_key");
-        let after_partition_creation = Instant::now();
+        let after_partition_creation = Utc::now();
 
         // Call load data but don't write any actual data (aka it was an empty write)
         load_data(&mut partition, &[""]).await;
 
         let chunk = partition.rollover_chunk();
-        let after_rollover = Instant::now();
+        let after_rollover = Utc::now();
 
         assert!(chunk.time_of_first_write.is_none());
         assert!(chunk.time_of_last_write.is_none());

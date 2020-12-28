@@ -7,11 +7,9 @@ use arrow_deps::{
         prelude::*,
     },
 };
+use chrono::{DateTime, Utc};
 use generated_types::wal as wb;
-use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    time::Instant,
-};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use data_types::{partition_metadata::Table as TableStats, TIME_COLUMN_NAME};
 use query::{
@@ -64,17 +62,17 @@ pub struct Chunk {
 
     /// Time at which the first data was written into this chunk. Note
     /// this is not the same as the timestamps on the data itself
-    pub time_of_first_write: Option<Instant>,
+    pub time_of_first_write: Option<DateTime<Utc>>,
 
     /// Most recent time at which data write was initiated into this
     /// chunk. Note this is not the same as the timestamps on the data
     /// itself
-    pub time_of_last_write: Option<Instant>,
+    pub time_of_last_write: Option<DateTime<Utc>>,
 
     /// Time at which this chunk became immutable (no new data was
     /// written after this time). Note this is not the same as the
     /// timestamps on the data itself
-    pub time_became_immutable: Option<Instant>,
+    pub time_became_immutable: Option<DateTime<Utc>>,
 
     /// `dictionary` maps &str -> u32. The u32s are used in place of String or
     /// str to avoid slow string operations. The same dictionary is used for
@@ -196,7 +194,7 @@ impl Chunk {
 
     pub fn write_entry(&mut self, entry: &wb::WriteBufferEntry<'_>) -> Result<()> {
         if let Some(table_batches) = entry.table_batches() {
-            let now = Instant::now();
+            let now = Utc::now();
             if self.time_of_first_write.is_none() {
                 self.time_of_first_write = Some(now);
             }
@@ -231,7 +229,7 @@ impl Chunk {
     /// Tell this chunk that it has been marked as immutable
     pub fn mark_immutable(&mut self) {
         assert!(self.time_became_immutable.is_none());
-        self.time_became_immutable = Some(Instant::now())
+        self.time_became_immutable = Some(Utc::now())
     }
 
     /// Translates `predicate` into per-chunk ids that can be
