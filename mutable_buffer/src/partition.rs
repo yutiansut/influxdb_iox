@@ -60,16 +60,20 @@ pub struct Partition {
     /// `iter()` to iterate over chunks in their creation order
     immutable_chunks: BTreeMap<u64, Arc<Chunk>>,
 
-    id_generator: ChunkIdGenerator,
+    /// Responsible for assigning ids to chunks. Eventually, this might
+    /// need to start at a number other than 0.
+    id_generator: u64,
 }
 
 impl Partition {
     pub fn new(key: impl Into<String>) -> Self {
         // TODO: for existing partitions, does this need to pick up at preexisting ID?
-        let mut id_generator = ChunkIdGenerator::default();
+        let mut id_generator = 0;
 
         let key: String = key.into();
-        let mutable_chunk = Chunk::new(&key, id_generator.next_id());
+        let mutable_chunk = Chunk::new(&key, id_generator);
+        id_generator += 1;
+
         Self {
             key,
             mutable_chunk,
@@ -123,7 +127,8 @@ impl Partition {
     /// Queries will continue to see data in the specified chunk until
     /// it is dropped.
     pub fn rollover_chunk(&mut self) -> Arc<Chunk> {
-        let chunk_id = self.id_generator.next_id();
+        let chunk_id = self.id_generator;
+        self.id_generator += 1;
         let mut chunk = Chunk::new(self.key(), chunk_id);
         std::mem::swap(&mut chunk, &mut self.mutable_chunk);
         chunk.mark_immutable();
@@ -173,21 +178,6 @@ impl Partition {
 #[derive(Debug, Default, PartialEq)]
 pub struct PartitionChunkInfo {
     pub num_immutable_chunks: usize,
-}
-
-/// Responsible for assigning ids to chunks. Eventually, this might
-/// need to start at a number other than 0.
-#[derive(Debug, Default, PartialEq)]
-struct ChunkIdGenerator {
-    next_id: u64,
-}
-
-impl ChunkIdGenerator {
-    fn next_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id += 1;
-        id
-    }
 }
 
 /// Iterates over chunks in a partition. Always iterates over mutable
