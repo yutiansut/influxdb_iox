@@ -16,14 +16,16 @@ use crate::{
     column::Column,
     dictionary::{Dictionary, Error as DictionaryError},
 };
-use data_types::{partition_metadata::Column as ColumnStats, TIME_COLUMN_NAME};
+use data_types::{
+    partition_metadata::Column as ColumnStats, schema::builder::SchemaBuilder, TIME_COLUMN_NAME,
+};
 use snafu::{OptionExt, ResultExt, Snafu};
 
 use arrow_deps::{
     arrow,
     arrow::{
         array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder},
-        datatypes::{DataType as ArrowDataType, Field as ArrowField, Schema as ArrowSchema},
+        datatypes::DataType as ArrowDataType,
         record_batch::RecordBatch,
     },
     datafusion::{
@@ -38,7 +40,7 @@ pub enum Error {
     #[snafu(display("Tag value ID {} not found in dictionary of chunk {}", value, chunk))]
     TagValueIdNotFoundInDictionary {
         value: u32,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
@@ -73,7 +75,7 @@ pub enum Error {
     ))]
     ColumnNameNotFoundInDictionary {
         column_name: String,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
@@ -84,7 +86,7 @@ pub enum Error {
     ))]
     ColumnIdNotFoundInDictionary {
         column_id: u32,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
@@ -95,6 +97,11 @@ pub enum Error {
 
     #[snafu(display("arrow conversion error: {}", source))]
     ArrowError { source: arrow::error::ArrowError },
+
+    #[snafu(display("Internal error converting schema: {}", source))]
+    InternalSchema {
+        source: data_types::schema::builder::Error,
+    },
 
     #[snafu(display(
         "No index entry found for column {} with id {}",
@@ -136,7 +143,7 @@ pub enum Error {
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Table {
     /// Name of the table as a u32 in the chunk dictionary
     pub id: u32,
@@ -805,7 +812,7 @@ impl Table {
                 .lookup_value(column_name)
                 .context(ColumnNameNotFoundInDictionary {
                     column_name,
-                    chunk: &chunk.key,
+                    chunk: chunk.id,
                 })?;
 
         self.column_id_to_index
@@ -842,7 +849,7 @@ impl Table {
                 let column_name = chunk.dictionary.lookup_id(column_id).context(
                     ColumnIdNotFoundInDictionary {
                         column_id,
-                        chunk: &chunk.key,
+                        chunk: chunk.id,
                     },
                 )?;
                 Ok((column_name, column_index))
@@ -862,13 +869,13 @@ impl Table {
         chunk: &Chunk,
         requested_columns_with_index: &[(&str, usize)],
     ) -> Result<RecordBatch> {
-        let mut fields = Vec::with_capacity(requested_columns_with_index.len());
+        let mut schema_builder = SchemaBuilder::new();
         let mut columns: Vec<ArrayRef> = Vec::with_capacity(requested_columns_with_index.len());
 
         for &(column_name, column_index) in requested_columns_with_index.iter() {
             let arrow_col: ArrayRef = match &self.columns[column_index] {
                 Column::String(vals, _) => {
-                    fields.push(ArrowField::new(column_name, ArrowDataType::Utf8, true));
+                    schema_builder = schema_builder.field(column_name, ArrowDataType::Utf8);
                     let mut builder = StringBuilder::with_capacity(vals.len(), vals.len() * 10);
 
                     for v in vals {
@@ -882,7 +889,7 @@ impl Table {
                     Arc::new(builder.finish())
                 }
                 Column::Tag(vals, _) => {
-                    fields.push(ArrowField::new(column_name, ArrowDataType::Utf8, true));
+                    schema_builder = schema_builder.tag(column_name);
                     let mut builder = StringBuilder::with_capacity(vals.len(), vals.len() * 10);
 
                     for v in vals {
@@ -892,7 +899,7 @@ impl Table {
                                 let tag_value = chunk.dictionary.lookup_id(*value_id).context(
                                     TagValueIdNotFoundInDictionary {
                                         value: *value_id,
-                                        chunk: &chunk.key,
+                                        chunk: chunk.id,
                                     },
                                 )?;
                                 builder.append_value(tag_value)
@@ -904,7 +911,7 @@ impl Table {
                     Arc::new(builder.finish())
                 }
                 Column::F64(vals, _) => {
-                    fields.push(ArrowField::new(column_name, ArrowDataType::Float64, true));
+                    schema_builder = schema_builder.field(column_name, ArrowDataType::Float64);
                     let mut builder = Float64Builder::new(vals.len());
 
                     for v in vals {
@@ -914,7 +921,7 @@ impl Table {
                     Arc::new(builder.finish())
                 }
                 Column::I64(vals, _) => {
-                    fields.push(ArrowField::new(column_name, ArrowDataType::Int64, true));
+                    schema_builder = schema_builder.field(column_name, ArrowDataType::Int64);
                     let mut builder = Int64Builder::new(vals.len());
 
                     for v in vals {
@@ -924,7 +931,7 @@ impl Table {
                     Arc::new(builder.finish())
                 }
                 Column::Bool(vals, _) => {
-                    fields.push(ArrowField::new(column_name, ArrowDataType::Boolean, true));
+                    schema_builder = schema_builder.field(column_name, ArrowDataType::Boolean);
                     let mut builder = BooleanBuilder::new(vals.len());
 
                     for v in vals {
@@ -938,9 +945,9 @@ impl Table {
             columns.push(arrow_col);
         }
 
-        let schema = ArrowSchema::new(fields);
+        let schema = schema_builder.build().context(InternalSchema)?.into();
 
-        RecordBatch::try_new(Arc::new(schema), columns).context(ArrowError {})
+        RecordBatch::try_new(schema, columns).context(ArrowError {})
     }
 
     /// returns true if any row in this table could possible match the
@@ -1275,7 +1282,7 @@ mod tests {
 
     #[test]
     fn test_has_columns() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -1317,7 +1324,7 @@ mod tests {
 
     #[test]
     fn test_matches_table_name_predicate() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("h2o"));
 
@@ -1347,7 +1354,7 @@ mod tests {
 
     #[test]
     fn test_matches_column_name_predicate() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("h2o"));
 
@@ -1393,7 +1400,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_series_set_plan() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -1440,7 +1447,7 @@ mod tests {
         // test that the columns and rows come out in the right order (tags then
         // timestamp)
 
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -1489,7 +1496,7 @@ mod tests {
     async fn test_series_set_plan_filter() {
         // test that filters are applied reasonably
 
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -1878,7 +1885,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grouped_window_series_set_plan_nanoseconds() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -1942,7 +1949,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_grouped_window_series_set_plan_months() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -1987,7 +1994,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_field_name_plan() {
-        let mut chunk = Chunk::new("dummy_chunk_key", 42);
+        let mut chunk = Chunk::new(42);
         let dictionary = &mut chunk.dictionary;
         let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 
@@ -2164,7 +2171,7 @@ mod tests {
     impl TableFixture {
         /// Create an Table with the specified lines loaded
         fn new(lp_lines: Vec<&str>) -> Self {
-            let mut chunk = Chunk::new("dummy_chunk_key", 42);
+            let mut chunk = Chunk::new(42);
             let dictionary = &mut chunk.dictionary;
             let mut table = Table::new(dictionary.lookup_value_or_insert("table_name"));
 

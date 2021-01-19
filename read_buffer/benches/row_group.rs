@@ -7,9 +7,8 @@ use rand::Rng;
 use rand_distr::{Distribution, Normal};
 
 use packers::{sorter, Packers};
-
-use read_buffer::column::{AggregateType, Column};
-use read_buffer::row_group::{build_predicates_with_time, ColumnType, Predicate, RowGroup};
+use read_buffer::benchmarks::{Column, ColumnType, RowGroup};
+use read_buffer::{AggregateType, Predicate};
 
 const ONE_MS: i64 = 1_000_000;
 
@@ -28,7 +27,7 @@ fn read_group(c: &mut Criterion) {
 fn read_group_predicate_all_time(c: &mut Criterion, row_group: &RowGroup, rng: &mut ThreadRng) {
     // This benchmark fixes the number of rows in the `RowGroup` (500K), and
     // varies the cardinality of the group keys.
-    let time_pred = build_predicates_with_time(i64::MIN, i64::MAX, vec![]);
+    let time_pred = Predicate::with_time_range(&[], i64::MIN, i64::MAX);
     benchmark_read_group_vary_cardinality(
         c,
         "row_group_read_group_all_time_vary_cardinality",
@@ -86,7 +85,7 @@ fn read_group_pre_computed_groups(c: &mut Criterion, row_group: &RowGroup, rng: 
         c,
         "row_group_read_group_pre_computed_groups_vary_cardinality",
         &row_group,
-        &[],
+        &Predicate::default(),
         // grouping columns and expected cardinality
         vec![
             (vec!["env"], 2),
@@ -103,7 +102,7 @@ fn read_group_pre_computed_groups(c: &mut Criterion, row_group: &RowGroup, rng: 
         c,
         "row_group_read_group_pre_computed_groups_vary_columns",
         &row_group,
-        &[],
+        &Predicate::default(),
         // number of cols to group on and expected cardinality
         vec![
             (vec!["cluster"], 200),
@@ -120,7 +119,7 @@ fn read_group_pre_computed_groups(c: &mut Criterion, row_group: &RowGroup, rng: 
         c,
         "row_group_read_group_pre_computed_groups_vary_rows",
         &[250_000, 500_000, 750_000, 1_000_000], // `RowGroup` row sizes to vary
-        &[],
+        &Predicate::default(),
         (vec!["data_centre", "cluster"], 200),
         rng,
     );
@@ -132,7 +131,7 @@ fn benchmark_read_group_vary_cardinality(
     c: &mut Criterion,
     benchmark_group_name: &str,
     row_group: &RowGroup,
-    predicates: &[Predicate<'_>],
+    predicate: &Predicate,
     cardinalities: &[(Vec<&str>, usize)],
 ) {
     let mut group = c.benchmark_group(benchmark_group_name);
@@ -151,8 +150,8 @@ fn benchmark_read_group_vary_cardinality(
             &expected_cardinality,
             |b, expected_cardinality| {
                 b.iter(|| {
-                    let result = row_group.read_group(
-                        predicates,
+                    let result = row_group.read_aggregate(
+                        predicate,
                         group_cols.as_slice(),
                         &[("duration", AggregateType::Count)],
                     );
@@ -172,7 +171,7 @@ fn benchmark_read_group_vary_rows(
     c: &mut Criterion,
     benchmark_group_name: &str,
     row_sizes: &[usize],
-    predicates: &[Predicate<'_>],
+    predicate: &Predicate,
     group_columns: (Vec<&str>, usize),
     rng: &mut ThreadRng,
 ) {
@@ -193,8 +192,8 @@ fn benchmark_read_group_vary_rows(
             )),
             |b| {
                 b.iter(|| {
-                    let result = row_group.read_group(
-                        predicates,
+                    let result = row_group.read_aggregate(
+                        predicate,
                         group_columns.0.as_slice(),
                         &[("duration", AggregateType::Count)],
                     );
@@ -214,7 +213,7 @@ fn benchmark_read_group_vary_group_cols(
     c: &mut Criterion,
     benchmark_group_name: &str,
     row_group: &RowGroup,
-    predicates: &[Predicate<'_>],
+    predicates: &Predicate,
     group_columns: &[(Vec<&str>, usize)],
 ) {
     let mut group = c.benchmark_group(benchmark_group_name);
@@ -232,7 +231,7 @@ fn benchmark_read_group_vary_group_cols(
             &group_cols,
             |b, group_cols| {
                 b.iter(|| {
-                    let result = row_group.read_group(
+                    let result = row_group.read_aggregate(
                         predicates,
                         group_cols.as_slice(),
                         &[("duration", AggregateType::Count)],

@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 
-use crate::column::AggregateType;
 use crate::row_group::{ColumnName, Predicate};
-use crate::table::{ReadFilterResults, ReadGroupResults, Table};
+use crate::table;
+use crate::table::{ColumnSelection, Table};
+use crate::Error;
+use crate::{column::AggregateType, row_group::RowGroup};
 
 type TableName = String;
 
@@ -31,42 +33,97 @@ impl Chunk {
         p
     }
 
-    /// Returns data for the specified column selections on the specified table
-    /// name.
-    ///
-    /// Results may be filtered by conjunctive predicates. Time predicates
-    /// should use as nanoseconds since the epoch.
-    pub fn select(
-        &self,
-        table_name: &str,
-        predicates: &[Predicate<'_>],
-        select_columns: &[ColumnName<'_>],
-    ) -> ReadFilterResults<'_, '_> {
-        // Lookup table by name and dispatch execution.
-        todo!();
+    /// The chunk's ID.
+    pub fn id(&self) -> u32 {
+        self.id
     }
 
-    /// Returns aggregates segmented by grouping keys for the specified
-    /// table name.
+    /// The total size in bytes of all row groups in all tables in this chunk.
+    pub fn size(&self) -> u64 {
+        self.meta.size
+    }
+
+    /// The total number of rows in all row groups in all tables in this chunk.
+    pub fn rows(&self) -> u64 {
+        self.meta.rows
+    }
+
+    /// The total number of row groups in all tables in this chunk.
+    pub fn row_groups(&self) -> usize {
+        self.meta.row_groups
+    }
+
+    /// The total number of tables in this chunk.
+    pub fn tables(&self) -> usize {
+        self.tables.len()
+    }
+
+    /// Returns true if there are no tables under this chunk.
+    pub fn is_empty(&self) -> bool {
+        self.tables() == 0
+    }
+
+    /// Add a row_group to a table in the chunk, updating all Chunk meta data.
+    pub fn upsert_table(&mut self, table_name: String, row_group: RowGroup) {
+        // update meta data
+        self.meta.update(&row_group);
+
+        match self.tables.entry(table_name.to_owned()) {
+            Entry::Occupied(mut e) => {
+                let table = e.get_mut();
+                table.add_row_group(row_group);
+            }
+            Entry::Vacant(e) => {
+                e.insert(Table::new(table_name, row_group));
+            }
+        };
+    }
+
+    /// Returns an iterator of lazily executed `read_filter` operations on the
+    /// provided table for the specified column selections.
     ///
-    /// The set of data to be aggregated may be filtered by optional conjunctive
-    /// predicates.
+    /// Results may be filtered by conjunctive predicates.
     ///
-    /// Group keys are determined according to the provided group column names.
-    /// Currently only grouping by string (tag key) columns is supported.
+    /// `None` indicates that the table was not found on the chunk, whilst a
+    /// `ReadFilterResults` value that immediately yields `None` indicates that
+    /// there were no matching results.
     ///
-    /// Required aggregates are specified via a tuple comprising a column name
-    /// and the type of aggregation required. Multiple aggregations can be
-    /// applied to the same column.
-    pub fn aggregate(
+    /// TODO(edd): Alternatively we could assert the caller must have done
+    /// appropriate pruning and that the table should always exist, meaning we
+    /// can blow up here and not need to return an option.
+    pub fn read_filter(
         &self,
         table_name: &str,
-        predicates: &[Predicate<'_>],
+        predicate: &Predicate,
+        select_columns: &ColumnSelection<'_>,
+    ) -> Option<table::ReadFilterResults<'_>> {
+        match self.tables.get(table_name) {
+            Some(table) => Some(table.read_filter(select_columns, predicate)),
+            None => None,
+        }
+    }
+
+    /// Returns an iterable collection of data in group columns and aggregate
+    /// columns, optionally filtered by the provided predicate. Results are
+    /// merged across all row groups within the returned table.
+    ///
+    /// Note: `read_aggregate` currently only supports grouping on "tag"
+    /// columns.
+    pub fn read_aggregate(
+        &self,
+        table_name: &str,
+        predicate: Predicate,
         group_columns: Vec<ColumnName<'_>>,
         aggregates: Vec<(ColumnName<'_>, AggregateType)>,
-    ) -> ReadGroupResults<'_, '_> {
+    ) -> Result<table::ReadAggregateResults<'_>, Error> {
         // Lookup table by name and dispatch execution.
-        todo!()
+        match self.tables.get(table_name) {
+            Some(table) => Ok(table.read_aggregate(predicate, &group_columns, &aggregates)),
+            None => crate::TableNotFound {
+                table_name: table_name.to_owned(),
+            }
+            .fail(),
+        }
     }
 
     //
@@ -75,12 +132,8 @@ impl Chunk {
 
     /// Returns the distinct set of table names that contain data that satisfies
     /// the time range and predicates.
-    pub fn table_names(&self, predicates: &[Predicate<'_>]) -> BTreeSet<String> {
-        //
-        // TODO(edd): do we want to add the ability to apply a predicate to the
-        // table names? For example, a regex where you only want table names
-        // beginning with /cpu.+/ or something?
-        todo!()
+    pub fn table_names(&self, predicate: &Predicate) -> BTreeSet<&String> {
+        self.tables.keys().collect::<BTreeSet<&String>>()
     }
 
     /// Returns the distinct set of tag keys (column names) matching the
@@ -88,7 +141,7 @@ impl Chunk {
     pub fn tag_keys(
         &self,
         table_name: String,
-        predicates: &[Predicate<'_>],
+        predicate: Predicate,
         found_keys: &BTreeSet<ColumnName<'_>>,
     ) -> BTreeSet<ColumnName<'_>> {
         // Lookup table by name and dispatch execution if the table's time range
@@ -106,7 +159,7 @@ impl Chunk {
     pub fn tag_values(
         &self,
         table_name: String,
-        predicates: &[Predicate<'_>],
+        predicate: Predicate,
         tag_keys: &[ColumnName<'_>],
         found_tag_values: &BTreeMap<ColumnName<'_>, BTreeSet<&String>>,
     ) -> BTreeMap<ColumnName<'_>, BTreeSet<&String>> {
@@ -126,6 +179,8 @@ struct MetaData {
     size: u64, // size in bytes of the chunk
     rows: u64, // Total number of rows across all tables
 
+    row_groups: usize, // Total number of row groups across all tables in the chunk.
+
     // The total time range of *all* data (across all tables) within this
     // chunk.
     //
@@ -140,12 +195,22 @@ impl MetaData {
             size: table.size(),
             rows: table.rows(),
             time_range: table.time_range(),
+            row_groups: 1,
         }
     }
 
-    pub fn add_table(&mut self, table: &Table) {
-        // Update size, rows, time_range
-        todo!()
+    /// Updates the meta data associated with the `Chunk` based on the provided
+    /// row_group
+    pub fn update(&mut self, table_data: &RowGroup) {
+        self.size += table_data.size();
+        self.rows += table_data.rows() as u64;
+        self.row_groups += 1;
+
+        let (them_min, them_max) = table_data.time_range();
+        self.time_range = Some(match self.time_range {
+            Some((this_min, this_max)) => (them_min.min(this_min), them_max.max(this_max)),
+            None => (them_min, them_max),
+        })
     }
 
     // invalidate should be called when a table is removed. All meta data must

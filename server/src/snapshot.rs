@@ -5,7 +5,7 @@ use arrow_deps::{
     parquet::{self, arrow::ArrowWriter, file::writer::TryClone},
 };
 use data_types::partition_metadata::{Partition as PartitionMeta, Table};
-use object_store::ObjectStore;
+use object_store::{path::ObjectStorePath, ObjectStore};
 use query::PartitionChunk;
 
 use std::io::{Cursor, Seek, SeekFrom, Write};
@@ -61,8 +61,8 @@ where
 {
     pub id: Uuid,
     pub partition_meta: PartitionMeta,
-    pub metadata_path: String,
-    pub data_path: String,
+    pub metadata_path: ObjectStorePath,
+    pub data_path: ObjectStorePath,
     store: Arc<ObjectStore>,
     partition: Arc<T>,
     status: Mutex<Status>,
@@ -73,9 +73,9 @@ where
     T: Send + Sync + 'static + PartitionChunk,
 {
     fn new(
-        partition_key: String,
-        metadata_path: String,
-        data_path: String,
+        partition_key: impl Into<String>,
+        metadata_path: ObjectStorePath,
+        data_path: ObjectStorePath,
         store: Arc<ObjectStore>,
         partition: Arc<T>,
         tables: Vec<Table>,
@@ -90,7 +90,7 @@ where
         Self {
             id: Uuid::new_v4(),
             partition_meta: PartitionMeta {
-                key: partition_key,
+                key: partition_key.into(),
                 tables,
             },
             metadata_path,
@@ -99,6 +99,10 @@ where
             partition,
             status: Mutex::new(status),
         }
+    }
+
+    fn data_path(&self) -> String {
+        self.store.convert_path(&self.data_path)
     }
 
     // returns the position of the next table
@@ -150,8 +154,10 @@ where
                 .map_err(|e| Box::new(e) as _)
                 .context(PartitionError)?;
 
-            let file_name = format!("{}/{}.parquet", &self.data_path, table_name);
-            self.write_batches(batches, &file_name).await?;
+            let mut location = self.data_path.clone();
+            let file_name = format!("{}.parquet", table_name);
+            location.set_file_name(&file_name);
+            self.write_batches(batches, &location).await?;
             self.mark_table_finished(pos);
 
             if self.should_stop() {
@@ -159,8 +165,9 @@ where
             }
         }
 
-        let partition_meta_path =
-            format!("{}/{}.json", &self.metadata_path, &self.partition_meta.key);
+        let mut partition_meta_path = self.metadata_path.clone();
+        let key = format!("{}.json", &self.partition_meta.key);
+        partition_meta_path.set_file_name(&key);
         let json_data = serde_json::to_vec(&self.partition_meta).context(JsonGenerationError)?;
         let data = Bytes::from(json_data);
         let len = data.len();
@@ -185,7 +192,11 @@ where
         Ok(())
     }
 
-    async fn write_batches(&self, batches: Vec<RecordBatch>, file_name: &str) -> Result<()> {
+    async fn write_batches(
+        &self,
+        batches: Vec<RecordBatch>,
+        file_name: &ObjectStorePath,
+    ) -> Result<()> {
         let mem_writer = MemWriter::default();
         {
             let mut writer = ArrowWriter::try_new(mem_writer.clone(), batches[0].schema(), None)
@@ -236,26 +247,27 @@ pub struct Status {
 }
 
 pub fn snapshot_chunk<T>(
-    metadata_path: impl Into<String>,
-    data_path: impl Into<String>,
+    metadata_path: ObjectStorePath,
+    data_path: ObjectStorePath,
     store: Arc<ObjectStore>,
-    partition: Arc<T>,
+    partition_key: &str,
+    chunk: Arc<T>,
     notify: Option<oneshot::Sender<()>>,
 ) -> Result<Arc<Snapshot<T>>>
 where
     T: Send + Sync + 'static + PartitionChunk,
 {
-    let table_stats = partition
+    let table_stats = chunk
         .table_stats()
         .map_err(|e| Box::new(e) as _)
         .context(PartitionError)?;
 
     let snapshot = Snapshot::new(
-        partition.key().to_string(),
-        metadata_path.into(),
-        data_path.into(),
+        partition_key.to_string(),
+        metadata_path,
+        data_path,
         store,
-        partition,
+        chunk,
         table_stats,
     );
     let snapshot = Arc::new(snapshot);
@@ -265,7 +277,8 @@ where
     tokio::spawn(async move {
         info!(
             "starting snapshot of {} to {}",
-            &snapshot.partition_meta.key, &snapshot.data_path
+            &snapshot.partition_meta.key,
+            &snapshot.data_path()
         );
         if let Err(e) = snapshot.run(notify).await {
             error!("error running snapshot: {:?}", e);
@@ -327,7 +340,7 @@ mod tests {
     use futures::TryStreamExt;
     use influxdb_line_protocol::parse_lines;
     use mutable_buffer::chunk::Chunk as ChunkWB;
-    use object_store::InMemory;
+    use object_store::memory::InMemory;
 
     #[tokio::test]
     async fn snapshot() {
@@ -340,7 +353,7 @@ mem,host=A,region=west used=45 1
 
         let lines: Vec<_> = parse_lines(lp).map(|l| l.unwrap()).collect();
         let write = lines_to_replicated_write(1, 1, &lines, &DatabaseRules::default());
-        let mut chunk = ChunkWB::new("testaroo", 11);
+        let mut chunk = ChunkWB::new(11);
 
         for e in write.write_buffer_batch().unwrap().entries().unwrap() {
             chunk.write_entry(&e).unwrap();
@@ -349,13 +362,17 @@ mem,host=A,region=west used=45 1
         let store = Arc::new(ObjectStore::new_in_memory(InMemory::new()));
         let chunk = Arc::new(chunk);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let metadata_path = "/meta";
-        let data_path = "/data";
+        let mut metadata_path = ObjectStorePath::default();
+        metadata_path.push_dir("meta");
+
+        let mut data_path = ObjectStorePath::default();
+        data_path.push_dir("data");
 
         let snapshot = snapshot_chunk(
-            metadata_path,
+            metadata_path.clone(),
             data_path,
             store.clone(),
+            "testaroo",
             chunk.clone(),
             Some(tx),
         )
@@ -363,8 +380,11 @@ mem,host=A,region=west used=45 1
 
         rx.await.unwrap();
 
+        let mut location = metadata_path;
+        location.set_file_name("testaroo.json");
+
         let summary = store
-            .get("/meta/testaroo.json")
+            .get(&location)
             .await
             .unwrap()
             .map_ok(|b| bytes::BytesMut::from(&b[..]))
@@ -394,18 +414,14 @@ mem,host=A,region=west used=45 1
         ];
 
         let store = Arc::new(ObjectStore::new_in_memory(InMemory::new()));
-        let chunk = Arc::new(ChunkWB::new("testaroo", 11));
-        let metadata_path = "/meta".to_string();
-        let data_path = "/data".to_string();
+        let chunk = Arc::new(ChunkWB::new(11));
+        let mut metadata_path = ObjectStorePath::default();
+        metadata_path.push_dir("meta");
 
-        let snapshot = Snapshot::new(
-            chunk.key.clone(),
-            metadata_path,
-            data_path,
-            store,
-            chunk,
-            tables,
-        );
+        let mut data_path = ObjectStorePath::default();
+        data_path.push_dir("data");
+
+        let snapshot = Snapshot::new("testaroo", metadata_path, data_path, store, chunk, tables);
 
         let (pos, name) = snapshot.next_table().unwrap();
         assert_eq!(0, pos);

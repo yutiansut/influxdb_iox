@@ -39,12 +39,12 @@ pub enum Error {
     #[snafu(display("Table ID {} not found in dictionary of chunk {}", table, chunk))]
     TableIdNotFoundInDictionary {
         table: u32,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
     #[snafu(display("Table {} not found in chunk {}", table, chunk))]
-    TableNotFoundInChunk { table: u32, chunk: String },
+    TableNotFoundInChunk { table: u32, chunk: u64 },
 
     #[snafu(display("Attempt to write table batch without a name"))]
     TableWriteWithoutName,
@@ -52,13 +52,10 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Chunk {
     /// The id for this chunk
-    pub id: u64,
-
-    /// partition key for all rows in this chunk
-    pub key: String,
+    pub id: u32,
 
     /// Time at which the first data was written into this chunk. Note
     /// this is not the same as the timestamps on the data itself
@@ -69,10 +66,10 @@ pub struct Chunk {
     /// itself
     pub time_of_last_write: Option<DateTime<Utc>>,
 
-    /// Time at which this chunk became immutable (no new data was
-    /// written after this time). Note this is not the same as the
-    /// timestamps on the data itself
-    pub time_became_immutable: Option<DateTime<Utc>>,
+    /// Time at which this chunk was closed and became immutable (no
+    /// new data was written after this time). Note this is not the
+    /// same as the timestamps on the data itself
+    pub time_closed: Option<DateTime<Utc>>,
 
     /// `dictionary` maps &str -> u32. The u32s are used in place of String or
     /// str to avoid slow string operations. The same dictionary is used for
@@ -180,15 +177,14 @@ fn make_range_expr(range: &TimestampRange) -> Expr {
 }
 
 impl Chunk {
-    pub fn new(key: impl Into<String>, id: u64) -> Self {
+    pub fn new(id: u32) -> Self {
         Self {
             id,
-            key: key.into(),
             dictionary: Dictionary::new(),
             tables: HashMap::new(),
             time_of_first_write: None,
             time_of_last_write: None,
-            time_became_immutable: None,
+            time_closed: None,
         }
     }
 
@@ -226,10 +222,10 @@ impl Chunk {
         Ok(())
     }
 
-    /// Tell this chunk that it has been marked as immutable
-    pub fn mark_immutable(&mut self) {
-        assert!(self.time_became_immutable.is_none());
-        self.time_became_immutable = Some(Utc::now())
+    /// Mark the chunk as closed
+    pub fn mark_closed(&mut self) {
+        assert!(self.time_closed.is_none());
+        self.time_closed = Some(Utc::now())
     }
 
     /// Translates `predicate` into per-chunk ids that can be
@@ -338,7 +334,7 @@ impl Chunk {
     }
 
     /// return the ID of this chunk
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> u32 {
         self.id
     }
 
@@ -370,7 +366,7 @@ impl Chunk {
                 .lookup_id(*id)
                 .context(TableIdNotFoundInDictionary {
                     table: *id,
-                    chunk: &self.key,
+                    chunk: self.id,
                 })?;
 
             let columns = table.stats();
@@ -391,7 +387,7 @@ impl Chunk {
         let table = match table_id {
             Ok(table_id) => Some(self.tables.get(&table_id).context(TableNotFoundInChunk {
                 table: table_id,
-                chunk: &self.key,
+                chunk: self.id,
             })?),
             Err(_) => None,
         };
@@ -420,11 +416,7 @@ impl Chunk {
 impl query::PartitionChunk for Chunk {
     type Error = Error;
 
-    fn key(&self) -> &str {
-        &self.key
-    }
-
-    fn id(&self) -> u64 {
+    fn id(&self) -> u32 {
         self.id
     }
 

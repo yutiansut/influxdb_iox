@@ -1,12 +1,24 @@
-use std::{borrow::Cow, collections::BTreeMap};
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    convert::{TryFrom, TryInto},
+    sync::Arc,
+};
 
 use hashbrown::{hash_map, HashMap};
 use itertools::Itertools;
 
 use crate::column::{
-    cmp::Operator, AggregateResult, AggregateType, Column, EncodedValues, OwnedValue, RowIDs,
-    RowIDsOption, Scalar, Value, Values, ValuesIterator,
+    self, cmp::Operator, AggregateResult, AggregateType, Column, EncodedValues, LogicalDataType,
+    OwnedValue, RowIDs, RowIDsOption, Scalar, Value, Values, ValuesIterator,
 };
+use crate::schema::ResultSchema;
+use arrow_deps::arrow::record_batch::RecordBatch;
+use arrow_deps::{
+    arrow, datafusion::logical_plan::Expr as DfExpr,
+    datafusion::scalar::ScalarValue as DFScalarValue,
+};
+use data_types::schema::{InfluxColumnType, Schema};
 
 /// The name used for a timestamp column.
 pub const TIME_COLUMN_NAME: &str = data_types::TIME_COLUMN_NAME;
@@ -44,6 +56,7 @@ impl RowGroup {
                 ColumnType::Tag(c) => {
                     assert_eq!(c.num_rows(), rows);
 
+                    meta.column_types.insert(name.clone(), c.logical_datatype());
                     meta.column_ranges
                         .insert(name.clone(), c.column_range().unwrap());
                     all_columns_by_name.insert(name.clone(), all_columns.len());
@@ -53,6 +66,7 @@ impl RowGroup {
                 ColumnType::Field(c) => {
                     assert_eq!(c.num_rows(), rows);
 
+                    meta.column_types.insert(name.clone(), c.logical_datatype());
                     meta.column_ranges
                         .insert(name.clone(), c.column_range().unwrap());
                     all_columns_by_name.insert(name.clone(), all_columns.len());
@@ -71,6 +85,7 @@ impl RowGroup {
                         Some((_, _)) => unreachable!("unexpected types for time range"),
                     };
 
+                    meta.column_types.insert(name.clone(), c.logical_datatype());
                     meta.column_ranges
                         .insert(name.clone(), c.column_range().unwrap());
 
@@ -80,6 +95,12 @@ impl RowGroup {
                 }
             }
         }
+
+        // Meta data should have same columns for types and ranges.
+        assert_eq!(
+            meta.column_types.keys().collect::<Vec<_>>(),
+            meta.column_ranges.keys().collect::<Vec<_>>(),
+        );
 
         Self {
             meta,
@@ -105,6 +126,11 @@ impl RowGroup {
     /// The ranges on each column in the `RowGroup`.
     pub fn column_ranges(&self) -> &BTreeMap<String, (OwnedValue, OwnedValue)> {
         &self.meta.column_ranges
+    }
+
+    /// The logical data-type of each column.
+    pub fn column_logical_types(&self) -> &BTreeMap<String, column::LogicalDataType> {
+        &self.meta.column_types
     }
 
     // Returns a reference to a column from the column name.
@@ -134,51 +160,63 @@ impl RowGroup {
         self.meta.time_range
     }
 
-    /// Efficiently determine if the provided predicate might be satisfied by
-    /// the provided column.
-    pub fn column_could_satisfy_predicate(
+    /// Efficiently determines if the provided set of binary expressions could
+    /// all be satisfied by the `RowGroup` when conjunctively applied.
+    pub fn could_satisfy_conjunctive_binary_expressions<'a>(
         &self,
-        column_name: ColumnName<'_>,
-        predicate: &(Operator, Value<'_>),
+        exprs: impl IntoIterator<Item = &'a BinaryExpr>,
     ) -> bool {
-        self.meta
-            .read_group_could_satisfy_predicate(column_name, predicate)
+        // Returns false if ANY expression cannot possibly be satisfied.
+        exprs
+            .into_iter()
+            .all(|expr| self.meta.column_could_satisfy_binary_expr(expr))
     }
 
     //
     // Methods for reading the `RowGroup`
     //
 
-    /// Returns a set of materialised column values that satisfy a set of
-    /// predicates.
+    /// Returns a set of materialised column values that optionally satisfy a
+    /// predicate.
     ///
-    /// Right now, predicates are conjunctive (AND).
+    /// TODO(edd): this should probably return an Option and the caller can
+    /// filter None results.
     pub fn read_filter(
         &self,
         columns: &[ColumnName<'_>],
-        predicates: &[Predicate<'_>],
+        predicates: &Predicate,
     ) -> ReadFilterResult<'_> {
         let row_ids = self.row_ids_from_predicates(predicates);
-        ReadFilterResult(self.materialise_rows(columns, row_ids))
+
+        // ensure meta/data have same lifetime by using column names from row
+        // group rather than from input.
+        let (col_names, col_data) = self.materialise_rows(columns, row_ids);
+        let schema = self.meta.schema_for_column_names(&col_names);
+        ReadFilterResult {
+            schema,
+            data: col_data,
+        }
     }
 
     fn materialise_rows(
         &self,
         names: &[ColumnName<'_>],
         row_ids: RowIDsOption,
-    ) -> Vec<(ColumnName<'_>, Values<'_>)> {
-        let mut results = vec![];
+    ) -> (Vec<&str>, Vec<Values<'_>>) {
+        let mut col_names = Vec::with_capacity(names.len());
+        let mut col_data = Vec::with_capacity(names.len());
         match row_ids {
-            RowIDsOption::None(_) => results, // nothing to materialise
+            RowIDsOption::None(_) => (col_names, col_data), // nothing to materialise
             RowIDsOption::Some(row_ids) => {
                 // TODO(edd): causes an allocation. Implement a way to pass a
                 // pooled buffer to the croaring Bitmap API.
                 let row_ids = row_ids.to_vec();
                 for &name in names {
                     let (col_name, col) = self.column_name_and_column(name);
-                    results.push((col_name, col.values(row_ids.as_slice())));
+                    col_names.push(col_name);
+                    col_data.push(col.values(row_ids.as_slice()));
                 }
-                results
+                (col_names, col_data)
             }
 
             RowIDsOption::All(_) => {
@@ -189,17 +227,16 @@ impl RowGroup {
 
                 for &name in names {
                     let (col_name, col) = self.column_name_and_column(name);
-                    results.push((col_name, col.values(row_ids.as_slice())));
+                    col_names.push(col_name);
+                    col_data.push(col.values(row_ids.as_slice()));
                 }
-                results
+                (col_names, col_data)
             }
         }
     }
 
-    // Determines the set of row ids that satisfy the provided predicates. If
-    // `predicates` contains two predicates on the time column they are
-    // special-cased.
-    fn row_ids_from_predicates(&self, predicates: &[Predicate<'_>]) -> RowIDsOption {
+    // Determines the set of row ids that satisfy the provided predicate.
+    fn row_ids_from_predicates(&self, predicate: &Predicate) -> RowIDsOption {
         // TODO(edd): perf - potentially pool this so we can re-use it once rows
         // have been materialised and it's no longer needed. Initialise a bitmap
         // RowIDs because it's like that set operations will be necessary.
@@ -211,21 +248,21 @@ impl RowGroup {
         // for subsequent calls _to_ the `RowGroup`.
         let mut dst = RowIDs::new_bitmap();
 
-        let mut predicates = Cow::Borrowed(predicates);
-        // If there is a time-range in the predicates (two time predicates),
+        let mut predicate = Cow::Borrowed(predicate);
+
+        // If there is a time-range in the predicate (two time expressions),
         // then execute an optimised version that will use a range based
-        // predicate on the time column.
-        if predicates
-            .iter()
-            .filter(|(col, _)| *col == TIME_COLUMN_NAME)
-            .count()
-            // Check if we have two predicates on the time column, i.e., a time
-            // range.
-            == 2
-        {
-            // Apply optimised filtering to time column
-            let time_pred_row_ids =
-                self.row_ids_from_predicates_with_time_range(predicates.as_ref(), dst);
+        // filter on the time column, effectively avoiding a scan and
+        // intersection.
+        if predicate.contains_time_range() {
+            predicate = predicate.to_owned(); // We need to modify the predicate
+
+            let time_range = predicate
+                .to_mut()
+                .remove_expr_by_column_name(TIME_COLUMN_NAME);
+
+            // removes time expression from predicate
+            let time_pred_row_ids = self.row_ids_from_time_range(&time_range, dst);
             match time_pred_row_ids {
                 // No matching rows based on time range
                 RowIDsOption::None(_) => return time_pred_row_ids,
@@ -243,23 +280,18 @@ impl RowGroup {
                     dst = row_ids // hand buffer back
                 }
             }
-
-            // remove time predicates so they're not processed again
-            let mut filtered_predicates = predicates.to_vec();
-            filtered_predicates.retain(|(col, _)| *col != TIME_COLUMN_NAME);
-            predicates = Cow::Owned(filtered_predicates);
         }
 
-        for (name, (op, value)) in predicates.iter() {
+        for expr in predicate.iter() {
             // N.B column should always exist because validation of predicates
             // should happen at the `Table` level.
-            let (col_name, col) = self.column_name_and_column(name);
+            let (col_name, col) = self.column_name_and_column(expr.column());
 
             // Explanation of how this buffer pattern works. The idea is that
             // the buffer should be returned to the caller so it can be re-used
             // on other columns. Each call to `row_ids_filter` returns the
             // buffer back enabling it to be re-used.
-            match col.row_ids_filter(op, value, dst) {
+            match col.row_ids_filter(&expr.op, &expr.literal_as_value(), dst) {
                 // No rows will be returned for the `RowGroup` because this
                 // column does not match any rows.
                 RowIDsOption::None(_dst) => return RowIDsOption::None(_dst),
@@ -292,78 +324,57 @@ impl RowGroup {
 
     // An optimised function for applying two comparison predicates to a time
     // column at once.
-    fn row_ids_from_predicates_with_time_range(
-        &self,
-        predicates: &[Predicate<'_>],
-        dst: RowIDs,
-    ) -> RowIDsOption {
-        // find the time range predicates and execute a specialised range based
-        // row id lookup.
-        let time_predicates = predicates
-            .iter()
-            .filter(|(col_name, _)| col_name == &TIME_COLUMN_NAME)
-            .collect::<Vec<_>>();
-        assert!(time_predicates.len() == 2);
-
+    fn row_ids_from_time_range(&self, time_range: &[BinaryExpr], dst: RowIDs) -> RowIDsOption {
+        assert_eq!(time_range.len(), 2);
         self.time_column().row_ids_filter_range(
-            &time_predicates[0].1, // min time
-            &time_predicates[1].1, // max time
+            &(time_range[0].op, time_range[0].literal_as_value()), // min time
+            &(time_range[1].op, time_range[1].literal_as_value()), // max time
             dst,
         )
     }
 
-    /// Returns a set of group keys and aggregated column data associated with
-    /// them. `read_group` currently only supports grouping on columns that have
-    /// integer encoded representations - typically "tag columns".
+    /// Materialises a collection of data in group columns and aggregate
+    /// columns, optionally filtered by the provided predicate.
     ///
-    /// Right now, predicates are treated conjunctive (AND) predicates.
-    /// `read_group` does not guarantee any sort order. Ordering of results
-    /// should be handled high up in the `Table` section of the Read Buffer,
-    /// where multiple `RowGroup` results may need to be merged.
-    pub fn read_group(
+    /// Collectively, row-wise values in the group columns comprise a "group
+    /// key", and each value in the same row for the aggregate columns contains
+    /// aggregate values for those group keys.
+    ///
+    /// Note: `read_aggregate` currently only supports "tag" columns.
+    /// Note: `read_aggregate` does not order results.
+    pub fn read_aggregate(
         &self,
-        predicates: &[Predicate<'_>],
+        predicate: &Predicate,
         group_columns: &[ColumnName<'_>],
         aggregates: &[(ColumnName<'_>, AggregateType)],
-    ) -> ReadGroupResult<'_> {
-        // `ReadGroupResult`s should have the same lifetime as self.
-        // Alternatively ReadGroupResult could not store references to input
-        // data and put the responsibility on the caller to tie result data and
-        // input data together, but the convenience seems useful for now.
-        let mut result = ReadGroupResult {
-            group_columns: group_columns
-                .iter()
-                .map(|name| {
-                    let (column_name, col) = self.column_name_and_column(name);
-                    column_name
-                })
-                .collect::<Vec<_>>(),
-            aggregate_columns: aggregates
-                .iter()
-                .map(|(name, typ)| {
-                    let (column_name, col) = self.column_name_and_column(name);
-                    (column_name, *typ)
-                })
-                .collect::<Vec<_>>(),
-            ..ReadGroupResult::default()
+    ) -> ReadAggregateResult<'_> {
+        let schema = ResultSchema {
+            select_columns: vec![],
+            group_columns: self.meta.schema_for_column_names(group_columns),
+            aggregate_columns: self.meta.schema_for_aggregate_column_names(aggregates),
+        };
+
+        let mut result = ReadAggregateResult {
+            schema,
+            ..ReadAggregateResult::default()
         };
 
         // Handle case where there are no predicates and all the columns being
         // grouped support constant-time expression of the row_ids belonging to
         // each grouped value.
-        let all_group_cols_pre_computed = result.group_columns.iter().all(|name| {
+        let all_group_cols_pre_computed = result.schema.group_column_names_iter().all(|name| {
             self.column_by_name(name)
                 .properties()
                 .has_pre_computed_row_ids
         });
-        if predicates.is_empty() && all_group_cols_pre_computed {
+        if predicate.is_empty() && all_group_cols_pre_computed {
             self.read_group_all_rows_all_rle(&mut result);
             return result;
         }
 
         // There are predicates. The next stage is apply them and determine the
         // intermediate set of row ids.
-        let row_ids = self.row_ids_from_predicates(predicates);
+        let row_ids = self.row_ids_from_predicates(predicate);
         let filter_row_ids = match row_ids {
             RowIDsOption::None(_) => {
                 return result;
@@ -372,15 +383,15 @@ impl RowGroup {
             RowIDsOption::All(row_ids) => None,
         };
 
-        let group_cols_num = result.group_columns.len();
-        let agg_cols_num = result.aggregate_columns.len();
+        let group_cols_num = result.schema.group_columns.len();
+        let agg_cols_num = result.schema.aggregate_columns.len();
 
         // materialise all *encoded* values for each column we are grouping on.
         // These will not be the logical (typically string) values, but will be
         // vectors of integers representing the physical values.
         let groupby_encoded_ids: Vec<_> = result
-            .group_columns
-            .iter()
+            .schema
+            .group_column_names_iter()
             .map(|name| {
                 let col = self.column_by_name(name);
                 let mut encoded_values_buf =
@@ -404,7 +415,7 @@ impl RowGroup {
 
         // Materialise values in aggregate columns.
         let mut aggregate_columns_data = Vec::with_capacity(agg_cols_num);
-        for (name, agg_type) in &result.aggregate_columns {
+        for (name, agg_type, _) in &result.schema.aggregate_columns {
             let col = self.column_by_name(name);
 
             // TODO(edd): this materialises a column per aggregate. If there are
@@ -447,14 +458,14 @@ impl RowGroup {
     // read_group_hash accepts a set of conjunctive predicates.
     fn read_group_with_hashing<'a>(
         &'a self,
-        dst: &mut ReadGroupResult<'a>,
+        dst: &mut ReadAggregateResult<'a>,
         groupby_encoded_ids: &[Vec<u32>],
         aggregate_columns_data: Vec<Values<'a>>,
     ) {
         // An optimised approach to building the hashmap of group keys using a
         // single 128-bit integer as the group key. If grouping is on more than
         // four columns then a fallback to using an vector as a key will happen.
-        if dst.group_columns.len() <= 4 {
+        if dst.schema.group_columns.len() <= 4 {
             self.read_group_hash_with_u128_key(dst, &groupby_encoded_ids, &aggregate_columns_data);
             return;
         }
@@ -467,7 +478,7 @@ impl RowGroup {
     // hash map.
     fn read_group_hash_with_vec_key<'a>(
         &'a self,
-        dst: &mut ReadGroupResult<'a>,
+        dst: &mut ReadAggregateResult<'a>,
         groupby_encoded_ids: &[Vec<u32>],
         aggregate_columns_data: &[Values<'a>],
     ) {
@@ -478,7 +489,7 @@ impl RowGroup {
 
         // key_buf will be used as a temporary buffer for group keys, which are
         // themselves integers.
-        let mut key_buf = vec![0; dst.group_columns.len()];
+        let mut key_buf = vec![0; dst.schema.group_columns.len()];
 
         for row in 0..total_rows {
             // update the group key buffer with the group key for this row
@@ -496,8 +507,8 @@ impl RowGroup {
                 }
                 // group key does not exist, so create it.
                 hash_map::RawEntryMut::Vacant(entry) => {
-                    let mut group_key_aggs = Vec::with_capacity(dst.aggregate_columns.len());
-                    for (_, agg_type) in &dst.aggregate_columns {
+                    let mut group_key_aggs = Vec::with_capacity(dst.schema.aggregate_columns.len());
+                    for (_, agg_type, _) in &dst.schema.aggregate_columns {
                         group_key_aggs.push(AggregateResult::from(agg_type));
                     }
 
@@ -513,8 +524,8 @@ impl RowGroup {
         // Finally, build results set. Each encoded group key needs to be
         // materialised into a logical group key
         let columns = dst
-            .group_columns
-            .iter()
+            .schema
+            .group_column_names_iter()
             .map(|name| self.column_by_name(name))
             .collect::<Vec<_>>();
         let mut group_key_vec: Vec<GroupKey<'_>> = Vec::with_capacity(groups.len());
@@ -545,13 +556,13 @@ impl RowGroup {
     // which is significantly more performant than using a `Vec<u32>`.
     fn read_group_hash_with_u128_key<'a>(
         &'a self,
-        dst: &mut ReadGroupResult<'a>,
+        dst: &mut ReadAggregateResult<'a>,
         groupby_encoded_ids: &[Vec<u32>],
         aggregate_columns_data: &[Values<'a>],
     ) {
         let total_rows = groupby_encoded_ids[0].len();
         assert!(groupby_encoded_ids.iter().all(|x| x.len() == total_rows));
-        assert!(dst.group_columns.len() <= 4);
+        assert!(dst.schema.group_columns.len() <= 4);
 
         // Now begin building the group keys.
         let mut groups: HashMap<u128, Vec<AggregateResult<'_>>> = HashMap::default();
@@ -574,8 +585,8 @@ impl RowGroup {
                 }
                 // group key does not exist, so create it.
                 hash_map::RawEntryMut::Vacant(entry) => {
-                    let mut group_key_aggs = Vec::with_capacity(dst.aggregate_columns.len());
-                    for (_, agg_type) in &dst.aggregate_columns {
+                    let mut group_key_aggs = Vec::with_capacity(dst.schema.aggregate_columns.len());
+                    for (_, agg_type, _) in &dst.schema.aggregate_columns {
                         group_key_aggs.push(AggregateResult::from(agg_type));
                     }
 
@@ -591,8 +602,8 @@ impl RowGroup {
         // Finally, build results set. Each encoded group key needs to be
         // materialised into a logical group key
         let columns = dst
-            .group_columns
-            .iter()
+            .schema
+            .group_column_names_iter()
             .map(|name| self.column_by_name(name))
             .collect::<Vec<_>>();
         let mut group_key_vec: Vec<GroupKey<'_>> = Vec::with_capacity(groups.len());
@@ -622,22 +633,23 @@ impl RowGroup {
     //
     // In this case all the grouping columns pre-computed bitsets for each
     // distinct value.
-    fn read_group_all_rows_all_rle<'a>(&'a self, dst: &mut ReadGroupResult<'a>) {
+    fn read_group_all_rows_all_rle<'a>(&'a self, dst: &mut ReadAggregateResult<'a>) {
         let group_columns = dst
-            .group_columns
-            .iter()
+            .schema
+            .group_column_names_iter()
             .map(|name| self.column_by_name(name))
             .collect::<Vec<_>>();
 
         let aggregate_columns_typ = dst
+            .schema
             .aggregate_columns
             .iter()
-            .map(|(name, typ)| (self.column_by_name(name), *typ))
+            .map(|(name, typ, _)| (self.column_by_name(name), *typ))
             .collect::<Vec<_>>();
 
         let encoded_groups = dst
-            .group_columns
-            .iter()
+            .schema
+            .group_column_names_iter()
             .map(|name| self.column_by_name(name).grouped_row_ids().unwrap_left())
             .collect::<Vec<_>>();
 
@@ -647,8 +659,8 @@ impl RowGroup {
         //
         // For example, we have two columns like:
         //
-        //    [0, 1, 1, 2, 2, 3, 4] // column encodes the values as integers [3,
-        //    3, 3, 3, 4, 2, 1] // column encodes the values as integers
+        //    [0, 1, 1, 2, 2, 3, 4] // column encodes the values as integers
+        //    [3, 3, 3, 3, 4, 2, 1] // column encodes the values as integers
         //
         // The columns have these distinct values:
         //
@@ -656,9 +668,9 @@ impl RowGroup {
         //
         // We will produce the following "group key" candidates:
         //
-        //    [0, 1], [0, 2], [0, 3], [0, 4] [1, 1], [1, 2], [1, 3], [1, 4] [2,
-        //    1], [2, 2], [2, 3], [2, 4] [3, 1], [3, 2], [3, 3], [3, 4] [4, 1],
-        //    [4, 2], [4, 3], [4, 4]
+        //    [0, 1], [0, 2], [0, 3], [0, 4] [1, 1], [1, 2], [1, 3], [1, 4]
+        //    [2, 1], [2, 2], [2, 3], [2, 4] [3, 1], [3, 2], [3, 3], [3, 4]
+        //    [4, 1], [4, 2], [4, 3], [4, 4]
         //
         // Based on the columns we can see that we only have data for the
         // following group keys:
@@ -735,12 +747,12 @@ impl RowGroup {
     // in constant time.
     fn read_group_single_group_column<'a>(
         &'a self,
-        dst: &mut ReadGroupResult<'a>,
+        dst: &mut ReadAggregateResult<'a>,
         groupby_encoded_ids: &[u32],
         aggregate_columns_data: Vec<Values<'a>>,
     ) {
-        let column = self.column_by_name(dst.group_columns[0]);
-        assert_eq!(dst.group_columns.len(), aggregate_columns_data.len());
+        let column = self.column_by_name(dst.schema.group_column_names_iter().next().unwrap());
+        assert_eq!(dst.schema.group_columns.len(), aggregate_columns_data.len());
         let total_rows = groupby_encoded_ids.len();
 
         // Allocate a vector to hold aggregates that can be updated as rows are
@@ -761,9 +773,10 @@ impl RowGroup {
                 }
                 None => {
                     let mut group_key_aggs = dst
+                        .schema
                         .aggregate_columns
                         .iter()
-                        .map(|(_, agg_type)| AggregateResult::from(agg_type))
+                        .map(|(_, agg_type, _)| AggregateResult::from(agg_type))
                         .collect::<Vec<_>>();
 
                     for (i, values) in aggregate_columns_data.iter().enumerate() {
@@ -798,11 +811,92 @@ impl RowGroup {
     // can be calculated by reading the rows in order.
     fn read_group_sorted_stream(
         &self,
-        predicates: &[Predicate<'_>],
+        predicates: &Predicate,
         group_column: ColumnName<'_>,
         aggregates: &[(ColumnName<'_>, AggregateType)],
     ) {
         todo!()
+    }
+}
+
+/// Initialise a `RowGroup` from an Arrow RecordBatch.
+///
+/// Presently this requires the RecordBatch to contain meta-data that specifies
+/// the semantic meaning of each column in terms of an Influx time-series
+/// use-case, i.e., whether the column is a tag column, field column or a time
+/// column.
+impl From<RecordBatch> for RowGroup {
+    fn from(rb: RecordBatch) -> Self {
+        let rows = rb.num_rows();
+        // TODO proper error handling here if the input schema is bad
+        let schema: Schema = rb
+            .schema()
+            .try_into()
+            .expect("Valid timeseries schema when creating row group");
+
+        let mut columns = BTreeMap::new();
+        for (i, arrow_column) in rb.columns().iter().enumerate() {
+            let (lp_type, field) = schema.field(i);
+            let col_name = field.name();
+
+            match lp_type {
+                Some(InfluxColumnType::Tag) => {
+                    assert_eq!(arrow_column.data_type(), &arrow::datatypes::DataType::Utf8);
+                    let arr: &arrow::array::StringArray = arrow_column
+                        .as_any()
+                        .downcast_ref::<arrow::array::StringArray>()
+                        .unwrap();
+
+                    let column_data = Column::from(arr);
+
+                    columns.insert(col_name.to_owned(), ColumnType::Tag(column_data));
+                }
+                Some(InfluxColumnType::Field(_)) => {
+                    let column_data = match arrow_column.data_type() {
+                        arrow::datatypes::DataType::Int64 => Column::from(
+                            arrow_column
+                                .as_any()
+                                .downcast_ref::<arrow::array::Int64Array>()
+                                .unwrap(),
+                        ),
+                        arrow::datatypes::DataType::Float64 => Column::from(
+                            arrow_column
+                                .as_any()
+                                .downcast_ref::<arrow::array::Float64Array>()
+                                .unwrap(),
+                        ),
+                        arrow::datatypes::DataType::UInt64 => Column::from(
+                            arrow_column
+                                .as_any()
+                                .downcast_ref::<arrow::array::UInt64Array>()
+                                .unwrap(),
+                        ),
+                        dt => unimplemented!(
+                            "data type {:?} currently not supported for field columns",
+                            dt
+                        ),
+                    };
+
+                    columns.insert(col_name.to_owned(), ColumnType::Field(column_data));
+                }
+                Some(InfluxColumnType::Timestamp) => {
+                    assert_eq!(col_name, TIME_COLUMN_NAME);
+
+                    let column_data = Column::from(match arrow_column.data_type() {
+                        arrow::datatypes::DataType::Int64 => arrow_column
+                            .as_any()
+                            .downcast_ref::<arrow::array::Int64Array>()
+                            .unwrap(),
+                        dt => panic!("{:?} column with {:?} must have type i64", col_name, dt),
+                    });
+
+                    columns.insert(col_name.to_owned(), ColumnType::Time(column_data));
+                }
+                _ => panic!("unknown column type"),
+            }
+        }
+
+        Self::new(rows as u32, columns)
     }
 }
 
@@ -825,12 +919,224 @@ fn unpack_u128_group_key(group_key_packed: u128, n: usize, mut dst: Vec<u32>) ->
     dst
 }
 
-pub type Predicate<'a> = (ColumnName<'a>, (Operator, Value<'a>));
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Predicate(Vec<BinaryExpr>);
+
+impl Predicate {
+    pub fn new(expr: Vec<BinaryExpr>) -> Self {
+        Self(expr)
+    }
+
+    /// Constructs a `Predicate` based on the provided collection of expressions
+    /// and explicit time bounds.
+    ///
+    /// The `from` and `to` values will be converted into appropriate
+    /// expressions, which result in the `Predicate` expressing the following:
+    ///
+    /// time >= from AND time < to
+    pub fn with_time_range(exprs: &[BinaryExpr], from: i64, to: i64) -> Self {
+        let mut time_exprs = vec![
+            BinaryExpr::from((TIME_COLUMN_NAME, ">=", from)),
+            BinaryExpr::from((TIME_COLUMN_NAME, "<", to)),
+        ];
+
+        time_exprs.extend_from_slice(exprs);
+        Self(time_exprs)
+    }
+
+    /// A `Predicate` is empty if it has no expressions.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, BinaryExpr> {
+        self.0.iter()
+    }
+
+    /// Returns a vector of all expressions on the predicate.
+    pub fn expressions(&self) -> &[BinaryExpr] {
+        &self.0
+    }
+
+    // Removes all expressions for specified column from the predicate and
+    // returns them.
+    //
+    // The current use-case for this to separate processing the time column on
+    // its own using an optimised filtering function (because the time column is
+    // very likely to have two expressions in the predicate).
+    fn remove_expr_by_column_name(&mut self, name: ColumnName<'_>) -> Vec<BinaryExpr> {
+        let mut exprs = vec![];
+        while let Some(i) = self.0.iter().position(|expr| expr.col == name) {
+            exprs.push(self.0.remove(i));
+        }
+
+        exprs
+    }
+
+    // Returns true if the Predicate contains two time expressions.
+    fn contains_time_range(&self) -> bool {
+        self.0
+            .iter()
+            .filter(|expr| expr.col == TIME_COLUMN_NAME)
+            .count()
+            == 2
+    }
+}
+
+/// Supported literal values for expressions. These map to a sub-set of logical
+/// datatypes supported by the `ReadBuffer`.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Literal {
+    String(String),
+    Integer(i64),
+    Unsigned(u64),
+    Float(f64),
+    Boolean(bool),
+}
+
+impl<'a> TryFrom<&DFScalarValue> for Literal {
+    type Error = String;
+
+    fn try_from(value: &DFScalarValue) -> Result<Self, Self::Error> {
+        match value {
+            DFScalarValue::Boolean(v) => match v {
+                Some(v) => Ok(Self::Boolean(*v)),
+                None => Err("NULL literal not supported".to_owned()),
+            },
+            DFScalarValue::Float64(v) => match v {
+                Some(v) => Ok(Self::Float(*v)),
+                None => Err("NULL literal not supported".to_owned()),
+            },
+            DFScalarValue::Int64(v) => match v {
+                Some(v) => Ok(Self::Integer(*v)),
+                None => Err("NULL literal not supported".to_owned()),
+            },
+            DFScalarValue::UInt64(v) => match v {
+                Some(v) => Ok(Self::Unsigned(*v)),
+                None => Err("NULL literal not supported".to_owned()),
+            },
+            DFScalarValue::Utf8(v) => match v {
+                Some(v) => Ok(Self::String(v.clone())),
+                None => Err("NULL literal not supported".to_owned()),
+            },
+            _ => Err("scalar type not supported".to_owned()),
+        }
+    }
+}
+
+/// An expression that contains a column name on the left side, an operator, and
+/// a literal value on the right side.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryExpr {
+    col: String,
+    op: Operator,
+    value: Literal,
+}
+
+impl BinaryExpr {
+    pub fn new(column_name: impl Into<String>, op: Operator, value: Literal) -> Self {
+        Self {
+            col: column_name.into(),
+            op,
+            value,
+        }
+    }
+
+    pub fn column(&self) -> ColumnName<'_> {
+        self.col.as_str()
+    }
+
+    pub fn op(&self) -> Operator {
+        self.op
+    }
+
+    pub fn literal(&self) -> &Literal {
+        &self.value
+    }
+
+    fn literal_as_value(&self) -> Value<'_> {
+        match self.literal() {
+            Literal::String(v) => Value::String(v),
+            Literal::Integer(v) => Value::Scalar(Scalar::I64(*v)),
+            Literal::Unsigned(v) => Value::Scalar(Scalar::U64(*v)),
+            Literal::Float(v) => Value::Scalar(Scalar::F64(*v)),
+            Literal::Boolean(v) => Value::Boolean(*v),
+        }
+    }
+}
+
+impl From<(&str, &str, &str)> for BinaryExpr {
+    fn from(expr: (&str, &str, &str)) -> Self {
+        Self::new(
+            expr.0,
+            Operator::try_from(expr.1).unwrap(),
+            Literal::String(expr.2.to_owned()),
+        )
+    }
+}
+
+// These From implementations are useful for expressing expressions easily in
+// tests by allowing for example:
+//
+//    BinaryExpr::from("region", ">=", "east")
+//    BinaryExpr::from("counter", "=", 321.3)
+macro_rules! binary_expr_from_impls {
+    ($(($type:ident, $variant:ident),)*) => {
+        $(
+            impl From<(&str, &str, $type)> for BinaryExpr {
+                fn from(expr: (&str, &str, $type)) -> Self {
+                    Self::new(
+                        expr.0,
+                        Operator::try_from(expr.1).unwrap(),
+                        Literal::$variant(expr.2.to_owned()),
+                    )
+                }
+            }
+        )*
+    };
+}
+
+binary_expr_from_impls! {
+    (String, String),
+    (i64, Integer),
+    (f64, Float),
+    (u64, Unsigned),
+    (bool, Boolean),
+}
+
+impl TryFrom<&DfExpr> for BinaryExpr {
+    type Error = String;
+
+    fn try_from(df_expr: &DfExpr) -> Result<Self, Self::Error> {
+        let (column_name, op, value) = match df_expr {
+            DfExpr::BinaryExpr { left, op, right } => (
+                match &**left {
+                    DfExpr::Column(name) => name,
+                    _ => return Err(format!("unsupported left expression {:?}", *left)),
+                },
+                Operator::try_from(op)?,
+                match &**right {
+                    DfExpr::Literal(scalar) => Literal::try_from(scalar)?,
+                    _ => return Err(format!("unsupported right expression {:?}", *right)),
+                },
+            ),
+            _ => return Err(format!("unsupported expression type {:?}", df_expr)),
+        };
+
+        Ok(Self::new(column_name, op, value))
+    }
+}
 
 // A GroupKey is an ordered collection of row values. The order determines which
 // columns the values originated from.
 #[derive(PartialEq, PartialOrd, Clone)]
 pub struct GroupKey<'row_group>(Vec<Value<'row_group>>);
+
+impl<'a> From<Vec<Value<'a>>> for GroupKey<'a> {
+    fn from(values: Vec<Value<'a>>) -> Self {
+        Self(values)
+    }
+}
 
 impl Eq for GroupKey<'_> {}
 
@@ -870,7 +1176,7 @@ impl Ord for GroupKey<'_> {
 // A representation of a column name.
 pub type ColumnName<'a> = &'a str;
 
-/// The logical type that a column could have.
+/// The InfluxDB-specific semantic meaning of a column.
 pub enum ColumnType {
     Tag(Column),
     Field(Column),
@@ -904,6 +1210,9 @@ struct MetaData {
     // possibly match based on the range of values a column has.
     column_ranges: BTreeMap<String, (OwnedValue, OwnedValue)>,
 
+    // The logical column types for each column in the `RowGroup`.
+    column_types: BTreeMap<String, LogicalDataType>,
+
     // The total time range of this table spanning all of the `RowGroup`s within
     // the table.
     //
@@ -913,21 +1222,17 @@ struct MetaData {
 }
 
 impl MetaData {
-    // helper function to determine if the provided predicate could be satisfied
-    // by the `RowGroup`. If this function returns `false` then there is no
-    // point attempting to read data from the `RowGroup`.
+    // helper function to determine if the provided binary expression could be
+    // satisfied in the `RowGroup`, If this function returns `false` then there
+    // no rows in the `RowGroup` would ever match the expression.
     //
-    pub fn read_group_could_satisfy_predicate(
-        &self,
-        column_name: ColumnName<'_>,
-        predicate: &(Operator, Value<'_>),
-    ) -> bool {
-        let (column_min, column_max) = match self.column_ranges.get(column_name) {
+    pub fn column_could_satisfy_binary_expr(&self, expr: &BinaryExpr) -> bool {
+        let (column_min, column_max) = match self.column_ranges.get(expr.column()) {
             Some(range) => range,
             None => return false, // column doesn't exist.
         };
 
-        let (op, value) = predicate;
+        let (op, value) = (expr.op(), &expr.literal_as_value());
         match op {
             // If the column range covers the value then it could contain that
             // value.
@@ -954,25 +1259,82 @@ impl MetaData {
             Operator::LTE => column_min <= value,
         }
     }
+
+    // Extract schema information for a set of columns.
+    fn schema_for_column_names(&self, names: &[ColumnName<'_>]) -> Vec<(String, LogicalDataType)> {
+        names
+            .iter()
+            .map(|&name| (name.to_owned(), *self.column_types.get(name).unwrap()))
+            .collect::<Vec<_>>()
+    }
+
+    // Extract the schema information for a set of aggregate columns
+    fn schema_for_aggregate_column_names(
+        &self,
+        columns: &[(ColumnName<'_>, AggregateType)],
+    ) -> Vec<(String, AggregateType, LogicalDataType)> {
+        columns
+            .iter()
+            .map(|(name, agg_type)| {
+                (
+                    name.to_string(),
+                    *agg_type,
+                    *self.column_types.get(*name).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>()
+    }
 }
 
 /// Encapsulates results from `RowGroup`s with a structure that makes them
 /// easier to work with and display.
-pub struct ReadFilterResult<'row_group>(pub Vec<(ColumnName<'row_group>, Values<'row_group>)>);
+pub struct ReadFilterResult<'row_group> {
+    /// tuples of the form (column_name, data_type)
+    schema: Vec<(String, LogicalDataType)>,
+    data: Vec<Values<'row_group>>,
+}
 
 impl ReadFilterResult<'_> {
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.data.is_empty()
+    }
+
+    pub fn schema(&self) -> &Vec<(String, LogicalDataType)> {
+        &self.schema
+    }
+
+    /// Produces a `RecordBatch` from the results, giving up ownership to the
+    /// returned record batch.
+    pub fn record_batch(self) -> arrow::record_batch::RecordBatch {
+        let schema = arrow::datatypes::Schema::new(
+            self.schema()
+                .iter()
+                .map(|(col_name, col_typ)| {
+                    arrow::datatypes::Field::new(col_name, col_typ.to_arrow_datatype(), true)
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        let columns = self
+            .data
+            .into_iter()
+            .map(arrow::array::ArrayRef::from)
+            .collect::<Vec<_>>();
+
+        // try_new only returns an error if the schema is invalid or the number
+        // of rows on columns differ. We have full control over both so there
+        // should never be an error to return...
+        arrow::record_batch::RecordBatch::try_new(Arc::new(schema), columns).unwrap()
     }
 }
 
 impl std::fmt::Debug for &ReadFilterResult<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // header line.
-        for (i, (k, _)) in self.0.iter().enumerate() {
+        for (i, (k, _)) in self.schema.iter().enumerate() {
             write!(f, "{}", k)?;
 
-            if i < self.0.len() - 1 {
+            if i < self.schema.len() - 1 {
                 write!(f, ",")?;
             }
         }
@@ -989,26 +1351,24 @@ impl std::fmt::Display for &ReadFilterResult<'_> {
             return Ok(());
         }
 
-        let expected_rows = self.0[0].1.len();
+        let expected_rows = self.data[0].len();
         let mut rows = 0;
 
         let mut iter_map = self
-            .0
+            .data
             .iter()
-            .map(|(k, v)| (*k, ValuesIterator::new(v)))
-            .collect::<BTreeMap<&str, ValuesIterator<'_>>>();
+            .map(|v| ValuesIterator::new(v))
+            .collect::<Vec<_>>();
 
         while rows < expected_rows {
             if rows > 0 {
                 writeln!(f)?;
             }
 
-            for (i, (k, _)) in self.0.iter().enumerate() {
-                if let Some(itr) = iter_map.get_mut(k) {
-                    write!(f, "{}", itr.next().unwrap())?;
-                    if i < self.0.len() - 1 {
-                        write!(f, ",")?;
-                    }
+            for (i, (k, _)) in self.schema.iter().enumerate() {
+                write!(f, "{}", iter_map[i].next().unwrap())?;
+                if i < self.schema.len() - 1 {
+                    write!(f, ",")?;
                 }
             }
 
@@ -1019,25 +1379,26 @@ impl std::fmt::Display for &ReadFilterResult<'_> {
 }
 
 #[derive(Default)]
-pub struct ReadGroupResult<'row_group> {
-    // columns that are being grouped on.
-    group_columns: Vec<ColumnName<'row_group>>,
-
-    // columns that are being aggregated
-    aggregate_columns: Vec<(ColumnName<'row_group>, AggregateType)>,
+pub struct ReadAggregateResult<'row_group> {
+    // a schema describing the columns in the results and their types.
+    pub(crate) schema: ResultSchema,
 
     // row-wise collection of group keys. Each group key contains column-wise
     // values for each of the groupby_columns.
-    group_keys: Vec<GroupKey<'row_group>>,
+    pub(crate) group_keys: Vec<GroupKey<'row_group>>,
 
     // row-wise collection of aggregates. Each aggregate contains column-wise
     // values for each of the aggregate_columns.
-    aggregates: Vec<Vec<AggregateResult<'row_group>>>,
+    pub(crate) aggregates: Vec<Vec<AggregateResult<'row_group>>>,
 }
 
-impl ReadGroupResult<'_> {
+impl ReadAggregateResult<'_> {
     pub fn is_empty(&self) -> bool {
         self.group_keys.is_empty()
+    }
+
+    pub fn schema(&self) -> &ResultSchema {
+        &self.schema
     }
 
     // The number of distinct group keys in the result.
@@ -1058,29 +1419,21 @@ impl ReadGroupResult<'_> {
     }
 }
 
-impl std::fmt::Debug for &ReadGroupResult<'_> {
+/// The Debug implementation emits both the schema and the column data for the
+/// results.
+impl std::fmt::Debug for &ReadAggregateResult<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // group column names
-        for k in &self.group_columns {
-            write!(f, "{},", k)?;
-        }
-
-        // aggregate column names
-        for (i, (k, typ)) in self.aggregate_columns.iter().enumerate() {
-            write!(f, "{}_{}", k, typ)?;
-
-            if i < self.aggregate_columns.len() - 1 {
-                write!(f, ",")?;
-            }
-        }
-        writeln!(f)?;
+        // Display the schema
+        std::fmt::Display::fmt(&self.schema(), f)?;
 
         // Display the rest of the values.
         std::fmt::Display::fmt(&self, f)
     }
 }
 
-impl std::fmt::Display for &ReadGroupResult<'_> {
+/// The Display implementation emits all of the column data for the results, but
+/// omits the schema.
+impl std::fmt::Display for &ReadAggregateResult<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_empty() {
             return Ok(());
@@ -1110,31 +1463,14 @@ impl std::fmt::Display for &ReadGroupResult<'_> {
     }
 }
 
-/// helper function useful for tests and benchmarks. Creates a time-range
-/// predicate in the domain `[from, to)`.
-pub fn build_predicates_with_time(
-    from: i64,
-    to: i64,
-    others: Vec<Predicate<'_>>,
-) -> Vec<Predicate<'_>> {
-    let mut arr = vec![
-        (
-            TIME_COLUMN_NAME,
-            (Operator::GTE, Value::Scalar(Scalar::I64(from))),
-        ),
-        (
-            TIME_COLUMN_NAME,
-            (Operator::LT, Value::Scalar(Scalar::I64(to))),
-        ),
-    ];
-
-    arr.extend(others);
-    arr
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // Helper function that creates a predicate from a single expression
+    fn col_pred(expr: BinaryExpr) -> Predicate {
+        Predicate::new(vec![expr])
+    }
 
     #[test]
     fn row_ids_from_predicates() {
@@ -1148,59 +1484,58 @@ mod test {
         let row_group = RowGroup::new(6, columns);
 
         // Closed partially covering "time range" predicate
-        let row_ids =
-            row_group.row_ids_from_predicates(&build_predicates_with_time(200, 600, vec![]));
+        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(&[], 200, 600));
         assert_eq!(row_ids.unwrap().to_vec(), vec![1, 2, 4, 5]);
 
         // Fully covering "time range" predicate
-        let row_ids =
-            row_group.row_ids_from_predicates(&build_predicates_with_time(10, 601, vec![]));
+        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(&[], 10, 601));
         assert!(matches!(row_ids, RowIDsOption::All(_)));
 
         // Open ended "time range" predicate
-        let row_ids = row_group.row_ids_from_predicates(&[(
+        let row_ids = row_group.row_ids_from_predicates(&col_pred(BinaryExpr::from((
             TIME_COLUMN_NAME,
-            (Operator::GTE, Value::Scalar(Scalar::I64(300))),
-        )]);
+            ">=",
+            300_i64,
+        ))));
         assert_eq!(row_ids.unwrap().to_vec(), vec![2, 3, 4, 5]);
 
         // Closed partially covering "time range" predicate and other column
         // predicate
-        let row_ids = row_group.row_ids_from_predicates(&build_predicates_with_time(
+        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(
+            &[BinaryExpr::from(("region", "=", "south"))],
             200,
             600,
-            vec![("region", (Operator::Equal, Value::String("south")))],
         ));
         assert_eq!(row_ids.unwrap().to_vec(), vec![4]);
 
         // Fully covering "time range" predicate and other column predicate
-        let row_ids = row_group.row_ids_from_predicates(&build_predicates_with_time(
+        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(
+            &[BinaryExpr::from(("region", "=", "west"))],
             10,
             601,
-            vec![("region", (Operator::Equal, Value::String("west")))],
         ));
         assert_eq!(row_ids.unwrap().to_vec(), vec![0, 1, 3]);
 
         // "time range" predicate and other column predicate that doesn't match
-        let row_ids = row_group.row_ids_from_predicates(&build_predicates_with_time(
+        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(
+            &[BinaryExpr::from(("region", "=", "nope"))],
             200,
             600,
-            vec![("region", (Operator::Equal, Value::String("nope")))],
         ));
         assert!(matches!(row_ids, RowIDsOption::None(_)));
 
         // Just a column predicate
-        let row_ids = row_group
-            .row_ids_from_predicates(&[("region", (Operator::Equal, Value::String("east")))]);
+        let row_ids =
+            row_group.row_ids_from_predicates(&col_pred(BinaryExpr::from(("region", "=", "east"))));
         assert_eq!(row_ids.unwrap().to_vec(), vec![2]);
 
         // Predicate can matches all the rows
         let row_ids = row_group
-            .row_ids_from_predicates(&[("region", (Operator::NotEqual, Value::String("abba")))]);
+            .row_ids_from_predicates(&col_pred(BinaryExpr::from(("region", "!=", "abba"))));
         assert!(matches!(row_ids, RowIDsOption::All(_)));
 
         // No predicates
-        let row_ids = row_group.row_ids_from_predicates(&[]);
+        let row_ids = row_group.row_ids_from_predicates(&Predicate::default());
         assert!(matches!(row_ids, RowIDsOption::All(_)));
     }
 
@@ -1228,7 +1563,7 @@ mod test {
         let cases = vec![
             (
                 vec!["count", "region", "time"],
-                build_predicates_with_time(1, 6, vec![]),
+                Predicate::with_time_range(&[], 1, 6),
                 "count,region,time
 100,west,1
 101,west,2
@@ -1239,14 +1574,14 @@ mod test {
             ),
             (
                 vec!["time", "region", "method"],
-                build_predicates_with_time(-19, 2, vec![]),
+                Predicate::with_time_range(&[], -19, 2),
                 "time,region,method
 1,west,GET
 ",
             ),
             (
                 vec!["time"],
-                build_predicates_with_time(0, 3, vec![]),
+                Predicate::with_time_range(&[], 0, 3),
                 "time
 1
 2
@@ -1254,7 +1589,7 @@ mod test {
             ),
             (
                 vec!["method"],
-                build_predicates_with_time(0, 3, vec![]),
+                Predicate::with_time_range(&[], 0, 3),
                 "method
 GET
 POST
@@ -1262,11 +1597,7 @@ POST
             ),
             (
                 vec!["count", "method", "time"],
-                build_predicates_with_time(
-                    0,
-                    6,
-                    vec![("method", (Operator::Equal, Value::String("POST")))],
-                ),
+                Predicate::with_time_range(&[BinaryExpr::from(("method", "=", "POST"))], 0, 6),
                 "count,method,time
 101,POST,2
 200,POST,3
@@ -1275,11 +1606,7 @@ POST
             ),
             (
                 vec!["region", "time"],
-                build_predicates_with_time(
-                    0,
-                    6,
-                    vec![("method", (Operator::Equal, Value::String("POST")))],
-                ),
+                Predicate::with_time_range(&[BinaryExpr::from(("method", "=", "POST"))], 0, 6),
                 "region,time
 west,2
 east,3
@@ -1296,7 +1623,7 @@ west,4
         // test no matching rows
         let results = row_group.read_filter(
             &["method", "region", "time"],
-            &build_predicates_with_time(-19, 1, vec![]),
+            &Predicate::with_time_range(&[], -19, 1),
         );
         let expected = "";
         assert!(results.is_empty());
@@ -1363,7 +1690,7 @@ west,4
     fn read_group_hash_u128_key(row_group: &RowGroup) {
         let cases = vec![
             (
-                build_predicates_with_time(0, 7, vec![]), // all time but without explicit pred
+                Predicate::with_time_range(&[], 0, 7), // all time but without explicit pred
                 vec!["region", "method"],
                 vec![("counter", AggregateType::Sum)],
                 "region,method,counter_sum
@@ -1375,7 +1702,7 @@ west,POST,304
 ",
             ),
             (
-                build_predicates_with_time(2, 6, vec![]), // all time but without explicit pred
+                Predicate::with_time_range(&[], 2, 6), // all time but without explicit pred
                 vec!["env", "region"],
                 vec![
                     ("counter", AggregateType::Sum),
@@ -1388,7 +1715,7 @@ stag,east,200,1
 ",
             ),
             (
-                build_predicates_with_time(-1, 10, vec![]),
+                Predicate::with_time_range(&[], -1, 10),
                 vec!["region", "env"],
                 vec![("method", AggregateType::Min)], // Yep, you can aggregate any column.
                 "region,env,method_min
@@ -1401,11 +1728,7 @@ west,prod,GET
             // This case is identical to above but has an explicit `region >
             // "north"` predicate.
             (
-                build_predicates_with_time(
-                    -1,
-                    10,
-                    vec![("region", (Operator::GT, Value::String("north")))],
-                ),
+                Predicate::with_time_range(&[BinaryExpr::from(("region", ">", "north"))], -1, 10),
                 vec!["region", "env"],
                 vec![("method", AggregateType::Min)], // Yep, you can aggregate any column.
                 "region,env,method_min
@@ -1414,7 +1737,7 @@ west,prod,GET
 ",
             ),
             (
-                build_predicates_with_time(-1, 10, vec![]),
+                Predicate::with_time_range(&[], -1, 10),
                 vec!["region", "env", "method"],
                 vec![("time", AggregateType::Max)], // Yep, you can aggregate any column.
                 "region,env,method,time_max
@@ -1428,7 +1751,7 @@ west,prod,POST,4
         ];
 
         for (predicate, group_cols, aggs, expected) in cases {
-            let mut results = row_group.read_group(&predicate, &group_cols, &aggs);
+            let mut results = row_group.read_aggregate(&predicate, &group_cols, &aggs);
             results.sort();
             assert_eq!(format!("{:?}", &results), expected);
         }
@@ -1438,7 +1761,7 @@ west,prod,POST,4
     // ensure that the `read_group_hash_with_vec_key` path is exercised.
     fn read_group_hash_vec_key(row_group: &RowGroup) {
         let cases = vec![(
-            build_predicates_with_time(0, 7, vec![]), // all time but with explicit pred
+            Predicate::with_time_range(&[], 0, 7), // all time but with explicit pred
             vec!["region", "method", "env", "letters", "numbers"],
             vec![("counter", AggregateType::Sum)],
             "region,method,env,letters,numbers,counter_sum
@@ -1452,7 +1775,7 @@ west,POST,prod,Bravo,two,203
         )];
 
         for (predicate, group_cols, aggs, expected) in cases {
-            let mut results = row_group.read_group(&predicate, &group_cols, &aggs);
+            let mut results = row_group.read_aggregate(&predicate, &group_cols, &aggs);
             results.sort();
             assert_eq!(format!("{:?}", &results), expected);
         }
@@ -1461,7 +1784,7 @@ west,POST,prod,Bravo,two,203
     // the read_group path where grouping is on a single column.
     fn read_group_single_groupby_column(row_group: &RowGroup) {
         let cases = vec![(
-            build_predicates_with_time(0, 7, vec![]), // all time but with explicit pred
+            Predicate::with_time_range(&[], 0, 7), // all time but with explicit pred
             vec!["method"],
             vec![("counter", AggregateType::Sum)],
             "method,counter_sum
@@ -1472,7 +1795,7 @@ PUT,203
         )];
 
         for (predicate, group_cols, aggs, expected) in cases {
-            let mut results = row_group.read_group(&predicate, &group_cols, &aggs);
+            let mut results = row_group.read_aggregate(&predicate, &group_cols, &aggs);
             results.sort();
             assert_eq!(format!("{:?}", &results), expected);
         }
@@ -1481,7 +1804,7 @@ PUT,203
     fn read_group_all_rows_all_rle(row_group: &RowGroup) {
         let cases = vec![
             (
-                vec![],
+                Predicate::default(),
                 vec!["region", "method"],
                 vec![("counter", AggregateType::Sum)],
                 "region,method,counter_sum
@@ -1493,7 +1816,7 @@ west,POST,304
 ",
             ),
             (
-                vec![],
+                Predicate::default(),
                 vec!["region", "method", "env"],
                 vec![("counter", AggregateType::Sum)],
                 "region,method,env,counter_sum
@@ -1505,7 +1828,7 @@ west,POST,prod,304
 ",
             ),
             (
-                vec![],
+                Predicate::default(),
                 vec!["env"],
                 vec![("counter", AggregateType::Count)],
                 "env,counter_count
@@ -1515,7 +1838,7 @@ stag,1
 ",
             ),
             (
-                vec![],
+                Predicate::default(),
                 vec!["region", "method"],
                 vec![
                     ("counter", AggregateType::Sum),
@@ -1533,7 +1856,7 @@ west,POST,304,101,203
         ];
 
         for (predicate, group_cols, aggs, expected) in cases {
-            let results = row_group.read_group(&predicate, &group_cols, &aggs);
+            let results = row_group.read_aggregate(&predicate, &group_cols, &aggs);
             assert_eq!(format!("{:?}", &results), expected);
         }
     }
@@ -1557,78 +1880,38 @@ west,POST,304,101,203
         let row_group = RowGroup::new(6, columns);
 
         let cases = vec![
-            ("az", &(Operator::Equal, Value::String("west")), false), // no az column
-            ("region", &(Operator::Equal, Value::String("west")), true), /* region column does
-                                                                       * contain "west" */
-            ("region", &(Operator::Equal, Value::String("over")), true), /* region column might
-                                                                          * contain "over" */
-            ("region", &(Operator::Equal, Value::String("abc")), false), /* region column can't
-                                                                          * contain "abc" */
-            ("region", &(Operator::Equal, Value::String("zoo")), false), /* region column can't
-                                                                          * contain "zoo" */
-            (
-                "region",
-                &(Operator::NotEqual, Value::String("hello")),
-                true,
-            ), // region column might not contain "hello"
-            ("method", &(Operator::NotEqual, Value::String("GET")), false), /* method must only
-                                                                             * contain "GET" */
-            ("region", &(Operator::GT, Value::String("abc")), true), /* region column might
-                                                                      * contain something >
-                                                                      * "abc" */
-            ("region", &(Operator::GT, Value::String("north")), true), /* region column might
-                                                                        * contain something >
-                                                                        * "north" */
-            ("region", &(Operator::GT, Value::String("west")), false), /* region column can't
-                                                                        * contain something >
-                                                                        * "west" */
-            ("region", &(Operator::GTE, Value::String("abc")), true), /* region column might
-                                                                       * contain something ≥
-                                                                       * "abc" */
-            ("region", &(Operator::GTE, Value::String("east")), true), /* region column might
-                                                                        * contain something ≥
-                                                                        * "east" */
-            ("region", &(Operator::GTE, Value::String("west")), true), /* region column might
-                                                                        * contain something ≥
-                                                                        * "west" */
-            ("region", &(Operator::GTE, Value::String("zoo")), false), /* region column can't
-                                                                        * contain something ≥
-                                                                        * "zoo" */
-            ("region", &(Operator::LT, Value::String("foo")), true), /* region column might
-                                                                      * contain something <
-                                                                      * "foo" */
-            ("region", &(Operator::LT, Value::String("north")), true), /* region column might
-                                                                        * contain something <
-                                                                        * "north" */
-            ("region", &(Operator::LT, Value::String("south")), true), /* region column might
-                                                                        * contain something <
-                                                                        * "south" */
-            ("region", &(Operator::LT, Value::String("east")), false), /* region column can't
-                                                                        * contain something <
-                                                                        * "east" */
-            ("region", &(Operator::LT, Value::String("abc")), false), /* region column can't
-                                                                       * contain something <
-                                                                       * "abc" */
-            ("region", &(Operator::LTE, Value::String("east")), true), /* region column might
-                                                                        * contain something ≤
-                                                                        * "east" */
-            ("region", &(Operator::LTE, Value::String("north")), true), /* region column might
-                                                                         * contain something ≤
-                                                                         * "north" */
-            ("region", &(Operator::LTE, Value::String("south")), true), /* region column might
-                                                                         * contain something ≤
-                                                                         * "south" */
-            ("region", &(Operator::LTE, Value::String("abc")), false), /* region column can't
-                                                                        * contain something ≤
-                                                                        * "abc" */
+            (("az", "=", "west"), false),      // no az column
+            (("region", "=", "west"), true),   // region column does contain "west"
+            (("region", "=", "over"), true),   // region column might contain "over"
+            (("region", "=", "abc"), false),   // region column can't contain "abc"
+            (("region", "=", "zoo"), false),   // region column can't contain "zoo"
+            (("region", "!=", "hello"), true), // region column might not contain "hello"
+            (("method", "!=", "GET"), false),  // method must only contain "GET"
+            (("region", ">", "abc"), true),    // region column might contain something > "abc"
+            (("region", ">", "north"), true),  // region column might contain something > "north"
+            (("region", ">", "west"), false),  // region column can't contain something > "west"
+            (("region", ">=", "abc"), true),   // region column might contain something ≥ "abc"
+            (("region", ">=", "east"), true),  // region column might contain something ≥ "east"
+            (("region", ">=", "west"), true),  // region column might contain something ≥ "west"
+            (("region", ">=", "zoo"), false),  // region column can't contain something ≥ "zoo"
+            (("region", "<", "foo"), true),    // region column might contain something < "foo"
+            (("region", "<", "north"), true),  // region column might contain something < "north"
+            (("region", "<", "south"), true),  // region column might contain something < "south"
+            (("region", "<", "east"), false),  // region column can't contain something < "east"
+            (("region", "<", "abc"), false),   // region column can't contain something < "abc"
+            (("region", "<=", "east"), true),  // region column might contain something ≤ "east"
+            (("region", "<=", "north"), true), // region column might contain something ≤ "north"
+            (("region", "<=", "south"), true), // region column might contain something ≤ "south"
+            (("region", "<=", "abc"), false),  // region column can't contain something ≤ "abc"
         ];
 
-        for (column_name, predicate, exp) in cases {
+        for ((col, op, value), exp) in cases {
+            let predicate = Predicate::new(vec![BinaryExpr::from((col, op, value))]);
+
             assert_eq!(
-                row_group.column_could_satisfy_predicate(column_name, predicate),
+                row_group.could_satisfy_conjunctive_binary_expressions(predicate.iter()),
                 exp,
-                "({:?}, {:?}) failed",
-                column_name,
+                "{:?} failed",
                 predicate
             );
         }
@@ -1664,15 +1947,26 @@ west,POST,304,101,203
 
     #[test]
     fn read_group_result() {
-        let group_columns = vec!["region", "host"];
-        let aggregate_columns = vec![
-            ("temp", AggregateType::Sum),
-            ("voltage", AggregateType::Count),
-        ];
-
-        let result = ReadGroupResult {
-            group_columns,
-            aggregate_columns,
+        let result = ReadAggregateResult {
+            schema: ResultSchema {
+                select_columns: vec![],
+                group_columns: vec![
+                    ("region".to_owned(), LogicalDataType::String),
+                    ("host".to_owned(), LogicalDataType::String),
+                ],
+                aggregate_columns: vec![
+                    (
+                        "temp".to_owned(),
+                        AggregateType::Sum,
+                        LogicalDataType::Integer,
+                    ),
+                    (
+                        "voltage".to_owned(),
+                        AggregateType::Count,
+                        LogicalDataType::Unsigned,
+                    ),
+                ],
+            },
             group_keys: vec![
                 GroupKey(vec![Value::String("east"), Value::String("host-a")]),
                 GroupKey(vec![Value::String("east"), Value::String("host-b")]),

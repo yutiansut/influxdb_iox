@@ -1,11 +1,10 @@
-use generated_types::wal as wb;
-use influxdb_line_protocol::ParsedLine;
+use generated_types::wal;
 use query::group_by::GroupByAndAggregate;
 use query::group_by::WindowDuration;
 use query::{
     exec::{stringset::StringSet, FieldListPlan, SeriesSetPlan, SeriesSetPlans, StringSetPlan},
     predicate::Predicate,
-    SQLDatabase, TSDatabase,
+    Database,
 };
 use query::{group_by::Aggregate, predicate::PredicateBuilder};
 
@@ -19,25 +18,13 @@ use crate::{
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use arrow_deps::{
-    arrow::{datatypes::Schema as ArrowSchema, record_batch::RecordBatch},
-    datafusion::{
-        datasource::MemTable, error::DataFusionError, execution::context::ExecutionContext,
-        logical_plan::LogicalPlan, physical_plan::collect, prelude::ExecutionConfig,
-    },
-};
-use data_types::data::{split_lines_into_write_entry_partitions, ReplicatedWrite};
+use arrow_deps::datafusion::{error::DataFusionError, logical_plan::LogicalPlan};
+use data_types::data::ReplicatedWrite;
 
 use crate::dictionary::Error as DictionaryError;
 
 use async_trait::async_trait;
-use chrono::{offset::TimeZone, Utc};
 use snafu::{ResultExt, Snafu};
-use sqlparser::{
-    ast::{SetExpr, Statement, TableFactor},
-    dialect::GenericDialect,
-    parser::Parser,
-};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Snafu)]
@@ -51,7 +38,7 @@ pub enum Error {
     #[snafu(display("Table name {} not found in dictionary of chunk {}", table, chunk))]
     TableNameNotFoundInDictionary {
         table: String,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
@@ -62,21 +49,21 @@ pub enum Error {
     ))]
     ColumnNameNotFoundInDictionary {
         column_name: String,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
     #[snafu(display("Column ID {} not found in dictionary of chunk {}", column_id, chunk))]
     ColumnIdNotFoundInDictionary {
         column_id: u32,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
     #[snafu(display("Value ID {} not found in dictionary of chunk {}", value_id, chunk))]
     ColumnValueIdNotFoundInDictionary {
         value_id: u32,
-        chunk: String,
+        chunk: u64,
         source: DictionaryError,
     },
 
@@ -89,22 +76,16 @@ pub enum Error {
     #[snafu(display("id conversion error"))]
     IdConversionError { source: std::num::TryFromIntError },
 
-    #[snafu(display("Invalid sql query: {} : {}", query, source))]
-    InvalidSqlQuery {
-        query: String,
-        source: sqlparser::parser::ParserError,
-    },
-
     #[snafu(display("error executing query {}: {}", query, source))]
     QueryError {
         query: String,
         source: DataFusionError,
     },
 
-    #[snafu(display("Unsupported SQL statement in query {}: {}", query, statement))]
-    UnsupportedStatement {
-        query: String,
-        statement: Box<Statement>,
+    #[snafu(display("Error dropping chunk from partition '{}': {}", partition_key, source))]
+    DroppingChunk {
+        partition_key: String,
+        source: crate::partition::Error,
     },
 
     #[snafu(display("replicated write from writer {} missing payload", writer))]
@@ -160,7 +141,7 @@ impl MutableBufferDb {
     }
 
     /// Directs the writes from batch into the appropriate partitions
-    async fn write_entries_to_partitions(&self, batch: &wb::WriteBufferBatch<'_>) -> Result<()> {
+    async fn write_entries_to_partitions(&self, batch: &wal::WriteBufferBatch<'_>) -> Result<()> {
         if let Some(entries) = batch.entries() {
             for entry in entries {
                 let key = entry
@@ -176,40 +157,39 @@ impl MutableBufferDb {
         Ok(())
     }
 
-    async fn table_to_arrow(&self, table_name: &str, columns: &[&str]) -> Result<Vec<RecordBatch>> {
-        let mut batches = Vec::new();
-        for partition in self.partition_snapshot().await.into_iter() {
-            let partition = partition.read().await;
-            partition.table_to_arrow(&mut batches, table_name, columns)?
-        }
-
-        Ok(batches)
-    }
-
     /// Rolls over the active chunk in this partititon
     pub async fn rollover_partition(&self, partition_key: &str) -> Result<Arc<Chunk>> {
         let partition = self.get_partition(partition_key).await;
         let mut partition = partition.write().await;
         Ok(partition.rollover_chunk())
     }
+
+    /// return the specified chunk from the partition
+    /// Returns None if no such chunk exists.
+    pub async fn get_chunk(&self, partition_key: &str, chunk_id: u32) -> Option<Arc<Chunk>> {
+        self.get_partition(partition_key)
+            .await
+            .read()
+            .await
+            .get_chunk(chunk_id)
+            .ok()
+    }
+
+    /// drop the the specified chunk from the partition
+    pub async fn drop_chunk(&self, partition_key: &str, chunk_id: u32) -> Result<Arc<Chunk>> {
+        self.get_partition(partition_key)
+            .await
+            .write()
+            .await
+            .drop_chunk(chunk_id)
+            .context(DroppingChunk { partition_key })
+    }
 }
 
 #[async_trait]
-impl TSDatabase for MutableBufferDb {
-    type Chunk = crate::chunk::Chunk;
+impl Database for MutableBufferDb {
     type Error = Error;
-
-    // TODO: writes lines creates a column named "time" for the timestamp data. If
-    //       we keep this we need to validate that no tag or field has the same
-    // name.
-    async fn write_lines(&self, lines: &[ParsedLine<'_>]) -> Result<(), Self::Error> {
-        let data = split_lines_into_write_entry_partitions(compute_partition_key, lines);
-        let batch = flatbuffers::get_root::<wb::WriteBufferBatch<'_>>(&data);
-
-        self.write_entries_to_partitions(&batch).await?;
-
-        Ok(())
-    }
+    type Chunk = Chunk;
 
     async fn store_replicated_write(&self, write: &ReplicatedWrite) -> Result<(), Self::Error> {
         match write.write_buffer_batch() {
@@ -308,75 +288,6 @@ impl TSDatabase for MutableBufferDb {
             }
         }
     }
-}
-
-#[async_trait]
-impl SQLDatabase for MutableBufferDb {
-    type Chunk = Chunk;
-    type Error = Error;
-
-    async fn query(&self, query: &str) -> Result<Vec<RecordBatch>, Self::Error> {
-        let mut tables = vec![];
-
-        let dialect = GenericDialect {};
-        let ast = Parser::parse_sql(&dialect, query).context(InvalidSqlQuery { query })?;
-
-        for statement in ast {
-            match statement {
-                Statement::Query(q) => {
-                    if let SetExpr::Select(q) = q.body {
-                        for item in q.from {
-                            if let TableFactor::Table { name, .. } = item.relation {
-                                let name = name.to_string();
-                                let data = self.table_to_arrow(&name, &[]).await?;
-                                tables.push(ArrowTable {
-                                    name,
-                                    schema: data[0].schema().clone(),
-                                    data,
-                                });
-                            }
-                        }
-                    }
-                }
-                _ => {
-                    return UnsupportedStatement {
-                        query: query.to_string(),
-                        statement,
-                    }
-                    .fail()
-                }
-            }
-        }
-
-        let config = ExecutionConfig::new().with_batch_size(1024 * 1024);
-        let mut ctx = ExecutionContext::with_config(config);
-
-        for table in tables {
-            let provider =
-                MemTable::try_new(table.schema, vec![table.data]).context(QueryError { query })?;
-            ctx.register_table(&table.name, Box::new(provider));
-        }
-
-        let plan = ctx
-            .create_logical_plan(&query)
-            .context(QueryError { query })?;
-        let plan = ctx.optimize(&plan).context(QueryError { query })?;
-        let plan = ctx
-            .create_physical_plan(&plan)
-            .context(QueryError { query })?;
-
-        collect(plan).await.context(QueryError { query })
-    }
-
-    /// Fetch the specified table names and columns as Arrow
-    /// RecordBatches. Columns are returned in the order specified.
-    async fn table_to_arrow(
-        &self,
-        table_name: &str,
-        columns: &[&str],
-    ) -> Result<Vec<RecordBatch>, Self::Error> {
-        self.table_to_arrow(table_name, columns).await
-    }
 
     /// Return the partition keys for data in this DB
     async fn partition_keys(&self) -> Result<Vec<String>, Self::Error> {
@@ -398,6 +309,17 @@ impl SQLDatabase for MutableBufferDb {
         self.accept(&mut filter, &mut visitor).await?;
         let names = visitor.into_inner().into_iter().collect();
         Ok(names)
+    }
+
+    /// Return the list of chunks, in order of id, for the specified
+    /// partition_key
+    async fn chunks(&self, partition_key: &str) -> Result<Vec<Arc<Chunk>>> {
+        Ok(self
+            .get_partition(partition_key)
+            .await
+            .read()
+            .await
+            .chunks())
     }
 }
 
@@ -701,7 +623,7 @@ impl Visitor for NameVisitor {
                     .lookup_id(column_id)
                     .context(ColumnIdNotFoundInDictionary {
                         column_id,
-                        chunk: &chunk.key,
+                        chunk: chunk.id,
                     })?;
 
             if !self.column_names.contains(column_name) {
@@ -837,7 +759,7 @@ impl<'a> Visitor for ValueVisitor<'a> {
         self.column_id = Some(chunk.dictionary.lookup_value(self.column_name).context(
             ColumnNameNotFoundInDictionary {
                 column_name: self.column_name,
-                chunk: &chunk.key,
+                chunk: chunk.id,
             },
         )?);
 
@@ -902,7 +824,7 @@ impl<'a> Visitor for ValueVisitor<'a> {
             let value = chunk.dictionary.lookup_id(value_id).context(
                 ColumnValueIdNotFoundInDictionary {
                     value_id,
-                    chunk: &chunk.key,
+                    chunk: chunk.id,
                 },
             )?;
 
@@ -1053,23 +975,6 @@ impl Visitor for WindowGroupsVisitor {
     }
 }
 
-// compute_partition_key returns the partititon key for the given
-// line. The key will be the prefix of a chunk name (multiple chunks
-// can exist for each key).  It uses the user defined chunking rules
-// to construct this key
-pub fn compute_partition_key(line: &ParsedLine<'_>) -> String {
-    // TODO - wire this up to use chunking rules, for now just chunk by day
-    let ts = line.timestamp.unwrap();
-    let dt = Utc.timestamp_nanos(ts);
-    dt.format("%Y-%m-%dT%H").to_string()
-}
-
-struct ArrowTable {
-    name: String,
-    schema: Arc<ArrowSchema>,
-    data: Vec<RecordBatch>,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,19 +985,21 @@ mod tests {
             seriesset::{Error as SeriesSetError, SeriesSet, SeriesSetItem},
             Executor,
         },
+        frontend::sql::SQLQueryPlanner,
         predicate::PredicateBuilder,
-        TSDatabase,
+        Database,
     };
 
     use arrow_deps::{
         arrow::{
             array::{Array, StringArray},
             datatypes::DataType,
+            record_batch::RecordBatch,
         },
         assert_table_eq,
-        datafusion::prelude::*,
+        datafusion::{physical_plan::collect, prelude::*},
     };
-    use influxdb_line_protocol::parse_lines;
+    use influxdb_line_protocol::{parse_lines, ParsedLine};
     use test_helpers::str_pair_vec_to_vec;
     use tokio::sync::mpsc;
 
@@ -1129,7 +1036,7 @@ mod tests {
             parse_lines("cpu,region=west user=23.2 10\ndisk,region=east bytes=99i 11")
                 .map(|l| l.unwrap())
                 .collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         // Now, we should see the two tables
         assert_eq!(
@@ -1151,7 +1058,7 @@ mod tests {
             parse_lines("cpu,region=west user=23.2 100\ncpu,region=west user=21.0 150\ndisk,region=east bytes=99i 200")
                 .map(|l| l.unwrap())
                 .collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         // Cover all times
         let predicate = PredicateBuilder::default().timestamp_range(0, 201).build();
@@ -1189,10 +1096,16 @@ mod tests {
         )
         .map(|l| l.unwrap())
         .collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
-        let chunks = db.table_to_arrow("cpu", &["region", "core"]).await?;
-        let columns = chunks[0].columns();
+        let partition_key = "1970-01-01T00";
+
+        let chunk = db.get_chunk(partition_key, 0).await.unwrap();
+        let mut batches = Vec::new();
+        chunk
+            .table_to_arrow(&mut batches, "cpu", &["region", "core"])
+            .unwrap();
+        let columns = batches[0].columns();
 
         assert_eq!(
             2,
@@ -1233,9 +1146,9 @@ mod tests {
         let lines: Vec<_> = parse_lines("cpu,region=west,host=A user=23.2,other=1i 10")
             .map(|l| l.unwrap())
             .collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
-        let results = db.query("select * from cpu").await?;
+        let results = run_sql_query(&db, "select * from cpu").await;
 
         let expected_cpu_table = &[
             "+------+-------+--------+------+------+",
@@ -1246,21 +1159,6 @@ mod tests {
         ];
 
         assert_table_eq!(expected_cpu_table, &results);
-
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn db_partition_key() -> Result {
-        let partition_keys: Vec<_> = parse_lines(
-            "\
-cpu user=23.2 1600107710000000000
-disk bytes=23432323i 1600136510000000000",
-        )
-        .map(|line| compute_partition_key(&line.unwrap()))
-        .collect();
-
-        assert_eq!(partition_keys, vec!["2020-09-14T18", "2020-09-15T02"]);
 
         Ok(())
     }
@@ -1278,7 +1176,7 @@ disk bytes=23432323i 1600136510000000000",
                        o2,state=NY,city=NYC,borough=Brooklyn temp=61.0 600\n";
 
         let lines: Vec<_> = parse_lines(lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         #[derive(Debug)]
         struct TestCase<'a> {
@@ -1403,7 +1301,7 @@ disk bytes=23432323i 1600136510000000000",
                        o2,state=NY,city=NYC,borough=Brooklyn temp=60.8 400\n";
 
         let lines: Vec<_> = parse_lines(lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         // Predicate: state=MA
         let expr = col("state").eq(lit("MA"));
@@ -1436,7 +1334,7 @@ disk bytes=23432323i 1600136510000000000",
                        o2,state=NY temp=60.8 400\n";
 
         let lines: Vec<_> = parse_lines(lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         #[derive(Debug)]
         struct TestCase<'a> {
@@ -1600,7 +1498,7 @@ disk bytes=23432323i 1600136510000000000",
         let lp_data = lp_lines.join("\n");
 
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         let predicate = Predicate::default();
 
@@ -1672,7 +1570,7 @@ disk bytes=23432323i 1600136510000000000",
         let lp_data = lp_lines.join("\n");
 
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         // filter out one row in h20
         let predicate = PredicateBuilder::default()
@@ -1717,7 +1615,7 @@ disk bytes=23432323i 1600136510000000000",
         let lp_data = lp_lines.join("\n");
 
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         let predicate = PredicateBuilder::default()
             .add_expr(col("tag_not_in_h20").eq(lit("foo")))
@@ -1776,7 +1674,7 @@ disk bytes=23432323i 1600136510000000000",
         let lp_data = lp_lines.join("\n");
 
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await.unwrap();
+        write_lines(&db, &lines).await;
 
         let predicate = PredicateBuilder::default()
             .add_expr(col("state").not_eq(lit("MA")))
@@ -1801,9 +1699,9 @@ disk bytes=23432323i 1600136510000000000",
         .join("\n");
 
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
-        // write a new lp_line that is in a new day and thus a new chunk
+        // write a new lp_line that is in a new day and thus a new partititon
         let nanoseconds_per_day: i64 = 1_000_000_000 * 60 * 60 * 24;
 
         let lp_data = vec![format!(
@@ -1812,7 +1710,7 @@ disk bytes=23432323i 1600136510000000000",
         )]
         .join("\n");
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         // ensure there are 2 chunks
         assert_eq!(db.len().await, 2);
@@ -1832,7 +1730,7 @@ disk bytes=23432323i 1600136510000000000",
             .expect("Created field_columns plan successfully");
 
         let fieldlists = executor
-            .to_fieldlist(plan)
+            .to_field_list(plan)
             .await
             .expect("Running fieldlist plan");
         assert!(fieldlists.fields.is_empty());
@@ -1849,7 +1747,7 @@ disk bytes=23432323i 1600136510000000000",
             .expect("Created field_columns plan successfully");
 
         let actual = executor
-            .to_fieldlist(plan)
+            .to_field_list(plan)
             .await
             .expect("Running fieldlist plan");
 
@@ -1896,7 +1794,7 @@ disk bytes=23432323i 1600136510000000000",
         .join("\n");
 
         let lines: Vec<_> = parse_lines(&lp_data).map(|l| l.unwrap()).collect();
-        db.write_lines(&lines).await?;
+        write_lines(&db, &lines).await;
 
         // setup to run the execution plan (
         let executor = Executor::default();
@@ -1913,7 +1811,7 @@ disk bytes=23432323i 1600136510000000000",
             .expect("Created field_columns plan successfully");
 
         let actual = executor
-            .to_fieldlist(plan)
+            .to_field_list(plan)
             .await
             .expect("Running fieldlist plan");
 
@@ -1979,5 +1877,20 @@ disk bytes=23432323i 1600136510000000000",
         println!("The results are: {:#?}", results);
 
         results
+    }
+
+    /// write lines into this database
+    async fn write_lines(database: &MutableBufferDb, lines: &[ParsedLine<'_>]) {
+        let mut writer = query::test::TestLPWriter::default();
+        writer.write_lines(database, lines).await.unwrap()
+    }
+
+    async fn run_sql_query(database: &MutableBufferDb, query: &str) -> Vec<RecordBatch> {
+        let planner = SQLQueryPlanner::default();
+        let executor = Executor::new();
+
+        let physical_plan = planner.query(database, query, &executor).await.unwrap();
+
+        collect(physical_plan).await.unwrap()
     }
 }

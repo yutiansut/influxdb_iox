@@ -18,6 +18,7 @@
 // - Stopping the server after all relevant tests are run
 
 use assert_cmd::prelude::*;
+use data_types::database_rules::DatabaseRules;
 use futures::prelude::*;
 use generated_types::{
     aggregate::AggregateType,
@@ -98,6 +99,24 @@ async fn read_and_write_data() -> Result<()> {
 
     let client = reqwest::Client::new();
     let client2 = influxdb2_client::Client::new(HTTP_BASE, TOKEN);
+
+    let rules = DatabaseRules {
+        store_locally: true,
+        ..Default::default()
+    };
+    let data = serde_json::to_vec(&rules).unwrap();
+
+    let database_name = format!("{}_{}", org_id_str, bucket_id_str);
+
+    client
+        .put(&format!(
+            "{}/iox/api/v1/databases/{}",
+            HTTP_BASE, &database_name
+        ))
+        .body(data)
+        .send()
+        .await
+        .unwrap();
 
     let start_time = SystemTime::now();
     let ns_since_epoch: i64 = start_time
@@ -425,7 +444,7 @@ async fn test_http_error_messages(client: &influxdb2_client::Client) -> Result<(
         .await
         .expect_err("Should have errored");
 
-    let expected_error = "HTTP request returned an error: 400 Bad Request, `{\"error\":\"Error parsing line protocol: A generic parsing error occurred: TakeWhile1\"}`";
+    let expected_error = "HTTP request returned an error: 400 Bad Request, `{\"error\":\"Error parsing line protocol: A generic parsing error occurred: TakeWhile1\",\"error_code\":100}`";
     assert_eq!(result.to_string(), expected_error);
 
     Ok(())
@@ -847,8 +866,6 @@ impl TestServer {
         let server_process = Command::cargo_bin("influxdb_iox")?
             // Can enable for debbugging
             //.arg("-vv")
-            // ignore any config file in the user's home directory
-            .arg("--ignore-config-file")
             .env("INFLUXDB_IOX_DB_DIR", dir.path())
             .env("INFLUXDB_IOX_ID", "1")
             .spawn()?;
@@ -866,8 +883,6 @@ impl TestServer {
         self.server_process = Command::cargo_bin("influxdb_iox")?
             // Can enable for debbugging
             //.arg("-vv")
-            // ignore any config file in the user's home directory
-            .arg("--ignore-config-file")
             .env("INFLUXDB_IOX_DB_DIR", self.dir.path())
             .env("INFLUXDB_IOX_ID", "1")
             .spawn()?;

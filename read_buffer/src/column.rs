@@ -5,7 +5,9 @@ pub mod fixed_null;
 
 use std::collections::BTreeSet;
 use std::convert::TryFrom;
+use std::sync::Arc;
 
+use arrow::array;
 use croaring::Bitmap;
 
 use arrow_deps::{arrow, arrow::array::Array};
@@ -20,6 +22,7 @@ use either::Either;
 // it's how many run-lengths would be produced in an RLE column and whether that
 // compression is worth the memory and compute costs to work on it.
 pub const TEMP_CARDINALITY_DICTIONARY_ENCODING_LIMIT: usize = 100_000;
+
 /// The possible logical types that column values can have. All values in a
 /// column have the same physical type.
 pub enum Column {
@@ -60,6 +63,18 @@ impl Column {
             Column::Unsigned(meta, _) => meta.rows,
             Column::Bool => todo!(),
             Column::ByteArray(meta, _) => meta.rows,
+        }
+    }
+
+    /// Returns the logical data-type associated with the column.
+    pub fn logical_datatype(&self) -> LogicalDataType {
+        match self {
+            Column::String(_, _) => LogicalDataType::String,
+            Column::Float(_, _) => LogicalDataType::Float,
+            Column::Integer(_, _) => LogicalDataType::Integer,
+            Column::Unsigned(_, _) => LogicalDataType::Unsigned,
+            Column::Bool => LogicalDataType::Boolean,
+            Column::ByteArray(_, _) => LogicalDataType::Binary,
         }
     }
 
@@ -594,6 +609,30 @@ pub struct ColumnProperties {
     pub has_pre_computed_row_ids: bool,
 }
 
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+/// The logical data-type for a column.
+pub enum LogicalDataType {
+    Integer,  // Signed integer
+    Unsigned, // Unsigned integer
+    Float,    //
+    String,   // UTF-8 valid string
+    Binary,   // Arbitrary collection of bytes
+    Boolean,  //
+}
+
+impl LogicalDataType {
+    pub fn to_arrow_datatype(&self) -> arrow::datatypes::DataType {
+        match &self {
+            LogicalDataType::Integer => arrow::datatypes::DataType::Int64,
+            LogicalDataType::Unsigned => arrow::datatypes::DataType::UInt64,
+            LogicalDataType::Float => arrow::datatypes::DataType::Float64,
+            LogicalDataType::String => arrow::datatypes::DataType::Utf8,
+            LogicalDataType::Binary => arrow::datatypes::DataType::Binary,
+            LogicalDataType::Boolean => arrow::datatypes::DataType::Boolean,
+        }
+    }
+}
+
 #[derive(Default, Debug, PartialEq)]
 // The meta-data for a column
 pub struct MetaData<T>
@@ -808,14 +847,7 @@ impl StringEncoding {
         }
     }
 
-    fn from_arrow_string_array(arr: arrow::array::StringArray) -> Self {
-        //
-        // TODO(edd): potentially switch on things like cardinality in the input
-        // and encode in different ways. Right now we only encode with RLE.
-        //
-
-        // RLE creation.
-
+    fn from_arrow_string_array(arr: &arrow::array::StringArray) -> Self {
         // build a sorted dictionary.
         let mut dictionary = BTreeSet::new();
 
@@ -1052,8 +1084,9 @@ pub enum IntegerEncoding {
 
     // TODO - add all the other possible integer combinations.
 
-    // Nullable encodings - TODO
+    // Nullable encodings - TODO, add variants for smaller physical types.
     I64I64N(fixed_null::FixedNull<arrow::datatypes::Int64Type>),
+    U64U64N(fixed_null::FixedNull<arrow::datatypes::UInt64Type>),
 }
 
 impl IntegerEncoding {
@@ -1090,6 +1123,10 @@ impl IntegerEncoding {
                 Some(v) => Value::Scalar(Scalar::I64(v)),
                 None => Value::Null,
             },
+            Self::U64U64N(c) => match c.value(row_id) {
+                Some(v) => Value::Scalar(Scalar::U64(v)),
+                None => Value::Null,
+            },
         }
     }
 
@@ -1115,6 +1152,7 @@ impl IntegerEncoding {
             Self::U64U8(c) => Values::U64(c.values::<u64>(row_ids, vec![])),
 
             Self::I64I64N(c) => Values::I64N(c.values(row_ids, vec![])),
+            Self::U64U64N(c) => Values::U64N(c.values(row_ids, vec![])),
         }
     }
 
@@ -1140,6 +1178,7 @@ impl IntegerEncoding {
             Self::U64U8(c) => Values::U64(c.all_values::<u64>(vec![])),
 
             Self::I64I64N(c) => Values::I64N(c.all_values(vec![])),
+            Self::U64U64N(c) => Values::U64N(c.all_values(vec![])),
         }
     }
 
@@ -1206,6 +1245,7 @@ impl IntegerEncoding {
             Self::U64U8(c) => c.row_ids_filter(value.as_u8(), op, dst),
 
             Self::I64I64N(c) => c.row_ids_filter(value.as_i64(), op, dst),
+            Self::U64U64N(c) => c.row_ids_filter(value.as_u64(), op, dst),
         }
     }
 
@@ -1257,6 +1297,7 @@ impl IntegerEncoding {
             }
 
             Self::I64I64N(c) => todo!(),
+            Self::U64U64N(c) => todo!(),
         }
     }
 
@@ -1275,6 +1316,10 @@ impl IntegerEncoding {
             IntegerEncoding::U64U8(c) => Value::Scalar(Scalar::U64(c.min(row_ids))),
             IntegerEncoding::I64I64N(c) => match c.min(row_ids) {
                 Some(v) => Value::Scalar(Scalar::I64(v)),
+                None => Value::Null,
+            },
+            IntegerEncoding::U64U64N(c) => match c.min(row_ids) {
+                Some(v) => Value::Scalar(Scalar::U64(v)),
                 None => Value::Null,
             },
         }
@@ -1297,6 +1342,10 @@ impl IntegerEncoding {
                 Some(v) => Value::Scalar(Scalar::I64(v)),
                 None => Value::Null,
             },
+            IntegerEncoding::U64U64N(c) => match c.max(row_ids) {
+                Some(v) => Value::Scalar(Scalar::U64(v)),
+                None => Value::Null,
+            },
         }
     }
 
@@ -1317,6 +1366,10 @@ impl IntegerEncoding {
                 Some(v) => Scalar::I64(v),
                 None => Scalar::Null,
             },
+            IntegerEncoding::U64U64N(c) => match c.sum(row_ids) {
+                Some(v) => Scalar::U64(v),
+                None => Scalar::Null,
+            },
         }
     }
 
@@ -1334,12 +1387,14 @@ impl IntegerEncoding {
             IntegerEncoding::U64U16(c) => c.count(row_ids),
             IntegerEncoding::U64U8(c) => c.count(row_ids),
             IntegerEncoding::I64I64N(c) => c.count(row_ids),
+            IntegerEncoding::U64U64N(c) => c.count(row_ids),
         }
     }
 }
 
 pub enum FloatEncoding {
-    Fixed64(fixed::Fixed<f64>), // TODO(edd): encodings for nullable columns
+    Fixed64(fixed::Fixed<f64>),
+    FixedNull64(fixed_null::FixedNull<arrow::datatypes::Float64Type>),
 }
 
 impl FloatEncoding {
@@ -1354,6 +1409,10 @@ impl FloatEncoding {
     pub fn value(&self, row_id: u32) -> Value<'_> {
         match &self {
             Self::Fixed64(c) => Value::Scalar(Scalar::F64(c.value(row_id))),
+            Self::FixedNull64(c) => match c.value(row_id) {
+                Some(v) => Value::Scalar(Scalar::F64(v)),
+                None => Value::Null,
+            },
         }
     }
 
@@ -1363,6 +1422,7 @@ impl FloatEncoding {
     pub fn values(&self, row_ids: &[u32]) -> Values<'_> {
         match &self {
             Self::Fixed64(c) => Values::F64(c.values::<f64>(row_ids, vec![])),
+            Self::FixedNull64(c) => Values::F64N(c.values(row_ids, vec![])),
         }
     }
 
@@ -1372,6 +1432,7 @@ impl FloatEncoding {
     pub fn all_values(&self) -> Values<'_> {
         match &self {
             Self::Fixed64(c) => Values::F64(c.all_values::<f64>(vec![])),
+            Self::FixedNull64(c) => Values::F64N(c.all_values(vec![])),
         }
     }
 
@@ -1382,7 +1443,8 @@ impl FloatEncoding {
     /// `row_ids_filter` will panic if this invariant is broken.
     pub fn row_ids_filter(&self, op: &cmp::Operator, value: &Scalar, dst: RowIDs) -> RowIDs {
         match &self {
-            FloatEncoding::Fixed64(c) => c.row_ids_filter(value.as_f64(), op, dst),
+            Self::Fixed64(c) => c.row_ids_filter(value.as_f64(), op, dst),
+            Self::FixedNull64(c) => c.row_ids_filter(value.as_f64(), op, dst),
         }
     }
 
@@ -1401,30 +1463,44 @@ impl FloatEncoding {
             FloatEncoding::Fixed64(c) => {
                 c.row_ids_filter_range((low.1.as_f64(), &low.0), (high.1.as_f64(), &high.0), dst)
             }
+            FloatEncoding::FixedNull64(c) => todo!(),
         }
     }
 
     pub fn min(&self, row_ids: &[u32]) -> Value<'_> {
         match &self {
             FloatEncoding::Fixed64(c) => Value::Scalar(Scalar::F64(c.min(row_ids))),
+            FloatEncoding::FixedNull64(c) => match c.min(row_ids) {
+                Some(v) => Value::Scalar(Scalar::F64(v)),
+                None => Value::Null,
+            },
         }
     }
 
     pub fn max(&self, row_ids: &[u32]) -> Value<'_> {
         match &self {
             FloatEncoding::Fixed64(c) => Value::Scalar(Scalar::F64(c.max(row_ids))),
+            FloatEncoding::FixedNull64(c) => match c.max(row_ids) {
+                Some(v) => Value::Scalar(Scalar::F64(v)),
+                None => Value::Null,
+            },
         }
     }
 
     pub fn sum(&self, row_ids: &[u32]) -> Scalar {
         match &self {
             FloatEncoding::Fixed64(c) => Scalar::F64(c.sum(row_ids)),
+            FloatEncoding::FixedNull64(c) => match c.sum(row_ids) {
+                Some(v) => Scalar::F64(v),
+                None => Scalar::Null,
+            },
         }
     }
 
     pub fn count(&self, row_ids: &[u32]) -> u32 {
         match &self {
             FloatEncoding::Fixed64(c) => c.count(row_ids),
+            FloatEncoding::FixedNull64(c) => c.count(row_ids),
         }
     }
 }
@@ -1438,6 +1514,13 @@ impl FloatEncoding {
 // ideally it's a "write once read many" scenario.
 impl From<arrow::array::StringArray> for Column {
     fn from(arr: arrow::array::StringArray) -> Self {
+        let data = StringEncoding::from_arrow_string_array(&arr);
+        Column::String(StringEncoding::meta_from_data(&data), data)
+    }
+}
+
+impl From<&arrow::array::StringArray> for Column {
+    fn from(arr: &arrow::array::StringArray) -> Self {
         let data = StringEncoding::from_arrow_string_array(arr);
         Column::String(StringEncoding::meta_from_data(&data), data)
     }
@@ -1524,6 +1607,71 @@ impl From<&[u64]> for Column {
                 Column::Unsigned(meta, IntegerEncoding::U64U64(data))
             }
         }
+    }
+}
+
+impl From<arrow::array::UInt64Array> for Column {
+    fn from(arr: arrow::array::UInt64Array) -> Self {
+        if arr.null_count() == 0 {
+            return Self::from(arr.values());
+        }
+
+        // determine min and max values.
+        let mut min: Option<u64> = None;
+        let mut max: Option<u64> = None;
+
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+
+            let v = arr.value(i);
+            match min {
+                Some(m) => {
+                    if v < m {
+                        min = Some(v);
+                    }
+                }
+                None => min = Some(v),
+            };
+
+            match max {
+                Some(m) => {
+                    if v > m {
+                        max = Some(v)
+                    }
+                }
+                None => max = Some(v),
+            };
+        }
+
+        let range = match (min, max) {
+            (None, None) => None,
+            (Some(min), Some(max)) => Some((min, max)),
+            _ => unreachable!("min/max must both be Some or None"),
+        };
+
+        let data = fixed_null::FixedNull::<arrow::datatypes::UInt64Type>::from(arr);
+        let meta = MetaData {
+            size: data.size(),
+            rows: data.num_rows(),
+            range,
+            ..MetaData::default()
+        };
+
+        // TODO(edd): currently fixed null only supports 64-bit logical/physical
+        // types. Need to add support for storing as smaller physical types.
+        Column::Unsigned(meta, IntegerEncoding::U64U64N(data))
+    }
+}
+
+impl From<&arrow::array::UInt64Array> for Column {
+    fn from(arr: &arrow::array::UInt64Array) -> Self {
+        if arr.null_count() == 0 {
+            return Self::from(arr.values());
+        }
+
+        todo!("figure out how to run off of a borrowed arrow array");
     }
 }
 
@@ -1747,6 +1895,71 @@ impl From<&[i64]> for Column {
     }
 }
 
+impl From<arrow::array::Int64Array> for Column {
+    fn from(arr: arrow::array::Int64Array) -> Self {
+        if arr.null_count() == 0 {
+            return Self::from(arr.values());
+        }
+
+        // determine min and max values.
+        let mut min: Option<i64> = None;
+        let mut max: Option<i64> = None;
+
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+
+            let v = arr.value(i);
+            match min {
+                Some(m) => {
+                    if v < m {
+                        min = Some(v);
+                    }
+                }
+                None => min = Some(v),
+            };
+
+            match max {
+                Some(m) => {
+                    if v > m {
+                        max = Some(v)
+                    }
+                }
+                None => max = Some(v),
+            };
+        }
+
+        let range = match (min, max) {
+            (None, None) => None,
+            (Some(min), Some(max)) => Some((min, max)),
+            _ => unreachable!("min/max must both be Some or None"),
+        };
+
+        let data = fixed_null::FixedNull::<arrow::datatypes::Int64Type>::from(arr);
+        let meta = MetaData {
+            size: data.size(),
+            rows: data.num_rows(),
+            range,
+            ..MetaData::default()
+        };
+
+        // TODO(edd): currently fixed null only supports 64-bit logical/physical
+        // types. Need to add support for storing as smaller physical types.
+        Column::Integer(meta, IntegerEncoding::I64I64N(data))
+    }
+}
+
+impl From<&arrow::array::Int64Array> for Column {
+    fn from(arr: &arrow::array::Int64Array) -> Self {
+        if arr.null_count() == 0 {
+            return Self::from(arr.values());
+        }
+
+        todo!("figure out how to run off of a borrowed arrow array");
+    }
+}
+
 /// Converts a slice of i32 values into the most compact fixed-width physical
 /// encoding. Whilst `i32` isn't a supported logical type it is still possible
 /// to store these values as logically `i64` values with `i32`, `i16`, `u16`,
@@ -1901,11 +2114,38 @@ impl From<&[i8]> for Column {
     }
 }
 
-impl From<arrow::array::Int64Array> for Column {
-    fn from(arr: arrow::array::Int64Array) -> Self {
+/// Converts a slice of `f64` values into a fixed-width column encoding.
+impl From<&[f64]> for Column {
+    fn from(arr: &[f64]) -> Self {
         // determine min and max values.
-        let mut min: Option<i64> = None;
-        let mut max: Option<i64> = None;
+        let mut min = arr[0];
+        let mut max = arr[0];
+        for &v in arr.iter().skip(1) {
+            min = min.min(v);
+            max = max.max(v);
+        }
+
+        let data = fixed::Fixed::<f64>::from(arr);
+        let meta = MetaData {
+            size: data.size(),
+            rows: data.num_rows(),
+            range: Some((min, max)),
+            ..MetaData::default()
+        };
+
+        Column::Float(meta, FloatEncoding::Fixed64(data))
+    }
+}
+
+impl From<arrow::array::Float64Array> for Column {
+    fn from(arr: arrow::array::Float64Array) -> Self {
+        if arr.null_count() == 0 {
+            return Self::from(arr.values());
+        }
+
+        // determine min and max values.
+        let mut min: Option<f64> = None;
+        let mut max: Option<f64> = None;
 
         for i in 0..arr.len() {
             if arr.is_null(i) {
@@ -1938,43 +2178,33 @@ impl From<arrow::array::Int64Array> for Column {
             _ => unreachable!("min/max must both be Some or None"),
         };
 
-        let data = fixed_null::FixedNull::<arrow::datatypes::Int64Type>::from(arr);
+        let data = fixed_null::FixedNull::<arrow::datatypes::Float64Type>::from(arr);
         let meta = MetaData {
             size: data.size(),
             rows: data.num_rows(),
             range,
             ..MetaData::default()
         };
-        Column::Integer(meta, IntegerEncoding::I64I64N(data))
+
+        // TODO(edd): currently fixed null only supports 64-bit logical/physical
+        // types. Need to add support for storing as smaller physical types.
+        Column::Float(meta, FloatEncoding::FixedNull64(data))
     }
 }
 
-/// Converts a slice of `f64` values into a fixed-width column encoding.
-impl From<&[f64]> for Column {
-    fn from(arr: &[f64]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
+impl From<&arrow::array::Float64Array> for Column {
+    fn from(arr: &arrow::array::Float64Array) -> Self {
+        if arr.null_count() == 0 {
+            return Self::from(arr.values());
         }
 
-        let data = fixed::Fixed::<f64>::from(arr);
-        let meta = MetaData {
-            size: data.size(),
-            rows: data.num_rows(),
-            range: Some((min, max)),
-            ..MetaData::default()
-        };
-
-        Column::Float(meta, FloatEncoding::Fixed64(data))
+        todo!("figure out how to run off of a borrowed arrow array");
     }
 }
 
 /// These variants describe supported aggregates that can applied to columnar
 /// data.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Debug)]
 pub enum AggregateType {
     Count,
     First,
@@ -2016,9 +2246,6 @@ pub enum AggregateResult<'a> {
     // Only numerical columns with scalar values can be summed. NULL values do
     // not contribute to the sum, but if all rows are NULL then the sum is
     // itself NULL (represented by `None`).
-    //
-    // TODO(edd): I might explicitly add a Null variant to the Scalar enum like
-    // we have with Value...
     Sum(Scalar),
 
     // The minimum value in the column data.
@@ -2411,6 +2638,15 @@ macro_rules! scalar_from_impls {
                     Self::Scalar(Scalar::$variant(v))
                 }
             }
+
+            impl From<Option<$type>> for Value<'_> {
+                fn from(v: Option<$type>) -> Self {
+                    match v {
+                        Some(v) => Self::Scalar(Scalar::$variant(v)),
+                        None => Self::Null,
+                    }
+                }
+            }
         )*
     };
 }
@@ -2418,7 +2654,7 @@ macro_rules! scalar_from_impls {
 scalar_from_impls! {
     (I64, i64),
     (U64, u64),
-    (F64,f64),
+    (F64, f64),
 }
 
 /// Each variant is a typed vector of materialised values for a column.
@@ -2445,15 +2681,15 @@ pub enum Values<'a> {
 impl<'a> Values<'a> {
     pub fn len(&self) -> usize {
         match &self {
-            Values::String(c) => c.len(),
-            Values::I64(c) => c.len(),
-            Values::U64(c) => c.len(),
-            Values::F64(c) => c.len(),
-            Values::Bool(c) => c.len(),
-            Values::ByteArray(c) => c.len(),
-            Values::I64N(c) => c.len(),
-            Values::U64N(c) => c.len(),
-            Values::F64N(c) => c.len(),
+            Self::String(c) => c.len(),
+            Self::I64(c) => c.len(),
+            Self::U64(c) => c.len(),
+            Self::F64(c) => c.len(),
+            Self::Bool(c) => c.len(),
+            Self::ByteArray(c) => c.len(),
+            Self::I64N(c) => c.len(),
+            Self::U64N(c) => c.len(),
+            Self::F64N(c) => c.len(),
         }
     }
 
@@ -2463,33 +2699,50 @@ impl<'a> Values<'a> {
 
     pub fn value(&self, i: usize) -> Value<'a> {
         match &self {
-            Values::String(c) => match c[i] {
+            Self::String(c) => match c[i] {
                 Some(v) => Value::String(v),
                 None => Value::Null,
             },
-            Values::F64(c) => Value::Scalar(Scalar::F64(c[i])),
-            Values::I64(c) => Value::Scalar(Scalar::I64(c[i])),
-            Values::U64(c) => Value::Scalar(Scalar::U64(c[i])),
-            Values::Bool(c) => match c[i] {
+            Self::F64(c) => Value::Scalar(Scalar::F64(c[i])),
+            Self::I64(c) => Value::Scalar(Scalar::I64(c[i])),
+            Self::U64(c) => Value::Scalar(Scalar::U64(c[i])),
+            Self::Bool(c) => match c[i] {
                 Some(v) => Value::Boolean(v),
                 None => Value::Null,
             },
-            Values::ByteArray(c) => match c[i] {
+            Self::ByteArray(c) => match c[i] {
                 Some(v) => Value::ByteArray(v),
                 None => Value::Null,
             },
-            Values::I64N(c) => match c[i] {
+            Self::I64N(c) => match c[i] {
                 Some(v) => Value::Scalar(Scalar::I64(v)),
                 None => Value::Null,
             },
-            Values::U64N(c) => match c[i] {
+            Self::U64N(c) => match c[i] {
                 Some(v) => Value::Scalar(Scalar::U64(v)),
                 None => Value::Null,
             },
-            Values::F64N(c) => match c[i] {
+            Self::F64N(c) => match c[i] {
                 Some(v) => Value::Scalar(Scalar::F64(v)),
                 None => Value::Null,
             },
+        }
+    }
+}
+
+/// Moves ownership of Values into an arrow `ArrayRef`.
+impl From<Values<'_>> for array::ArrayRef {
+    fn from(values: Values<'_>) -> Self {
+        match values {
+            Values::String(values) => Arc::new(arrow::array::StringArray::from(values)),
+            Values::I64(values) => Arc::new(arrow::array::Int64Array::from(values)),
+            Values::U64(values) => Arc::new(arrow::array::UInt64Array::from(values)),
+            Values::F64(values) => Arc::new(arrow::array::Float64Array::from(values)),
+            Values::I64N(values) => Arc::new(arrow::array::Int64Array::from(values)),
+            Values::U64N(values) => Arc::new(arrow::array::UInt64Array::from(values)),
+            Values::F64N(values) => Arc::new(arrow::array::Float64Array::from(values)),
+            Values::Bool(values) => Arc::new(arrow::array::BooleanArray::from(values)),
+            Values::ByteArray(values) => Arc::new(arrow::array::BinaryArray::from(values)),
         }
     }
 }

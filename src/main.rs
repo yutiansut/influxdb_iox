@@ -1,19 +1,17 @@
 //! Entrypoint of InfluxDB IOx binary
 #![deny(rust_2018_idioms)]
 #![warn(
-    missing_copy_implementations,
     missing_debug_implementations,
     clippy::explicit_iter_loop,
     clippy::use_self
 )]
 
 use clap::{crate_authors, crate_version, value_t, App, Arg, ArgMatches, SubCommand};
+use dotenv::dotenv;
 use ingest::parquet::writer::CompressionLevel;
+use structopt::StructOpt;
 use tokio::runtime::Runtime;
 use tracing::{debug, error, info, warn};
-
-mod panic;
-pub mod server;
 
 mod commands {
     pub mod config;
@@ -21,11 +19,11 @@ mod commands {
     pub mod file_meta;
     mod input;
     pub mod logging;
-    pub mod server;
     pub mod stats;
 }
+pub mod influxdb_ioxd;
 
-use commands::logging::LoggingLevel;
+use commands::{config::Config, logging::LoggingLevel};
 
 enum ReturnCode {
     ConversionFailed = 1,
@@ -41,8 +39,8 @@ Examples:
     # Run the InfluxDB IOx server:
     influxdb_iox
 
-    # Display all current config settings
-    influxdb_iox config show
+    # Display all server settings
+    influxdb_iox server --help
 
     # Run the InfluxDB IOx server with extra verbose logging
     influxdb_iox -v
@@ -59,6 +57,8 @@ Examples:
     # Dumps storage statistics about out.parquet to stdout
     influxdb_iox stats out.parquet
 "#;
+    // load all environment variables from .env before doing anything
+    load_dotenv();
 
     let matches = App::new(help)
         .version(crate_version!())
@@ -121,15 +121,8 @@ Examples:
                         .help("Include detailed information per file")
                 ),
         )
-        .subcommand(
-            SubCommand::with_name("config")
-                .about("Configuration display and manipulation")
-                .subcommand(SubCommand::with_name("show").help("show current configuration information"))
-                .subcommand(SubCommand::with_name("help").help("explain detailed configuration options"))
-        )
          .subcommand(
-            SubCommand::with_name("server")
-                .about("Runs in server mode (default)")
+            commands::config::Config::clap(),
         )
         .arg(Arg::with_name("verbose").short("v").long("verbose").multiple(true).help(
             "Enables verbose logging (use 'vv' for even more verbosity). You can also set log level via \
@@ -137,9 +130,6 @@ Examples:
         ))
         .arg(Arg::with_name("num-threads").long("num-threads").takes_value(true).help(
             "Set the maximum number of threads to use. Defaults to the number of cores on the system",
-        ))
-        .arg(Arg::with_name("ignore-config-file").long("ignore-config-file").takes_value(false).help(
-            "If specified, ignores the default configuration file, if any. Configuration is read from the environment only",
         ))
         .get_matches();
 
@@ -157,8 +147,6 @@ async fn dispatch_args(matches: ArgMatches<'_>) {
     // 2. if `-v` (single instances of verbose), use DEFAULT_VERBOSE_LOG_LEVEL
     // 3. Otherwise use DEFAULT_LOG_LEVEL
     let logging_level = LoggingLevel::new(matches.occurrences_of("verbose"));
-
-    let ignore_config_file = matches.occurrences_of("ignore-config-file") > 0;
 
     match matches.subcommand() {
         ("convert", Some(sub_matches)) => {
@@ -202,24 +190,26 @@ async fn dispatch_args(matches: ArgMatches<'_>) {
                 }
             }
         }
-        ("config", Some(sub_matches)) => {
-            logging_level.setup_basic_logging();
-            match sub_matches.subcommand() {
-                ("show", _) => commands::config::show_config(ignore_config_file),
-                ("help", _) => commands::config::describe_config(ignore_config_file),
-                (command, _) => panic!("Unknown subcommand for config: {}", command),
-            }
-        }
-        ("server", Some(_)) | (_, _) => {
+        // Handle the case where the user explicitly specified the server command
+        ("server", Some(sub_matches)) => {
             // Note don't set up basic logging here, different logging rules appy in server
             // mode
-            println!("InfluxDB IOx server starting");
-            match commands::server::main(logging_level, ignore_config_file).await {
-                Ok(()) => eprintln!("Shutdown OK"),
-                Err(e) => {
-                    error!("Server shutdown with error: {}", e);
-                    std::process::exit(ReturnCode::ServerExitedAbnormally as _);
-                }
+            let res =
+                influxdb_ioxd::main(logging_level, Some(Config::from_clap(sub_matches))).await;
+
+            if let Err(e) = res {
+                error!("Server shutdown with error: {}", e);
+                std::process::exit(ReturnCode::ServerExitedAbnormally as _);
+            }
+        }
+        // handle the case where the user didn't specify a command
+        (_, _) => {
+            // Note don't set up basic logging here, different logging rules appy in server
+            // mode
+            let res = influxdb_ioxd::main(logging_level, None).await;
+            if let Err(e) = res {
+                error!("Server shutdown with error: {}", e);
+                std::process::exit(ReturnCode::ServerExitedAbnormally as _);
             }
         }
     }
@@ -269,4 +259,23 @@ fn get_runtime(num_threads: Option<&str>) -> Result<Runtime, std::io::Error> {
             }
         }
     }
+}
+
+/// Source the .env file before initialising the Config struct - this sets
+/// any envs in the file, which the Config struct then uses.
+///
+/// Precedence is given to existing env variables.
+fn load_dotenv() {
+    match dotenv() {
+        Ok(_) => {}
+        Err(dotenv::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
+            // Ignore this - a missing env file is not an error, defaults will
+            // be applied when initialising the Config struct.
+        }
+        Err(e) => {
+            eprintln!("FATAL Error loading config from: {}", e);
+            eprintln!("Aborting");
+            std::process::exit(1);
+        }
+    };
 }
