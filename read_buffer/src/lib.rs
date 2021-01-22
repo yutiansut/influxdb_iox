@@ -10,6 +10,7 @@ pub(crate) mod table;
 
 use std::{
     collections::{btree_map::Entry, BTreeMap, BTreeSet},
+    convert::TryInto,
     fmt,
     sync::Arc,
 };
@@ -19,11 +20,11 @@ use arrow_deps::arrow::{
     datatypes::{DataType::Utf8, Field, Schema},
     record_batch::RecordBatch,
 };
-use snafu::{ResultExt, Snafu};
+use snafu::{ensure, OptionExt, ResultExt, Snafu};
 
 // Identifiers that are exported as part of the public API.
-pub use column::AggregateType;
 pub use row_group::{BinaryExpr, Predicate};
+pub use schema::*;
 pub use table::ColumnSelection;
 
 use chunk::Chunk;
@@ -143,8 +144,17 @@ impl Database {
     }
 
     // Lists all partition keys with data for this database.
-    pub fn partition_keys(&mut self) -> Vec<&String> {
-        self.partitions.keys().collect::<Vec<_>>()
+    pub fn partition_keys(&self) -> Vec<&String> {
+        self.partitions.keys().collect()
+    }
+
+    /// Lists all chunk ids in the given partition key. Returns empty
+    /// `Vec` if no partition with the given key exists
+    pub fn chunk_ids(&self, partition_key: &str) -> Vec<u32> {
+        self.partitions
+            .get(partition_key)
+            .map(|partition| partition.chunk_ids())
+            .unwrap_or_default()
     }
 
     pub fn size(&self) -> u64 {
@@ -199,6 +209,13 @@ impl Database {
             Some(partition) => {
                 let mut chunks = vec![];
                 for chunk_id in chunk_ids {
+                    let chunk = partition
+                        .chunks
+                        .get(chunk_id)
+                        .context(ChunkNotFound { id: *chunk_id })?;
+
+                    ensure!(chunk.has_table(table_name), TableNotFound { table_name });
+
                     chunks.push(
                         partition
                             .chunks
@@ -444,6 +461,11 @@ impl Partition {
         };
     }
 
+    /// Return the chunk ids stored in this partition, in order of id
+    fn chunk_ids(&self) -> Vec<u32> {
+        self.chunks.keys().cloned().collect()
+    }
+
     fn chunks_by_ids(&self, ids: &[u32]) -> Result<Vec<&Chunk>> {
         let mut chunks = vec![];
         for chunk_id in ids {
@@ -484,6 +506,19 @@ pub struct ReadFilterResults<'input, 'chunk> {
     select_columns: table::ColumnSelection<'input>,
 }
 
+impl<'input, 'chunk> fmt::Debug for ReadFilterResults<'input, 'chunk> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReadFilterResults")
+            .field("chunks.len", &self.chunks.len())
+            .field("next_i", &self.next_i)
+            .field("curr_table_results", &"<OPAQUE>")
+            .field("table_name", &self.table_name)
+            .field("predicate", &self.predicate)
+            .field("select_columns", &self.select_columns)
+            .finish()
+    }
+}
+
 impl<'input, 'chunk> ReadFilterResults<'input, 'chunk> {
     fn new(
         chunks: Vec<&'chunk Chunk>,
@@ -512,10 +547,10 @@ impl<'input, 'chunk> Iterator for ReadFilterResults<'input, 'chunk> {
 
         // Try next chunk's table.
         if self.curr_table_results.is_none() {
-            self.curr_table_results = self.chunks[self.next_i].read_filter(
-                self.table_name,
-                &self.predicate,
-                &self.select_columns,
+            self.curr_table_results = Some(
+                self.chunks[self.next_i]
+                    .read_filter(self.table_name, &self.predicate, &self.select_columns)
+                    .unwrap(),
             );
         }
 
@@ -524,7 +559,10 @@ impl<'input, 'chunk> Iterator for ReadFilterResults<'input, 'chunk> {
             Some(table_results) => {
                 // Table has found results in a row group.
                 if let Some(row_group_result) = table_results.next() {
-                    return Some(row_group_result.record_batch());
+                    // it should not be possible for the conversion to record
+                    // batch to fail here
+                    let rb = row_group_result.try_into();
+                    return Some(rb.unwrap());
                 }
 
                 // no more results for row groups in the table. Try next chunk.

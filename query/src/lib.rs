@@ -41,16 +41,10 @@ pub trait Database: Debug + Send + Sync {
     /// Return the partition keys for data in this DB
     async fn partition_keys(&self) -> Result<Vec<String>, Self::Error>;
 
-    /// Return the table names that are in a given partition key
-    async fn table_names_for_partition(
-        &self,
-        partition_key: &str,
-    ) -> Result<Vec<String>, Self::Error>;
-
     /// Returns a covering set of chunks in the specified partition. A
     /// covering set means that together the chunks make up a single
     /// complete copy of the data being queried.
-    async fn chunks(&self, partition_key: &str) -> Result<Vec<Arc<Self::Chunk>>, Self::Error>;
+    async fn chunks(&self, partition_key: &str) -> Vec<Arc<Self::Chunk>>;
 
     // ----------
     // The functions below are slated for removal (migration into a gRPC query
@@ -161,32 +155,3 @@ pub trait DatabaseStore: Debug + Send + Sync {
 //
 //#[cfg(test)]
 pub mod test;
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_timestamp_range_contains() {
-        let range = TimestampRange::new(100, 200);
-        assert!(!range.contains(99));
-        assert!(range.contains(100));
-        assert!(range.contains(101));
-        assert!(range.contains(199));
-        assert!(!range.contains(200));
-        assert!(!range.contains(201));
-    }
-
-    #[test]
-    fn test_timestamp_range_contains_opt() {
-        let range = TimestampRange::new(100, 200);
-        assert!(!range.contains_opt(Some(99)));
-        assert!(range.contains_opt(Some(100)));
-        assert!(range.contains_opt(Some(101)));
-        assert!(range.contains_opt(Some(199)));
-        assert!(!range.contains_opt(Some(200)));
-        assert!(!range.contains_opt(Some(201)));
-
-        assert!(!range.contains_opt(None));
-    }
-}

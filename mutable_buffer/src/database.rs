@@ -1,4 +1,5 @@
 use generated_types::wal;
+use query::group_by::Aggregate;
 use query::group_by::GroupByAndAggregate;
 use query::group_by::WindowDuration;
 use query::{
@@ -6,7 +7,6 @@ use query::{
     predicate::Predicate,
     Database,
 };
-use query::{group_by::Aggregate, predicate::PredicateBuilder};
 
 use crate::column::Column;
 use crate::table::Table;
@@ -296,30 +296,14 @@ impl Database for MutableBufferDb {
         Ok(keys)
     }
 
-    /// Return all table names that are in a given partition key
-    async fn table_names_for_partition(
-        &self,
-        partition_key: &str,
-    ) -> Result<Vec<String>, Self::Error> {
-        let predicate = PredicateBuilder::default()
-            .partition_key(partition_key)
-            .build();
-        let mut filter = ChunkTableFilter::new(predicate);
-        let mut visitor = TableNameVisitor::new();
-        self.accept(&mut filter, &mut visitor).await?;
-        let names = visitor.into_inner().into_iter().collect();
-        Ok(names)
-    }
-
     /// Return the list of chunks, in order of id, for the specified
     /// partition_key
-    async fn chunks(&self, partition_key: &str) -> Result<Vec<Arc<Chunk>>> {
-        Ok(self
-            .get_partition(partition_key)
+    async fn chunks(&self, partition_key: &str) -> Vec<Arc<Chunk>> {
+        self.get_partition(partition_key)
             .await
             .read()
             .await
-            .chunks())
+            .chunks()
     }
 }
 
@@ -1000,7 +984,7 @@ mod tests {
         datafusion::{physical_plan::collect, prelude::*},
     };
     use influxdb_line_protocol::{parse_lines, ParsedLine};
-    use test_helpers::str_pair_vec_to_vec;
+    use test_helpers::{assert_contains, str_pair_vec_to_vec};
     use tokio::sync::mpsc;
 
     type TestError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -1660,9 +1644,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(
-        expected = "Unsupported binary operator in expression: #state NotEq Utf8(\"MA\")"
-    )]
     async fn test_query_series_pred_neq() {
         let db = MutableBufferDb::new("column_namedb");
 
@@ -1680,8 +1661,12 @@ mod tests {
             .add_expr(col("state").not_eq(lit("MA")))
             .build();
 
-        // Should panic as the neq path isn't implemented yet
-        db.query_series(predicate).await.unwrap();
+        // Should err as the neq path isn't implemented yet
+        let err = db.query_series(predicate).await.unwrap_err();
+        assert_contains!(
+            err.to_string(),
+            "Operator NotEq not yet supported in IOx MutableBuffer"
+        );
     }
 
     #[tokio::test]
