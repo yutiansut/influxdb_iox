@@ -1,16 +1,16 @@
 //! This module contains the main IOx Database object which has the
-//! instances of the immutable buffer, read buffer, and object store
+//! instances of the mutable buffer, read buffer, and object store
 
 use std::{
     collections::BTreeMap,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Mutex, RwLock,
+        Arc, Mutex,
     },
 };
 
 use async_trait::async_trait;
-use data_types::{data::ReplicatedWrite, database_rules::DatabaseRules};
+use data_types::{data::ReplicatedWrite, database_rules::DatabaseRules, selection::Selection};
 use mutable_buffer::MutableBufferDb;
 use query::{Database, PartitionChunk};
 use read_buffer::Database as ReadBufferDb;
@@ -22,6 +22,7 @@ use crate::buffer::Buffer;
 mod chunk;
 use chunk::DBChunk;
 pub mod pred;
+mod streams;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -82,9 +83,7 @@ pub struct Db {
     #[serde(skip)]
     /// The read buffer holds chunk data in an in-memory optimized
     /// format.
-    ///
-    /// TODO: finer grained locking see ticket https://github.com/influxdata/influxdb_iox/issues/669
-    pub read_buffer: Arc<RwLock<ReadBufferDb>>,
+    pub read_buffer: Arc<ReadBufferDb>,
 
     #[serde(skip)]
     /// The wal buffer holds replicated writes in an append in-memory
@@ -103,7 +102,7 @@ impl Db {
         wal_buffer: Option<Buffer>,
     ) -> Self {
         let wal_buffer = wal_buffer.map(Mutex::new);
-        let read_buffer = Arc::new(RwLock::new(read_buffer));
+        let read_buffer = Arc::new(read_buffer);
         Self {
             rules,
             mutable_buffer,
@@ -118,7 +117,6 @@ impl Db {
         if let Some(local_store) = self.mutable_buffer.as_ref() {
             local_store
                 .rollover_partition(partition_key)
-                .await
                 .context(RollingPartition)
                 .map(DBChunk::new_mb)
         } else {
@@ -145,8 +143,6 @@ impl Db {
     /// List chunks that are currently in the read buffer
     pub async fn read_buffer_chunks(&self, partition_key: &str) -> Vec<Arc<DBChunk>> {
         self.read_buffer
-            .read()
-            .expect("mutex poisoned")
             .chunk_ids(partition_key)
             .into_iter()
             .map(|chunk_id| DBChunk::new_rb(self.read_buffer.clone(), partition_key, chunk_id))
@@ -164,7 +160,6 @@ impl Db {
             .as_ref()
             .context(DatatbaseNotWriteable)?
             .drop_chunk(partition_key, chunk_id)
-            .await
             .map(DBChunk::new_mb)
             .context(MutableBufferDrop)
     }
@@ -177,8 +172,6 @@ impl Db {
         chunk_id: u32,
     ) -> Result<Arc<DBChunk>> {
         self.read_buffer
-            .write()
-            .expect("mutex poisoned")
             .drop_chunk(partition_key, chunk_id)
             .context(ReadBufferDrop)?;
 
@@ -212,20 +205,19 @@ impl Db {
             .as_ref()
             .context(DatatbaseNotWriteable)?
             .get_chunk(partition_key, chunk_id)
-            .await
             .context(UnknownMutableBufferChunk { chunk_id })?;
 
         let mut batches = Vec::new();
         for stats in mb_chunk.table_stats().unwrap() {
             mb_chunk
-                .table_to_arrow(&mut batches, &stats.name, &[])
+                .table_to_arrow(&mut batches, &stats.name, Selection::All)
                 .unwrap();
             for batch in batches.drain(..) {
                 // As implemented now, taking this write lock will wait
                 // until all reads to the read buffer to complete and
                 // then will block all reads while the insert is occuring
-                let mut read_buffer = self.read_buffer.write().expect("mutex poisoned");
-                read_buffer.upsert_partition(partition_key, mb_chunk.id(), &stats.name, batch)
+                self.read_buffer
+                    .upsert_partition(partition_key, mb_chunk.id(), &stats.name, batch)
             }
         }
 
@@ -283,18 +275,6 @@ impl Database for Db {
             .store_replicated_write(write)
             .await
             .context(MutableBufferWrite)
-    }
-
-    async fn table_names(
-        &self,
-        predicate: query::predicate::Predicate,
-    ) -> Result<query::exec::StringSetPlan, Self::Error> {
-        self.mutable_buffer
-            .as_ref()
-            .context(DatabaseNotReadable)?
-            .table_names(predicate)
-            .await
-            .context(MutableBufferRead)
     }
 
     async fn tag_column_names(
@@ -371,6 +351,10 @@ impl Database for Db {
 
 #[cfg(test)]
 mod tests {
+    use crate::query_tests::utils::make_db;
+
+    use super::*;
+
     use arrow_deps::{
         arrow::record_batch::RecordBatch, assert_table_eq, datafusion::physical_plan::collect,
     };
@@ -378,19 +362,6 @@ mod tests {
         exec::Executor, frontend::sql::SQLQueryPlanner, test::TestLPWriter, PartitionChunk,
     };
     use test_helpers::assert_contains;
-
-    use super::*;
-
-    /// Create a Database with a local store
-    fn make_db() -> Db {
-        let name = "test_db";
-        Db::new(
-            DatabaseRules::default(),
-            Some(MutableBufferDb::new(name)),
-            ReadBufferDb::new(),
-            None, // wal buffer
-        )
-    }
 
     #[tokio::test]
     async fn write_no_mutable_buffer() {
@@ -459,14 +430,14 @@ mod tests {
             "+-----+------+",
         ];
         let batches = run_query(&db, "select * from cpu").await;
-        assert_table_eq!(expected, &batches);
+        assert_table_eq!(&expected, &batches);
 
         // And expect that we still get the same thing when data is rolled over again
         let chunk = db.rollover_partition("1970-01-01T00").await.unwrap();
         assert_eq!(chunk.id(), 1);
 
         let batches = run_query(&db, "select * from cpu").await;
-        assert_table_eq!(expected, &batches);
+        assert_table_eq!(&expected, &batches);
     }
 
     #[tokio::test]
@@ -502,7 +473,7 @@ mod tests {
             "+-----+------+",
         ];
         let batches = run_query(&db, "select * from cpu").await;
-        assert_table_eq!(expected, &batches);
+        assert_table_eq!(&expected, &batches);
 
         // now, drop the mutable buffer chunk and results should still be the same
         db.drop_mutable_buffer_chunk(partition_key, mb_chunk.id())
@@ -513,7 +484,7 @@ mod tests {
         assert_eq!(read_buffer_chunk_ids(&db, partition_key).await, vec![0]);
 
         let batches = run_query(&db, "select * from cpu").await;
-        assert_table_eq!(expected, &batches);
+        assert_table_eq!(&expected, &batches);
 
         // drop, the chunk from the read buffer
         db.drop_read_buffer_chunk(partition_key, mb_chunk.id())
@@ -550,7 +521,7 @@ mod tests {
         let mb_chunk = db.rollover_partition("1970-01-01T00").await.unwrap();
         assert_eq!(mb_chunk.id(), 0);
 
-        // add a new chunk in immutable buffer, and move chunk1 (but
+        // add a new chunk in mutable buffer, and move chunk1 (but
         // not chunk 0) to read buffer
         writer.write_lp_string(&db, "cpu bar=1 30").await.unwrap();
         let mb_chunk = db.rollover_partition("1970-01-01T00").await.unwrap();

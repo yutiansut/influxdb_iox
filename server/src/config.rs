@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-const DB_RULES_FILE_NAME: &str = "rules.json";
+pub(crate) const DB_RULES_FILE_NAME: &str = "rules.json";
 
 /// The Config tracks the configuration od databases and their rules along
 /// with host groups for replication. It is used as an in-memory structure
@@ -68,8 +68,13 @@ impl Config {
     }
 
     pub(crate) fn host_group(&self, host_group_id: &str) -> Option<Arc<HostGroup>> {
-        let state = self.state.read().expect("mutex poinsoned");
+        let state = self.state.read().expect("mutex poisoned");
         state.host_groups.get(host_group_id).cloned()
+    }
+
+    pub(crate) fn db_names_sorted(&self) -> Vec<DatabaseName<'static>> {
+        let state = self.state.read().expect("mutex poisoned");
+        state.databases.keys().cloned().collect()
     }
 
     fn commit(&self, name: &DatabaseName<'static>, db: Arc<Db>) {
@@ -87,10 +92,10 @@ impl Config {
     }
 }
 
-pub fn object_store_path_for_database_config(
-    root: &ObjectStorePath,
+pub fn object_store_path_for_database_config<P: ObjectStorePath>(
+    root: &P,
     name: &DatabaseName<'_>,
-) -> ObjectStorePath {
+) -> P {
     let mut path = root.clone();
     path.push_dir(name.to_string());
     path.set_file_name(DB_RULES_FILE_NAME);
@@ -136,7 +141,7 @@ impl<'a> Drop for CreateDatabaseHandle<'a> {
 #[cfg(test)]
 mod test {
     use super::*;
-    use object_store::path::cloud::CloudConverter;
+    use object_store::{memory::InMemory, ObjectStore, ObjectStoreApi};
 
     #[test]
     fn create_db() {
@@ -153,15 +158,23 @@ mod test {
         let db_reservation = config.create_db(name.clone(), rules).unwrap();
         db_reservation.commit();
         assert!(config.db(&name).is_some());
+
+        assert_eq!(config.db_names_sorted(), vec![name]);
     }
 
     #[test]
     fn object_store_path_for_database_config() {
-        let path = ObjectStorePath::from_cloud_unchecked("1");
-        let name = DatabaseName::new("foo").unwrap();
-        let rules_path = super::object_store_path_for_database_config(&path, &name);
-        let rules_path = CloudConverter::convert(&rules_path);
+        let storage = ObjectStore::new_in_memory(InMemory::new());
+        let mut base_path = storage.new_path();
+        base_path.push_dir("1");
 
-        assert_eq!(rules_path, "1/foo/rules.json");
+        let name = DatabaseName::new("foo").unwrap();
+        let rules_path = super::object_store_path_for_database_config(&base_path, &name);
+
+        let mut expected_path = base_path;
+        expected_path.push_dir("foo");
+        expected_path.set_file_name("rules.json");
+
+        assert_eq!(rules_path, expected_path);
     }
 }

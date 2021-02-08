@@ -17,7 +17,7 @@ use data_types::{
     DatabaseName,
 };
 use influxdb_line_protocol::parse_lines;
-use object_store::path::ObjectStorePath;
+use object_store::ObjectStoreApi;
 use query::{frontend::sql::SQLQueryPlanner, Database, DatabaseStore};
 use server::{ConnectionManager, Server as AppServer};
 
@@ -26,7 +26,7 @@ use bytes::{Bytes, BytesMut};
 use futures::{self, StreamExt};
 use http::header::CONTENT_ENCODING;
 use hyper::{Body, Method, Request, Response, StatusCode};
-use routerify::{prelude::*, Middleware, RequestInfo, Router, RouterService};
+use routerify::{prelude::*, Middleware, RequestInfo, Router, RouterError, RouterService};
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt, Snafu};
 use tracing::{debug, error, info};
@@ -98,6 +98,9 @@ pub enum ApplicationError {
     #[snafu(display("Invalid request body: {}", source))]
     InvalidRequestBody { source: serde_json::error::Error },
 
+    #[snafu(display("Invalid response body: {}", source))]
+    InternalSerializationError { source: serde_json::error::Error },
+
     #[snafu(display("Invalid content encoding: {}", content_encoding))]
     InvalidContentEncoding { content_encoding: String },
 
@@ -108,7 +111,7 @@ pub enum ApplicationError {
     },
 
     #[snafu(display("Error reading request body: {}", source))]
-    ReadingBody { source: hyper::error::Error },
+    ReadingBody { source: hyper::Error },
 
     #[snafu(display("Error reading request body as utf8: {}", source))]
     ReadingBodyAsUtf8 { source: std::str::Utf8Error },
@@ -146,8 +149,8 @@ pub enum ApplicationError {
 }
 
 impl ApplicationError {
-    pub fn response(&self) -> Result<Response<Body>, Self> {
-        Ok(match self {
+    pub fn response(&self) -> Response<Body> {
+        match self {
             Self::BucketByName { .. } => self.internal_error(),
             Self::BucketMappingError { .. } => self.internal_error(),
             Self::WritingPoints { .. } => self.internal_error(),
@@ -159,6 +162,7 @@ impl ApplicationError {
             Self::ExpectedQueryString { .. } => self.bad_request(),
             Self::InvalidQueryString { .. } => self.bad_request(),
             Self::InvalidRequestBody { .. } => self.bad_request(),
+            Self::InternalSerializationError { .. } => self.internal_error(),
             Self::InvalidContentEncoding { .. } => self.bad_request(),
             Self::ReadingHeaderAsUtf8 { .. } => self.bad_request(),
             Self::ReadingBody { .. } => self.bad_request(),
@@ -171,7 +175,7 @@ impl ApplicationError {
             Self::ErrorCreatingDatabase { .. } => self.bad_request(),
             Self::DatabaseNameError { .. } => self.bad_request(),
             Self::DatabaseNotFound { .. } => self.not_found(),
-        })
+        }
     }
 
     fn bad_request(&self) -> Response<Body> {
@@ -247,14 +251,15 @@ where
             info!(response = ?res, "Successfully processed request");
             Ok(res)
         })) // this endpoint is for API backward compatibility with InfluxDB 2.x
-        .post("/api/v2/write", write_handler::<M>)
+        .post("/api/v2/write", write::<M>)
         .get("/ping", ping)
-        .get("/api/v2/read", read_handler::<M>)
-        .put("/iox/api/v1/databases/:name", create_database_handler::<M>)
-        .get("/iox/api/v1/databases/:name", get_database_handler::<M>)
-        .put("/iox/api/v1/id", set_writer_handler::<M>)
-        .get("/api/v1/partitions", list_partitions_handler::<M>)
-        .post("/api/v1/snapshot", snapshot_partition_handler::<M>)
+        .get("/api/v2/read", read::<M>)
+        .get("/iox/api/v1/databases", list_databases::<M>)
+        .put("/iox/api/v1/databases/:name", create_database::<M>)
+        .get("/iox/api/v1/databases/:name", get_database::<M>)
+        .put("/iox/api/v1/id", set_writer::<M>)
+        .get("/api/v1/partitions", list_partitions::<M>)
+        .post("/api/v1/snapshot", snapshot_partition::<M>)
         // Specify the error handler to handle any errors caused by
         // a route or any middleware.
         .err_handler_with_info(error_handler)
@@ -262,19 +267,29 @@ where
         .unwrap()
 }
 
-// the Routerify error handler. This should be the handler of last resort.
-// Errors should be handled with responses built in the individual handlers for
-// specific ApplicationError(s)
-async fn error_handler(err: routerify::Error, req: RequestInfo) -> Response<Body> {
-    let method = req.method().clone();
-    let uri = req.uri().clone();
-    error!(error = ?err, error_message = ?err.to_string(), method = ?method, uri = ?uri, "Error while handling request");
+// The API-global error handler, handles ApplicationErrors originating from
+// individual routes and middlewares, along with errors from the router itself
+async fn error_handler(err: RouterError<ApplicationError>, req: RequestInfo) -> Response<Body> {
+    match err {
+        RouterError::HandleRequest(e, _)
+        | RouterError::HandlePreMiddlewareRequest(e)
+        | RouterError::HandlePostMiddlewareWithInfoRequest(e)
+        | RouterError::HandlePostMiddlewareWithoutInfoRequest(e) => {
+            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
+            e.response()
+        }
+        _ => {
+            let method = req.method().clone();
+            let uri = req.uri().clone();
+            error!(error = ?err, error_message = ?err.to_string(), method = ?method, uri = ?uri, "Error while handling request");
 
-    let json = serde_json::json!({"error": err.to_string()}).to_string();
-    Response::builder()
-        .status(StatusCode::INTERNAL_SERVER_ERROR)
-        .body(Body::from(json))
-        .unwrap()
+            let json = serde_json::json!({"error": err.to_string()}).to_string();
+            Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .body(Body::from(json))
+                .unwrap()
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -333,20 +348,6 @@ async fn parse_body(req: hyper::Request<Body>) -> Result<Bytes, ApplicationError
         Ok(decoded_data.into())
     } else {
         Ok(body)
-    }
-}
-
-#[tracing::instrument(level = "debug")]
-async fn write_handler<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
-where
-    M: ConnectionManager + Send + Sync + Debug + 'static,
-{
-    match write::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
-            e.response()
-        }
-        res => res,
     }
 }
 
@@ -410,21 +411,6 @@ struct ReadInfo {
     sql_query: String,
 }
 
-#[tracing::instrument(level = "debug")]
-async fn read_handler<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
-where
-    M: ConnectionManager + Send + Sync + Debug + 'static,
-{
-    match read::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
-
-            e.response()
-        }
-        res => res,
-    }
-}
-
 // TODO: figure out how to stream read results out rather than rendering the
 // whole thing in mem
 #[tracing::instrument(level = "debug")]
@@ -467,19 +453,26 @@ async fn read<M: ConnectionManager + Send + Sync + Debug + 'static>(
     Ok(Response::new(Body::from(results.into_bytes())))
 }
 
+#[derive(Serialize, Deserialize, Debug)]
+/// Body of the response to the /databases endpoint.
+struct ListDatabasesResponse {
+    names: Vec<String>,
+}
+
 #[tracing::instrument(level = "debug")]
-async fn create_database_handler<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
+async fn list_databases<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
 where
     M: ConnectionManager + Send + Sync + Debug + 'static,
 {
-    match create_database::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
+    let server = req
+        .data::<Arc<AppServer<M>>>()
+        .expect("server state")
+        .clone();
 
-            e.response()
-        }
-        res => res,
-    }
+    let names = server.db_names_sorted().await;
+    let json = serde_json::to_string(&ListDatabasesResponse { names })
+        .context(InternalSerializationError)?;
+    Ok(Response::new(Body::from(json)))
 }
 
 #[tracing::instrument(level = "debug")]
@@ -506,21 +499,6 @@ async fn create_database<M: ConnectionManager + Send + Sync + Debug + 'static>(
         .context(ErrorCreatingDatabase)?;
 
     Ok(Response::new(Body::empty()))
-}
-
-#[tracing::instrument(level = "debug")]
-async fn get_database_handler<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
-where
-    M: ConnectionManager + Send + Sync + Debug + 'static,
-{
-    match get_database::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
-
-            e.response()
-        }
-        res => res,
-    }
 }
 
 #[tracing::instrument(level = "debug")]
@@ -551,21 +529,6 @@ async fn get_database<M: ConnectionManager + Send + Sync + Debug + 'static>(
         .expect("builder should be successful");
 
     Ok(response)
-}
-
-#[tracing::instrument(level = "debug")]
-async fn set_writer_handler<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
-where
-    M: ConnectionManager + Send + Sync + Debug + 'static,
-{
-    match set_writer::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
-
-            e.response()
-        }
-        res => res,
-    }
 }
 
 #[tracing::instrument(level = "debug")]
@@ -616,21 +579,6 @@ struct DatabaseInfo {
 }
 
 #[tracing::instrument(level = "debug")]
-async fn list_partitions_handler<M>(req: Request<Body>) -> Result<Response<Body>, ApplicationError>
-where
-    M: ConnectionManager + Send + Sync + Debug + 'static,
-{
-    match list_partitions::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
-
-            e.response()
-        }
-        res => res,
-    }
-}
-
-#[tracing::instrument(level = "debug")]
 async fn list_partitions<M: ConnectionManager + Send + Sync + Debug + 'static>(
     req: Request<Body>,
 ) -> Result<Response<Body>, ApplicationError> {
@@ -675,26 +623,11 @@ struct SnapshotInfo {
 }
 
 #[tracing::instrument(level = "debug")]
-async fn snapshot_partition_handler<M>(
-    req: Request<Body>,
-) -> Result<Response<Body>, ApplicationError>
-where
-    M: ConnectionManager + Send + Sync + Debug + 'static,
-{
-    match snapshot_partition::<M>(req).await {
-        Err(e) => {
-            error!(error = ?e, error_message = ?e.to_string(), "Error while handling request");
-
-            e.response()
-        }
-        res => res,
-    }
-}
-
-#[tracing::instrument(level = "debug")]
 async fn snapshot_partition<M: ConnectionManager + Send + Sync + Debug + 'static>(
     req: Request<Body>,
 ) -> Result<Response<Body>, ApplicationError> {
+    use object_store::path::ObjectStorePath;
+
     let server = req
         .data::<Arc<AppServer<M>>>()
         .expect("server state")
@@ -715,7 +648,9 @@ async fn snapshot_partition<M: ConnectionManager + Send + Sync + Debug + 'static
         bucket: &snapshot.bucket,
     })?;
 
-    let mut metadata_path = ObjectStorePath::default();
+    let store = server.store.clone();
+
+    let mut metadata_path = store.new_path();
     metadata_path.push_dir(&db_name.to_string());
     let mut data_path = metadata_path.clone();
     metadata_path.push_dir("meta");
@@ -726,7 +661,7 @@ async fn snapshot_partition<M: ConnectionManager + Send + Sync + Debug + 'static
     let snapshot = server::snapshot::snapshot_chunk(
         metadata_path,
         data_path,
-        server.store.clone(),
+        store,
         partition_key,
         chunk,
         None,
@@ -875,7 +810,7 @@ mod tests {
             .send()
             .await;
 
-        check_response("write", response, StatusCode::NO_CONTENT, "").await;
+        check_response("gzip_write", response, StatusCode::NO_CONTENT, "").await;
 
         // Check that the data got into the right bucket
         let test_db = test_storage
@@ -921,6 +856,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_databases() {
+        let server = Arc::new(AppServer::new(
+            ConnectionManagerImpl {},
+            Arc::new(ObjectStore::new_in_memory(InMemory::new())),
+        ));
+        server.set_id(1);
+        let server_url = test_server(server.clone());
+
+        let database_names: Vec<String> = vec!["foo_bar", "foo_baz"]
+            .iter()
+            .map(|i| i.to_string())
+            .collect();
+
+        for database_name in &database_names {
+            let rules = DatabaseRules {
+                name: database_name.clone(),
+                store_locally: true,
+                ..Default::default()
+            };
+            server.create_database(database_name, rules).await.unwrap();
+        }
+
+        let client = Client::new();
+        let response = client
+            .get(&format!("{}/iox/api/v1/databases", server_url))
+            .send()
+            .await;
+
+        let data = serde_json::to_string(&ListDatabasesResponse {
+            names: database_names,
+        })
+        .unwrap();
+        check_response("list_databases", response, StatusCode::OK, &data).await;
+    }
+
+    #[tokio::test]
     async fn create_database() {
         let server = Arc::new(AppServer::new(
             ConnectionManagerImpl {},
@@ -959,13 +930,14 @@ mod tests {
         server.set_id(1);
         let server_url = test_server(server.clone());
 
+        let database_name = "foo_bar";
         let rules = DatabaseRules {
+            name: database_name.to_owned(),
             store_locally: true,
             ..Default::default()
         };
         let data = serde_json::to_string(&rules).unwrap();
 
-        let database_name = "foo_bar";
         server.create_database(database_name, rules).await.unwrap();
 
         let client = Client::new();
@@ -977,7 +949,7 @@ mod tests {
             .send()
             .await;
 
-        check_response("create_database", response, StatusCode::OK, &data).await;
+        check_response("get_database", response, StatusCode::OK, &data).await;
     }
 
     /// checks a http response against expected results

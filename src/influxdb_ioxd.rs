@@ -1,11 +1,12 @@
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub mod http_routes;
+mod flight;
+pub mod http;
 pub mod rpc;
 
 use server::{ConnectionManagerImpl as ConnectionManager, Server as AppServer};
@@ -49,7 +50,7 @@ pub enum Error {
     ))]
     StartListeningHttp {
         bind_addr: SocketAddr,
-        source: hyper::error::Error,
+        source: hyper::Error,
     },
 
     #[snafu(display(
@@ -63,10 +64,10 @@ pub enum Error {
     },
 
     #[snafu(display("Error serving HTTP: {}", source))]
-    ServingHttp { source: hyper::error::Error },
+    ServingHttp { source: hyper::Error },
 
     #[snafu(display("Error serving RPC: {}", source))]
-    ServingRPC { source: self::rpc::service::Error },
+    ServingRPC { source: self::rpc::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -97,14 +98,16 @@ pub async fn main(logging_level: LoggingLevel, config: Option<Config>) -> Result
 
     let db_dir = &config.database_directory;
 
-    fs::create_dir_all(db_dir).context(CreatingDatabaseDirectory { path: db_dir })?;
-
     let object_store = if let Some(bucket_name) = &config.gcp_bucket {
         info!("Using GCP bucket {} for storage", bucket_name);
         ObjectStore::new_google_cloud_storage(GoogleCloudStorage::new(bucket_name))
-    } else {
+    } else if let Some(db_dir) = db_dir {
         info!("Using local dir {:?} for storage", db_dir);
+        fs::create_dir_all(db_dir).context(CreatingDatabaseDirectory { path: db_dir })?;
         ObjectStore::new_file(object_store::disk::File::new(&db_dir))
+    } else {
+        warn!("NO PERSISTENCE: using memory for object storage");
+        ObjectStore::new_in_memory(object_store::memory::InMemory::new())
     };
     let object_storage = Arc::new(object_store);
 
@@ -115,6 +118,12 @@ pub async fn main(logging_level: LoggingLevel, config: Option<Config>) -> Result
     // call
     if let Some(id) = config.writer_id {
         app_server.set_id(id);
+        if let Err(e) = app_server.load_database_configs().await {
+            error!(
+                "unable to load database configurations from object storage: {}",
+                e
+            )
+        }
     } else {
         warn!("server ID not set. ID must be set via the INFLUXDB_IOX_ID config or API before writing or querying data.");
     }
@@ -126,13 +135,13 @@ pub async fn main(logging_level: LoggingLevel, config: Option<Config>) -> Result
         .await
         .context(StartListeningGrpc { grpc_bind_addr })?;
 
-    let grpc_server = self::rpc::service::make_server(socket, app_server.clone());
+    let grpc_server = self::rpc::make_server(socket, app_server.clone());
 
     info!(bind_address=?grpc_bind_addr, "gRPC server listening");
 
     // Construct and start up HTTP server
 
-    let router_service = http_routes::router_service(app_server.clone());
+    let router_service = http::router_service(app_server.clone());
 
     let bind_addr = config.http_bind_address;
     let http_server = Server::try_bind(&bind_addr)

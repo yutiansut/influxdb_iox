@@ -1,10 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::fmt::Display;
-use std::slice::Iter;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    convert::TryInto,
+    fmt::Display,
+    sync::Arc,
+    sync::RwLock,
+};
+
+use arrow_deps::arrow::record_batch::RecordBatch;
+use data_types::selection::Selection;
+use snafu::{ensure, Snafu};
 
 use crate::column::{AggregateResult, Scalar, Value};
 use crate::row_group::{self, ColumnName, GroupKey, Predicate, RowGroup};
 use crate::schema::{AggregateType, ColumnType, LogicalDataType, ResultSchema};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("cannot drop last row group in table; drop table"))]
+    EmptyTableError {},
+}
+
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A Table represents data for a single measurement.
 ///
@@ -25,36 +41,72 @@ use crate::schema::{AggregateType, ColumnType, LogicalDataType, ResultSchema};
 pub struct Table {
     name: String,
 
-    // Metadata about the table's segments
-    meta: MetaData,
+    // A table's data is held in a collection of immutable row groups and
+    // mutable meta data (`RowGroupData`).
+    //
+    // Concurrent access to the `RowGroupData` is managed via an `RwLock`, which is
+    // taken in the following circumstances:
+    //
+    //    * A lock is needed when adding a new row group. It is held as long as it takes to push
+    //      the new row group on a `Vec` and update the table meta-data. This is not long.
+    //
+    //    * A lock is needed when removing row groups. It is held as long as it takes to remove
+    //      something from a `Vec`, and re-construct new meta-data. This is not long.
+    //
+    //    * A read lock is needed for all read operations over table data (row groups). However,
+    //      the read lock is only held for as long as it takes to shallow-clone the table data (via
+    //      Arcs) that are required for the read. The expensive process of performing the read
+    //      operation is done in a lock-free manner.
+    table_data: RwLock<RowGroupData>,
+}
 
-    row_groups: Vec<RowGroup>,
+// Tie data and meta-data together so that they can be wrapped in RWLock.
+struct RowGroupData {
+    meta: Arc<MetaData>,
+    data: Vec<Arc<RowGroup>>,
 }
 
 impl Table {
     /// Create a new table with the provided row_group.
-    pub fn new(name: String, rg: RowGroup) -> Self {
+    pub fn new(name: impl Into<String>, rg: RowGroup) -> Self {
         Self {
-            name,
-            meta: MetaData::new(rg.metadata()),
-            row_groups: vec![rg],
+            name: name.into(),
+            table_data: RwLock::new(RowGroupData {
+                meta: Arc::new(MetaData::new(rg.metadata())),
+                data: vec![Arc::new(rg)],
+            }),
         }
     }
 
     /// Add a new row group to this table.
     pub fn add_row_group(&mut self, rg: RowGroup) {
-        self.meta.update(rg.metadata());
-        self.row_groups.push(rg);
+        let mut row_groups = self.table_data.write().unwrap();
+
+        // `meta` can't be modified whilst protected by an Arc so create a new one.
+        row_groups.meta = Arc::new(MetaData::update_with(
+            MetaData::clone(&row_groups.meta), // clone meta-data not Arc
+            rg.metadata(),
+        ));
+
+        // Add the new row group data to the table.
+        row_groups.data.push(Arc::new(rg));
     }
 
-    /// Remove the row group at `position` from table.
-    pub fn drop_segment(&mut self, position: usize) {
-        todo!();
-    }
+    /// Remove the row group at `position` from table, returning an error if the
+    /// caller has attempted to drop the last row group.
+    ///
+    /// To drop the last row group from the table, the caller should instead
+    /// drop the table.
+    pub fn drop_row_group(&mut self, position: usize) -> Result<()> {
+        let mut row_groups = self.table_data.write().unwrap();
 
-    /// Iterate over all row groups for the table.
-    pub fn iter(&mut self) -> Iter<'_, RowGroup> {
-        self.row_groups.iter()
+        // Tables must always have at least one row group.
+        ensure!(row_groups.data.len() > 1, EmptyTableError);
+
+        row_groups.data.remove(position); // removes row group data
+        row_groups.meta = Arc::new(MetaData::from(&row_groups.data)); // rebuild meta
+
+        Ok(())
     }
 
     /// The name of the table (equivalent to measurement or table name).
@@ -64,44 +116,62 @@ impl Table {
 
     /// Determines if this table contains no row groups.
     pub fn is_empty(&self) -> bool {
-        self.row_groups.is_empty()
+        self.table_data.read().unwrap().data.is_empty()
     }
 
     /// The total number of row groups within this table.
     pub fn len(&self) -> usize {
-        self.row_groups.len()
+        self.table_data.read().unwrap().data.len()
     }
 
     /// The total size of the table in bytes.
     pub fn size(&self) -> u64 {
-        self.meta.size
+        self.table_data.read().unwrap().meta.size
+    }
+
+    // Returns the total number of row groups in this table.
+    pub fn row_groups(&self) -> usize {
+        self.table_data.read().unwrap().data.len()
     }
 
     /// The number of rows in this table.
     pub fn rows(&self) -> u64 {
-        self.meta.rows
+        self.table_data.read().unwrap().meta.rows
     }
 
     /// The time range of all row groups within this table.
     pub fn time_range(&self) -> Option<(i64, i64)> {
-        self.meta.time_range
+        self.table_data.read().unwrap().meta.time_range
+    }
+
+    // Helper function used in tests.
+    // Returns an immutable reference to the table's current meta data.
+    fn meta(&self) -> Arc<MetaData> {
+        Arc::clone(&self.table_data.read().unwrap().meta)
     }
 
     // Identify set of row groups that might satisfy the predicate.
-    fn filter_row_groups(&self, predicate: &Predicate) -> Vec<&RowGroup> {
-        let mut rgs = Vec::with_capacity(self.row_groups.len());
+    //
+    // Produce a set of these row groups along with a snapshot of the table meta
+    // data associated with them.
+    //
+    // N.B the table read lock is only held as long as it takes to determine
+    // with meta data whether each row group may satisfy the predicate.
+    fn filter_row_groups(&self, predicate: &Predicate) -> (Arc<MetaData>, Vec<Arc<RowGroup>>) {
+        let table_data = self.table_data.read().unwrap();
+        let mut row_groups = Vec::with_capacity(table_data.data.len());
 
-        'rowgroup: for rg in &self.row_groups {
+        'rowgroup: for rg in table_data.data.iter() {
             // check all expressions in predicate
             if !rg.could_satisfy_conjunctive_binary_expressions(predicate.iter()) {
                 continue 'rowgroup;
             }
 
             // row group could potentially satisfy predicate
-            rgs.push(rg);
+            row_groups.push(Arc::clone(&rg));
         }
 
-        rgs
+        (Arc::clone(&table_data.meta), row_groups)
     }
 
     /// Select data for the specified column selections with the provided
@@ -115,29 +185,26 @@ impl Table {
     /// the predicate and fall with the [min, max) time range domain.
     pub fn read_filter<'a>(
         &'a self,
-        columns: &ColumnSelection<'_>,
+        columns: &Selection<'_>,
         predicate: &Predicate,
-    ) -> ReadFilterResults<'a> {
+    ) -> ReadFilterResults {
         // identify row groups where time range and predicates match could match
-        // using row group meta data, and then execute against those row groups
-        // and merge results.
-        let rgs = self.filter_row_groups(predicate);
+        // the predicate. Get a snapshot of those and the meta-data.
+        let (meta, row_groups) = self.filter_row_groups(predicate);
 
         let schema = ResultSchema {
             select_columns: match columns {
-                ColumnSelection::All => self.meta.schema_for_all_columns(),
-                ColumnSelection::Some(column_names) => {
-                    self.meta.schema_for_column_names(column_names)
-                }
+                Selection::All => meta.schema_for_all_columns(),
+                Selection::Some(column_names) => meta.schema_for_column_names(column_names),
             },
             ..ResultSchema::default()
         };
 
-        // temp I think I can remove `predicates` from the results
+        // TODO(edd): I think I can remove `predicates` from the results
         ReadFilterResults {
             predicate: predicate.clone(),
             schema,
-            row_groups: rgs,
+            row_groups,
         }
     }
 
@@ -153,24 +220,27 @@ impl Table {
     pub fn read_aggregate<'input>(
         &self,
         predicate: Predicate,
-        group_columns: &'input [ColumnName<'input>],
+        group_columns: &'input Selection<'_>,
         aggregates: &'input [(ColumnName<'input>, AggregateType)],
-    ) -> ReadAggregateResults<'_> {
+    ) -> ReadAggregateResults {
+        let (meta, row_groups) = self.filter_row_groups(&predicate);
+
         // Filter out any column names that we do not have data for.
         let schema = ResultSchema {
-            group_columns: self.meta.schema_for_column_names(group_columns),
-            aggregate_columns: self.meta.schema_for_aggregate_column_names(aggregates),
+            group_columns: match group_columns {
+                Selection::All => meta.schema_for_all_columns(),
+                Selection::Some(column_names) => meta.schema_for_column_names(column_names),
+            },
+            aggregate_columns: meta.schema_for_aggregate_column_names(aggregates),
             ..ResultSchema::default()
         };
-
-        // TODO(edd): for now punt on predicate pruning but need to figure it out.
-        let row_groups = self.filter_row_groups(&predicate);
 
         // return the iterator to build the results.
         ReadAggregateResults {
             schema,
             predicate,
             row_groups,
+            ..Default::default()
         }
     }
 
@@ -355,21 +425,42 @@ impl Table {
     // ---- Schema API queries
     //
 
-    /// Returns the distinct set of tag keys (column names) matching the
-    /// provided optional predicates and time range.
-    pub fn tag_keys<'a>(
+    /// Returns a distinct set of column names in the table.
+    ///
+    /// Optionally a predicate may be provided. In such a case only column names
+    /// will be returned belonging to columns whom have at least one non-null
+    /// value for any row satisfying the predicate.
+    pub fn column_names(
         &self,
-        time_range: (i64, i64),
-        predicates: &[(&str, &str)],
-        found_columns: &BTreeSet<String>,
-    ) -> BTreeSet<ColumnName<'a>> {
-        // Firstly, this should short-circuit early if all of the table's columns
-        // are present in `found_columns`.
+        predicate: &Predicate,
+        mut dst: BTreeSet<String>,
+    ) -> BTreeSet<String> {
+        let table_data = self.table_data.read().unwrap();
+
+        // Short circuit execution if we have already got all of this table's
+        // columns in the results.
+        if table_data
+            .meta
+            .columns
+            .keys()
+            .all(|name| dst.contains(name))
+        {
+            return dst;
+        }
+
+        // Identify row groups where time range and predicates match could match
+        // the predicate. Get a snapshot of those, and the table meta-data.
         //
-        // Otherwise, identify segments where time range and predicates match could
-        // match using segment meta data and then execute against those segments
-        // and merge results.
-        todo!();
+        // NOTE(edd): this takes another read lock on `self`. I think this is
+        // ok, but if it turns out it's not then we can move the
+        // `filter_row_groups` logic into here and not take the second read
+        // lock.
+        let (_, row_groups) = self.filter_row_groups(predicate);
+        for row_group in row_groups {
+            row_group.column_names(predicate, &mut dst);
+        }
+
+        dst
     }
 
     /// Returns the distinct set of tag values (column values) for each provided
@@ -394,9 +485,68 @@ impl Table {
         // that only have values that have already been found.
         todo!();
     }
+
+    /// Determines if this table could satisfy the provided predicate.
+    ///
+    /// `false` is proof that no row within this table would match the
+    /// predicate, whilst `true` indicates one or more rows *might* match the
+    /// predicate.
+    fn could_satisfy_predicate(&self, predicate: &Predicate) -> bool {
+        // Get a snapshot of the table data under a read lock.
+        let (meta, row_groups) = {
+            let table_data = self.table_data.read().unwrap();
+            (Arc::clone(&table_data.meta), table_data.data.to_vec())
+        };
+
+        // if the table doesn't have a column for one of the predicate's
+        // expressions then the table cannot satisfy the predicate.
+        if !predicate
+            .iter()
+            .all(|expr| meta.columns.contains_key(expr.column()))
+        {
+            return false;
+        }
+
+        // If there is a single row group in the table that could satisfy the
+        // predicate then the table itself could satisfy the predicate so return
+        // true. If none of the row groups could match then return false.
+        let exprs = predicate.expressions();
+        row_groups
+            .iter()
+            .any(|row_group| row_group.could_satisfy_conjunctive_binary_expressions(exprs))
+    }
+
+    /// Determines if this table contains one or more rows that satisfy the
+    /// predicate.
+    pub fn satisfies_predicate(&self, predicate: &Predicate) -> bool {
+        // Get a snapshot of the table data under a read lock.
+        let (meta, row_groups) = {
+            let table_data = self.table_data.read().unwrap();
+            (Arc::clone(&table_data.meta), table_data.data.to_vec())
+        };
+
+        // if the table doesn't have a column for one of the predicate's
+        // expressions then the table cannot satisfy the predicate.
+        if !predicate
+            .iter()
+            .all(|expr| meta.columns.contains_key(expr.column()))
+        {
+            return false;
+        }
+
+        // Apply the predicate to all row groups. Each row group will do its own
+        // column pruning based on its column ranges.
+
+        // The following could be expensive if row group data needs to be
+        // processed but this operation is now lock-free.
+        row_groups
+            .iter()
+            .any(|row_group| row_group.satisfies_predicate(predicate))
+    }
 }
 
 // TODO(edd): reduce owned strings here by, e.g., using references as keys.
+#[derive(Clone)]
 struct MetaData {
     // The total size of the table in bytes.
     size: u64,
@@ -428,6 +578,50 @@ impl MetaData {
             column_names: meta.columns.keys().cloned().collect(),
             time_range: Some(meta.time_range),
         }
+    }
+
+    /// Create a new `MetaData` by consuming `this` and incorporating `other`.
+    pub fn update_with(mut this: Self, other: &row_group::MetaData) -> Self {
+        // The incoming row group must have exactly the same schema as the
+        // existing row groups in the table.
+        assert_eq!(&this.columns, &other.columns);
+
+        // update size, rows, column ranges, time range
+        this.size += other.size;
+        this.rows += other.rows as u64;
+
+        // The incoming row group must have exactly the same schema as the
+        // existing row groups in the table.
+        assert_eq!(&this.columns, &other.columns);
+
+        // Update the table schema using the incoming row group schema
+        for (column_name, column_meta) in &other.columns {
+            let (column_range_min, column_range_max) = &column_meta.range;
+            let mut curr_range = &mut this
+                .columns
+                .get_mut(&column_name.to_string())
+                .unwrap()
+                .range;
+            if column_range_min < &curr_range.0 {
+                curr_range.0 = column_range_min.clone();
+            }
+
+            if column_range_max > &curr_range.1 {
+                curr_range.1 = column_range_max.clone();
+            }
+
+            match this.time_range {
+                Some(time_range) => {
+                    this.time_range = Some((
+                        time_range.0.min(other.time_range.0),
+                        time_range.1.max(other.time_range.1),
+                    ));
+                }
+                None => panic!("cannot call `update` on empty Metadata"),
+            }
+        }
+
+        this
     }
 
     // Extract schema information for a set of columns. If a column name does
@@ -462,9 +656,20 @@ impl MetaData {
         names
             .iter()
             .filter_map(|(name, agg_type)| {
-                self.columns
-                    .get(*name)
-                    .map(|schema| (schema.typ.clone(), *agg_type, schema.logical_data_type))
+                self.columns.get(*name).map(|schema| {
+                    // TODO(edd): this check happens because an aggregate does
+                    // not have to have the same physical type as the logical
+                    // type of the column it is aggregating on. An example of
+                    // this is Count. I'm going to fix this by associated data
+                    // types with the aggregate itself.
+                    let physical_data_type = if let AggregateType::Count = agg_type {
+                        LogicalDataType::Unsigned
+                    } else {
+                        schema.logical_data_type
+                    };
+
+                    (schema.typ.clone(), *agg_type, physical_data_type)
+                })
             })
             .collect::<Vec<_>>()
     }
@@ -472,77 +677,40 @@ impl MetaData {
     pub fn all_column_names(&self) -> Vec<&str> {
         self.column_names.iter().map(|name| name.as_str()).collect()
     }
-
-    pub fn update(&mut self, meta: &row_group::MetaData) {
-        // update size, rows, column ranges, time range
-        self.size += meta.size;
-        self.rows += meta.rows as u64;
-
-        // The incoming row group must have exactly the same schema as the
-        // existing row groups in the table.
-        assert_eq!(&self.columns, &meta.columns);
-
-        // Update the table schema using the incoming row group schema
-        for (column_name, column_meta) in &meta.columns {
-            let (column_range_min, column_range_max) = &column_meta.range;
-            let mut curr_range = &mut self
-                .columns
-                .get_mut(&column_name.to_string())
-                .unwrap()
-                .range;
-            if column_range_min < &curr_range.0 {
-                curr_range.0 = column_range_min.clone();
-            }
-
-            if column_range_max > &curr_range.1 {
-                curr_range.1 = column_range_max.clone();
-            }
-
-            match self.time_range {
-                Some(time_range) => {
-                    self.time_range = Some((
-                        time_range.0.min(meta.time_range.0),
-                        time_range.1.max(meta.time_range.1),
-                    ));
-                }
-                None => panic!("cannot call `update` on empty Metadata"),
-            }
-        }
-    }
-
-    // invalidate should be called when a segment is removed that impacts the
-    // meta data.
-    pub fn invalidate(&mut self) {
-        // Update size, rows, time_range by inspecting each segment's metadata
-        todo!()
-    }
 }
 
-/// A collection of columns to include in query results.
-///
-/// The `All` variant denotes that the caller wishes to include all table
-/// columns in the results.
-#[derive(Debug)]
-pub enum ColumnSelection<'a> {
-    All,
-    Some(&'a [&'a str]),
+// Builds new table meta-data from a collection of row groups. Useful for
+// rebuilding state when a row group has been removed from the table.
+impl From<&Vec<Arc<RowGroup>>> for MetaData {
+    fn from(row_groups: &Vec<Arc<RowGroup>>) -> Self {
+        if row_groups.is_empty() {
+            panic!("row groups required for meta data construction");
+        }
+
+        let mut meta = Self::new(row_groups[0].metadata());
+        for row_group in row_groups.iter().skip(1) {
+            meta = Self::update_with(meta, row_group.metadata());
+        }
+
+        meta
+    }
 }
 
 /// Results of a `read_filter` execution on the table. Execution is lazy -
 /// row groups are only queried when `ReadFilterResults` is iterated.
-pub struct ReadFilterResults<'table> {
+pub struct ReadFilterResults {
     // schema of all columns in the query results
     schema: ResultSchema,
 
     // These row groups passed the predicates and need to be queried.
-    row_groups: Vec<&'table RowGroup>,
+    row_groups: Vec<Arc<RowGroup>>,
 
     // TODO(edd): encapsulate this into a single executor function that just
     // executes on the next row group.
     predicate: Predicate,
 }
 
-impl<'table> ReadFilterResults<'table> {
+impl ReadFilterResults {
     pub fn is_empty(&self) -> bool {
         self.row_groups.is_empty()
     }
@@ -552,10 +720,26 @@ impl<'table> ReadFilterResults<'table> {
     pub fn schema(&self) -> &ResultSchema {
         &self.schema
     }
+
+    // useful for testing - materialise all results but don't convert them to
+    // record batches. Skips any row groups that don't have any results
+    fn row_group_results(&self) -> Vec<row_group::ReadFilterResult<'_>> {
+        let select_columns = &self
+            .schema()
+            .select_column_names_iter()
+            .map(|name| name.as_str())
+            .collect::<Vec<_>>();
+
+        self.row_groups
+            .iter()
+            .map(|row_group| row_group.read_filter(select_columns, &self.predicate))
+            .filter(|result| !result.is_empty())
+            .collect()
+    }
 }
 
-impl<'a> Iterator for ReadFilterResults<'a> {
-    type Item = row_group::ReadFilterResult<'a>;
+impl Iterator for ReadFilterResults {
+    type Item = RecordBatch;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.is_empty() {
@@ -571,12 +755,13 @@ impl<'a> Iterator for ReadFilterResults<'a> {
                 .collect::<Vec<_>>(),
             &self.predicate,
         );
+
         if result.is_empty() {
             return self.next(); // try next row group
         }
 
         assert_eq!(result.schema(), self.schema()); // validate schema
-        Some(result)
+        Some(result.try_into().unwrap())
     }
 }
 
@@ -603,44 +788,36 @@ impl<'a> Display for DisplayReadFilterResults<'a> {
 }
 
 #[derive(Default)]
-pub struct ReadAggregateResults<'table> {
+pub struct ReadAggregateResults {
     // schema information for the results
     schema: ResultSchema,
 
     // the predicate to apply to each row group.
     predicate: Predicate,
 
-    // row groups that will be executed against
-    row_groups: Vec<&'table RowGroup>,
+    // row groups that will be executed against. The columns to group on and the
+    // aggregates to produce are determined by the `schema`.
+    row_groups: Vec<Arc<RowGroup>>,
+
+    drained: bool, // currently this iterator only yields once.
 }
 
-impl<'a> ReadAggregateResults<'a> {
+impl ReadAggregateResults {
     /// Returns the schema associated with table result and therefore all of
     /// results from row groups.
     pub fn schema(&self) -> &ResultSchema {
         &self.schema
     }
-}
 
-/// Implements an iterator on the Table's results for `read_aggregate`. This
-/// iterator will execute against one or more row groups, merging each row group
-/// result into the last before returning a final set of results.
-///
-/// Merging in this context means unioning all group keys in multiple sets of
-/// results, and aggregating together aggregates for duplicate group keys.
-///
-/// Given that, it's expected that this iterator will only iterate once, but
-/// perhaps in the future we will break the work up and send intermediate
-/// results back.
-impl<'a> Iterator for ReadAggregateResults<'a> {
-    type Item = row_group::ReadAggregateResult<'a>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.row_groups.is_empty() {
+    // Logic to get next result merged across all row groups for the table is
+    // pulled out so we can decouple this from materialising record batches,
+    // which means we're not forced to use record batches in tests.
+    fn next_merged_result(&mut self) -> Option<row_group::ReadAggregateResult<'_>> {
+        if self.row_groups.is_empty() || self.drained {
             return None;
         }
 
-        let merged_results = self.row_groups.remove(0).read_aggregate(
+        let mut merged_results = self.row_groups.get(0).unwrap().read_aggregate(
             &self.predicate,
             &self
                 .schema
@@ -658,7 +835,7 @@ impl<'a> Iterator for ReadAggregateResults<'a> {
 
         // Execute against remaining row groups, merging each into the merged
         // set.
-        for row_group in &self.row_groups {
+        for row_group in self.row_groups.iter().skip(1) {
             let result = row_group.read_aggregate(
                 &self.predicate,
                 &self
@@ -680,10 +857,30 @@ impl<'a> Iterator for ReadAggregateResults<'a> {
             assert_eq!(result.schema(), self.schema()); // validate schema
 
             // merge result into on-going results.
-            todo!();
+            merged_results = merged_results.merge(result);
         }
 
+        self.drained = true;
         Some(merged_results)
+    }
+}
+
+/// Implements an iterator on the Table's results for `read_aggregate`. This
+/// iterator will execute against one or more row groups, merging each row group
+/// result into the last before returning a final set of results.
+///
+/// Merging in this context means unioning all group keys in multiple sets of
+/// results, and aggregating together aggregates for duplicate group keys.
+///
+/// Given that, it's expected that this iterator will only iterate once, but
+/// perhaps in the future we will break the work up and send intermediate
+/// results back.
+impl Iterator for ReadAggregateResults {
+    type Item = RecordBatch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.next_merged_result()
+            .map(|merged_result| merged_result.try_into().unwrap())
     }
 }
 
@@ -710,16 +907,17 @@ impl std::fmt::Display for DisplayReadAggregateResults<'_> {
 
 #[cfg(test)]
 mod test {
+    use super::*;
+
     use row_group::ColumnMeta;
 
-    use super::*;
     use crate::column::{self, Column};
     use crate::row_group::{BinaryExpr, ColumnType, ReadAggregateResult};
     use crate::schema;
     use crate::schema::LogicalDataType;
 
     #[test]
-    fn meta_data_update() {
+    fn meta_data_update_with() {
         let rg_meta = row_group::MetaData {
             size: 100,
             rows: 2000,
@@ -751,24 +949,27 @@ mod test {
             )
         );
 
-        meta.update(&row_group::MetaData {
-            size: 300,
-            rows: 1500,
-            columns: vec![(
-                "region".to_owned(),
-                ColumnMeta {
-                    typ: schema::ColumnType::Tag("region".to_owned()),
-                    logical_data_type: schema::LogicalDataType::String,
-                    range: (
-                        column::OwnedValue::String("east".to_owned()),
-                        column::OwnedValue::String("north".to_owned()),
-                    ),
-                },
-            )]
-            .into_iter()
-            .collect::<BTreeMap<_, _>>(),
-            time_range: (10, 3500),
-        });
+        meta = MetaData::update_with(
+            meta,
+            &row_group::MetaData {
+                size: 300,
+                rows: 1500,
+                columns: vec![(
+                    "region".to_owned(),
+                    ColumnMeta {
+                        typ: schema::ColumnType::Tag("region".to_owned()),
+                        logical_data_type: schema::LogicalDataType::String,
+                        range: (
+                            column::OwnedValue::String("east".to_owned()),
+                            column::OwnedValue::String("north".to_owned()),
+                        ),
+                    },
+                )]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+                time_range: (10, 3500),
+            },
+        );
 
         assert_eq!(meta.rows, 3500);
         assert_eq!(meta.size, 400);
@@ -783,8 +984,54 @@ mod test {
     }
 
     #[test]
+    fn add_remove_row_groups() {
+        let mut columns = BTreeMap::new();
+        let tc = ColumnType::Time(Column::from(&[0_i64, 2, 3][..]));
+        columns.insert("time".to_string(), tc);
+
+        let rg = RowGroup::new(3, columns);
+        let mut table = Table::new("cpu".to_owned(), rg);
+
+        assert_eq!(table.rows(), 3);
+
+        // add another row group
+        let mut columns = BTreeMap::new();
+        let tc = ColumnType::Time(Column::from(&[1_i64, 2, 3, 4, 5][..]));
+        columns.insert("time".to_string(), tc);
+        let rg = RowGroup::new(5, columns);
+        table.add_row_group(rg);
+
+        assert_eq!(table.rows(), 8);
+        assert_eq!(table.meta().time_range, Some((0, 5)));
+        assert_eq!(
+            table.meta().columns.get("time").unwrap().range,
+            (
+                column::OwnedValue::Scalar(column::Scalar::I64(0)),
+                column::OwnedValue::Scalar(column::Scalar::I64(5))
+            )
+        );
+
+        // remove the first row group
+        table.drop_row_group(0).unwrap();
+        assert_eq!(table.rows(), 5);
+        assert_eq!(table.meta().time_range, Some((1, 5)));
+        assert_eq!(
+            table.meta().columns.get("time").unwrap().range,
+            (
+                column::OwnedValue::Scalar(column::Scalar::I64(1)),
+                column::OwnedValue::Scalar(column::Scalar::I64(5))
+            )
+        );
+
+        // attempt to remove the last row group.
+        table
+            .drop_row_group(0)
+            .expect_err("drop_row_group should have returned an error");
+    }
+
+    #[test]
     fn select() {
-        // Build first segment.
+        // Build first row group.
         let mut columns = BTreeMap::new();
         let tc = ColumnType::Time(Column::from(&[1_i64, 2, 3, 4, 5, 6][..]));
         columns.insert("time".to_string(), tc);
@@ -809,7 +1056,7 @@ mod test {
         .collect::<BTreeMap<_, _>>();
         assert_eq!(
             table
-                .meta
+                .meta()
                 .columns
                 .iter()
                 .map(|(k, v)| (k.as_str(), v.logical_data_type))
@@ -817,7 +1064,7 @@ mod test {
             exp_col_types
         );
 
-        // Build another segment.
+        // Build another row group.
         let mut columns = BTreeMap::new();
         let tc = ColumnType::Time(Column::from(&[10_i64, 20, 30][..]));
         columns.insert("time".to_string(), tc);
@@ -825,15 +1072,12 @@ mod test {
         columns.insert("region".to_string(), rc);
         let fc = ColumnType::Field(Column::from(&[1000_u64, 1002, 1200][..]));
         columns.insert("count".to_string(), fc);
-        let segment = RowGroup::new(3, columns);
-        table.add_row_group(segment);
+        let row_group = RowGroup::new(3, columns);
+        table.add_row_group(row_group);
 
         // Get all the results
         let predicate = Predicate::with_time_range(&[], 1, 31);
-        let results = table.read_filter(
-            &ColumnSelection::Some(&["time", "count", "region"]),
-            &predicate,
-        );
+        let results = table.read_filter(&Selection::Some(&["time", "count", "region"]), &predicate);
 
         // check the column types
         let exp_schema = ResultSchema {
@@ -853,17 +1097,15 @@ mod test {
             ],
             ..ResultSchema::default()
         };
-
         assert_eq!(results.schema(), &exp_schema);
 
-        let mut all = vec![];
-        for result in results {
+        let results = results.row_group_results();
+        for result in &results {
             assert_eq!(result.schema(), &exp_schema);
-            all.push(result);
         }
 
         assert_eq!(
-            format!("{}", DisplayReadFilterResults(all)),
+            format!("{}", DisplayReadFilterResults(results)),
             "time,count,region
 1,100,west
 2,101,west
@@ -881,15 +1123,29 @@ mod test {
             Predicate::with_time_range(&[BinaryExpr::from(("region", "!=", "south"))], 1, 25);
 
         // Apply a predicate `WHERE "region" != "south"`
-        let results = table.read_filter(&ColumnSelection::Some(&["time", "region"]), &predicate);
+        let results = table.read_filter(&Selection::Some(&["time", "region"]), &predicate);
 
-        let mut all = vec![];
-        for result in results {
-            all.push(result);
+        let exp_schema = ResultSchema {
+            select_columns: vec![
+                (
+                    schema::ColumnType::Timestamp("time".to_owned()),
+                    LogicalDataType::Integer,
+                ),
+                (
+                    schema::ColumnType::Tag("region".to_owned()),
+                    LogicalDataType::String,
+                ),
+            ],
+            ..ResultSchema::default()
+        };
+
+        let results = results.row_group_results();
+        for result in &results {
+            assert_eq!(result.schema(), &exp_schema);
         }
 
         assert_eq!(
-            format!("{}", DisplayReadFilterResults(all)),
+            format!("{}", DisplayReadFilterResults(results)),
             "time,region
 1,west
 2,west
@@ -902,61 +1158,207 @@ mod test {
     }
 
     #[test]
-    fn read_group_result() {
-        let results = DisplayReadAggregateResults(vec![
-            ReadAggregateResult {
-                schema: ResultSchema {
-                    select_columns: vec![],
-                    group_columns: vec![
-                        (
-                            schema::ColumnType::Tag("region".to_owned()),
-                            LogicalDataType::String,
-                        ),
-                        (
-                            schema::ColumnType::Tag("host".to_owned()),
-                            LogicalDataType::String,
-                        ),
-                    ],
-                    aggregate_columns: vec![(
-                        schema::ColumnType::Tag("temp".to_owned()),
-                        AggregateType::Sum,
-                        LogicalDataType::Integer,
-                    )],
-                },
-                group_keys: vec![vec![Value::String("east"), Value::String("host-a")].into()],
-                aggregates: vec![vec![AggregateResult::Sum(Scalar::I64(10))]],
-            },
-            ReadAggregateResult {
-                schema: ResultSchema {
-                    select_columns: vec![],
-                    group_columns: vec![
-                        (
-                            schema::ColumnType::Tag("region".to_owned()),
-                            LogicalDataType::String,
-                        ),
-                        (
-                            schema::ColumnType::Tag("host".to_owned()),
-                            LogicalDataType::String,
-                        ),
-                    ],
-                    aggregate_columns: vec![(
-                        schema::ColumnType::Tag("temp".to_owned()),
-                        AggregateType::Sum,
-                        LogicalDataType::Integer,
-                    )],
-                },
-                group_keys: vec![vec![Value::String("west"), Value::String("host-b")].into()],
-                aggregates: vec![vec![AggregateResult::Sum(Scalar::I64(100))]],
-            },
-        ]);
+    fn read_aggregate_no_groups() {
+        // Build first row group.
+        let mut columns = BTreeMap::new();
+        columns.insert(
+            "time".to_string(),
+            ColumnType::create_time(&[100, 200, 300]),
+        );
+        columns.insert(
+            "region".to_string(),
+            ColumnType::create_tag(&["west", "west", "east"]),
+        );
+        let rg = RowGroup::new(3, columns);
+        let mut table = Table::new("cpu", rg);
 
-        //Display implementation
+        // Build another row group.
+        let mut columns = BTreeMap::new();
+        columns.insert("time".to_string(), ColumnType::create_time(&[2, 3]));
+        columns.insert(
+            "region".to_string(),
+            ColumnType::create_tag(&["north", "north"]),
+        );
+        let rg = RowGroup::new(2, columns);
+        table.add_row_group(rg);
+
+        // no predicate aggregate
+        let mut results = table.read_aggregate(
+            Predicate::default(),
+            &Selection::Some(&[]),
+            &[("time", AggregateType::Count), ("time", AggregateType::Sum)],
+        );
+
+        // check the column result schema
+        let exp_schema = ResultSchema {
+            aggregate_columns: vec![
+                (
+                    schema::ColumnType::Timestamp("time".to_owned()),
+                    AggregateType::Count,
+                    LogicalDataType::Unsigned,
+                ),
+                (
+                    schema::ColumnType::Timestamp("time".to_owned()),
+                    AggregateType::Sum,
+                    LogicalDataType::Integer,
+                ),
+            ],
+            ..ResultSchema::default()
+        };
+        assert_eq!(results.schema(), &exp_schema);
+
+        assert_eq!(
+            DisplayReadAggregateResults(vec![results.next_merged_result().unwrap()]).to_string(),
+            "time_count,time_sum\n5,605\n",
+        );
+        assert!(matches!(results.next_merged_result(), None));
+
+        // apply a predicate
+        let mut results = table.read_aggregate(
+            Predicate::new(vec![BinaryExpr::from(("region", "=", "west"))]),
+            &Selection::Some(&[]),
+            &[("time", AggregateType::Count), ("time", AggregateType::Sum)],
+        );
+
+        assert_eq!(
+            DisplayReadAggregateResults(vec![results.next_merged_result().unwrap()]).to_string(),
+            "time_count,time_sum\n2,300\n",
+        );
+        assert!(matches!(results.next_merged_result(), None));
+    }
+
+    #[test]
+    fn read_aggregate_result_display() {
+        let mut result_a = ReadAggregateResult {
+            schema: ResultSchema {
+                select_columns: vec![],
+                group_columns: vec![
+                    (
+                        schema::ColumnType::Tag("region".to_owned()),
+                        LogicalDataType::String,
+                    ),
+                    (
+                        schema::ColumnType::Tag("host".to_owned()),
+                        LogicalDataType::String,
+                    ),
+                ],
+                aggregate_columns: vec![(
+                    schema::ColumnType::Tag("temp".to_owned()),
+                    AggregateType::Sum,
+                    LogicalDataType::Integer,
+                )],
+            },
+            ..ReadAggregateResult::default()
+        };
+        result_a.add_row(
+            vec![Value::String("east"), Value::String("host-a")],
+            vec![AggregateResult::Sum(Scalar::I64(10))],
+        );
+
+        let mut result_b = ReadAggregateResult {
+            schema: ResultSchema {
+                select_columns: vec![],
+                group_columns: vec![
+                    (
+                        schema::ColumnType::Tag("region".to_owned()),
+                        LogicalDataType::String,
+                    ),
+                    (
+                        schema::ColumnType::Tag("host".to_owned()),
+                        LogicalDataType::String,
+                    ),
+                ],
+                aggregate_columns: vec![(
+                    schema::ColumnType::Tag("temp".to_owned()),
+                    AggregateType::Sum,
+                    LogicalDataType::Integer,
+                )],
+            },
+            ..Default::default()
+        };
+        result_b.add_row(
+            vec![Value::String("west"), Value::String("host-b")],
+            vec![AggregateResult::Sum(Scalar::I64(100))],
+        );
+
+        let results = DisplayReadAggregateResults(vec![result_a, result_b]); //Display implementation
         assert_eq!(
             format!("{}", &results),
             "region,host,temp_sum
 east,host-a,10
 west,host-b,100
 "
+        );
+    }
+
+    #[test]
+    fn column_names() {
+        // Build a row group.
+        let mut columns = BTreeMap::new();
+        let tc = ColumnType::Time(Column::from(&[1_i64, 2, 3][..]));
+        columns.insert("time".to_string(), tc);
+
+        let rc = ColumnType::Tag(Column::from(&["west", "south", "north"][..]));
+        columns.insert("region".to_string(), rc);
+        let rg = RowGroup::new(3, columns);
+        let mut table = Table::new("cpu".to_owned(), rg);
+
+        // add another row group
+        let mut columns = BTreeMap::new();
+        let tc = ColumnType::Time(Column::from(&[200_i64, 300, 400][..]));
+        columns.insert("time".to_string(), tc);
+
+        let rc = ColumnType::Tag(Column::from(vec![Some("north"), None, None].as_slice()));
+        columns.insert("region".to_string(), rc);
+        let rg = RowGroup::new(3, columns);
+        table.add_row_group(rg);
+
+        // Table looks like:
+        //
+        // region, time
+        // ------------
+        // west,     1
+        // south,    2
+        // north,    3
+        // <- next row group ->
+        // north,  200
+        // NULL,   300
+        // NULL,   400
+
+        let mut dst: BTreeSet<String> = BTreeSet::new();
+        dst = table.column_names(&Predicate::default(), dst);
+
+        assert_eq!(
+            dst.iter().cloned().collect::<Vec<_>>(),
+            vec!["region".to_owned(), "time".to_owned()],
+        );
+
+        // re-run and get the same answer
+        dst = table.column_names(&Predicate::default(), dst);
+        assert_eq!(
+            dst.iter().cloned().collect::<Vec<_>>(),
+            vec!["region".to_owned(), "time".to_owned()],
+        );
+
+        // include a predicate that doesn't match any region rows and still get
+        // region from previous results.
+        dst = table.column_names(
+            &Predicate::new(vec![BinaryExpr::from(("time", ">=", 300_i64))]),
+            dst,
+        );
+        assert_eq!(
+            dst.iter().cloned().collect::<Vec<_>>(),
+            vec!["region".to_owned(), "time".to_owned()],
+        );
+
+        // wipe the destination buffer and region won't show up
+        dst = table.column_names(
+            &Predicate::new(vec![BinaryExpr::from(("time", ">=", 300_i64))]),
+            BTreeSet::new(),
+        );
+        assert_eq!(
+            dst.iter().cloned().collect::<Vec<_>>(),
+            vec!["time".to_owned()],
         );
     }
 }

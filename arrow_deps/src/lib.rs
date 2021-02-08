@@ -5,8 +5,11 @@
 // export arrow, parquet, and datafusion publically so we can have a single
 // reference in cargo
 pub use arrow;
+pub use arrow_flight;
 pub use datafusion;
 pub use parquet;
+
+pub mod util;
 
 /// This has a collection of testing helper functions
 pub mod test_util;

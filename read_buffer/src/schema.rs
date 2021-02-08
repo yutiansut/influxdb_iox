@@ -9,7 +9,7 @@ use data_types::schema::InfluxFieldType;
 /// This schema is useful for helping with displaying information in tests and
 /// decorating Arrow record batches when results are converted before leaving
 /// the read buffer.
-#[derive(Default, PartialEq, Debug)]
+#[derive(Default, PartialEq, Debug, Clone)]
 pub struct ResultSchema {
     pub select_columns: Vec<(ColumnType, LogicalDataType)>,
     pub group_columns: Vec<(ColumnType, LogicalDataType)>,
@@ -45,30 +45,48 @@ impl ResultSchema {
                 ColumnType::Other(name) => name,
             })
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn len(&self) -> usize {
+        self.select_columns.len() + self.group_columns.len() + self.aggregate_columns.len()
+    }
+
+    // How to display the name for a column that was constructed as an aggregate
+    // result.
+    //
+    // TODO(edd): support multiple instances of the same aggregation on the same
+    // column? E.g., `temp_sum_1`, `temp_sum_2` etc??
+    fn aggregate_result_column_name(&self, i: usize) -> String {
+        let (col_type, agg_type, _) = self.aggregate_columns.get(i).unwrap();
+        format!("{}_{}", col_type, agg_type)
+    }
 }
 
 /// Effectively emits a header line for a CSV-like table.
 impl Display for ResultSchema {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // do we need to emit the group by and aggregate columns?
-        let has_group_and_agg = !self.group_columns.is_empty();
+        // do we need to emit the group by or aggregate columns?
+        let has_agg_columns = !self.aggregate_columns.is_empty();
 
         for (i, (name, _)) in self.select_columns.iter().enumerate() {
-            if has_group_and_agg || i < self.select_columns.len() - 1 {
+            if has_agg_columns || i < self.select_columns.len() - 1 {
                 write!(f, "{},", name)?;
-            } else if !has_group_and_agg {
+            } else if !has_agg_columns {
                 return write!(f, "{}", name); // last value in header row
             }
         }
 
-        // write out group by columns
+        // write out group by columns, if any
         for (i, (name, _)) in self.group_columns.iter().enumerate() {
             write!(f, "{},", name)?;
         }
 
         // finally, emit the aggregate columns
-        for (i, (col_name, col_agg, _)) in self.aggregate_columns.iter().enumerate() {
-            write!(f, "{}_{}", col_name, col_agg)?;
+        for (i, _) in self.aggregate_columns.iter().enumerate() {
+            write!(f, "{}", self.aggregate_result_column_name(i))?;
 
             if i < self.aggregate_columns.len() - 1 {
                 write!(f, ",")?;
@@ -91,6 +109,31 @@ impl TryFrom<&ResultSchema> for data_types::schema::Schema {
                 }
                 ColumnType::Timestamp(_) => builder = builder.timestamp(),
                 ColumnType::Other(name) => builder = builder.field(name.as_str(), data_type.into()),
+            }
+        }
+
+        for (col_type, data_type) in &rs.group_columns {
+            match col_type {
+                ColumnType::Tag(name) => builder = builder.tag(name.as_str()),
+                ColumnType::Field(name) => {
+                    builder = builder.influx_field(name.as_str(), data_type.into())
+                }
+                ColumnType::Timestamp(_) => builder = builder.timestamp(),
+                ColumnType::Other(name) => builder = builder.field(name.as_str(), data_type.into()),
+            }
+        }
+
+        for (i, (col_type, _, data_type)) in rs.aggregate_columns.iter().enumerate() {
+            let col_name = rs.aggregate_result_column_name(i);
+
+            match col_type {
+                ColumnType::Field(_) => {
+                    builder = builder.influx_field(col_name.as_str(), data_type.into())
+                }
+                ColumnType::Other(_) => {
+                    builder = builder.field(col_name.as_str(), data_type.into())
+                }
+                ct => unreachable!("not possible to aggregate {:?} columns", ct),
             }
         }
 

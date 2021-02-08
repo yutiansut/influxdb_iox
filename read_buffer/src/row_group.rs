@@ -1,12 +1,15 @@
 use std::{
     borrow::Cow,
-    collections::BTreeMap,
+    cmp::Ordering,
+    collections::{BTreeMap, BTreeSet},
     convert::{TryFrom, TryInto},
+    sync::Arc,
 };
 
+use arrow::array;
 use hashbrown::{hash_map, HashMap};
 use itertools::Itertools;
-use snafu::Snafu;
+use snafu::{ResultExt, Snafu};
 
 use crate::column::{
     cmp::Operator, AggregateResult, Column, EncodedValues, OwnedValue, RowIDs, RowIDsOption,
@@ -35,6 +38,9 @@ pub enum Error {
     SchemaError {
         source: data_types::schema::builder::Error,
     },
+
+    #[snafu(display("unsupported operation: {}", msg))]
+    UnsupportedOperation { msg: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -170,16 +176,45 @@ impl RowGroup {
         self.meta.time_range
     }
 
-    /// Efficiently determines if the provided set of binary expressions could
-    /// all be satisfied by the `RowGroup` when conjunctively applied.
+    /// Efficiently determines if the row group _might_ satisfy all of the
+    /// provided binary expressions, when conjunctively applied.
+    ///
+    /// `false` indicates that one or more of the expressions would not match
+    /// any rows in the row group.
     pub fn could_satisfy_conjunctive_binary_expressions<'a>(
         &self,
         exprs: impl IntoIterator<Item = &'a BinaryExpr>,
     ) -> bool {
-        // Returns false if ANY expression cannot possibly be satisfied.
+        // if a single expression returns `false` then the whole operation
+        // returns `false` because the expressions are conjunctively applied.
         exprs
             .into_iter()
             .all(|expr| self.meta.column_could_satisfy_binary_expr(expr))
+    }
+
+    /// Determines if the row group contains one or more rows that satisfy all
+    /// of the provided binary expressions, when conjunctively applied.
+    ///
+    /// `satisfies_predicate` currently constructs a set of row ids for all
+    /// rows that satisfy the predicate, but does not materialise any
+    /// values. There are some optimisation opportunities here, but I don't
+    /// think they're at all worth it at the moment.
+    ///
+    /// They could be:
+    ///  * for predicates with single expression just find a matching value in
+    ///    the column;
+    ///  * in some cases perhaps work row by row rather than column by column.
+    pub fn satisfies_predicate(&self, predicate: &Predicate) -> bool {
+        if !self.could_satisfy_conjunctive_binary_expressions(predicate.iter()) {
+            return false;
+        }
+
+        // return false if there were no rows ids returned that satisfy the
+        // predicate.
+        !matches!(
+            self.row_ids_from_predicate(predicate),
+            RowIDsOption::None(_)
+        )
     }
 
     //
@@ -201,12 +236,11 @@ impl RowGroup {
 
         let schema = ResultSchema {
             select_columns,
-            group_columns: vec![],
-            aggregate_columns: vec![],
+            ..Default::default()
         };
 
         // apply predicates to determine candidate rows.
-        let row_ids = self.row_ids_from_predicates(predicates);
+        let row_ids = self.row_ids_from_predicate(predicates);
         let col_data = self.materialise_rows(columns, row_ids);
         ReadFilterResult {
             schema,
@@ -245,7 +279,7 @@ impl RowGroup {
     }
 
     // Determines the set of row ids that satisfy the provided predicate.
-    fn row_ids_from_predicates(&self, predicate: &Predicate) -> RowIDsOption {
+    fn row_ids_from_predicate(&self, predicate: &Predicate) -> RowIDsOption {
         // TODO(edd): perf - potentially pool this so we can re-use it once rows
         // have been materialised and it's no longer needed. Initialise a bitmap
         // RowIDs because it's like that set operations will be necessary.
@@ -368,6 +402,14 @@ impl RowGroup {
             ..ReadAggregateResult::default()
         };
 
+        // Pure column aggregates - no grouping.
+        if group_columns.is_empty() {
+            self.aggregate_columns(predicate, &mut result);
+            return result;
+        }
+
+        // All of the below assume grouping by columns.
+
         // Handle case where there are no predicates and all the columns being
         // grouped support constant-time expression of the row_ids belonging to
         // each grouped value.
@@ -383,7 +425,7 @@ impl RowGroup {
 
         // There are predicates. The next stage is apply them and determine the
         // intermediate set of row ids.
-        let row_ids = self.row_ids_from_predicates(predicate);
+        let row_ids = self.row_ids_from_predicate(predicate);
         let filter_row_ids = match row_ids {
             RowIDsOption::None(_) => {
                 return result;
@@ -538,7 +580,7 @@ impl RowGroup {
             .map(|name| self.column_by_name(name))
             .collect::<Vec<_>>();
         let mut group_key_vec: Vec<GroupKey<'_>> = Vec::with_capacity(groups.len());
-        let mut aggregate_vec = Vec::with_capacity(groups.len());
+        let mut aggregate_vec: Vec<AggregateResults<'_>> = Vec::with_capacity(groups.len());
 
         for (group_key, aggs) in groups.into_iter() {
             let mut logical_key = Vec::with_capacity(group_key.len());
@@ -548,7 +590,7 @@ impl RowGroup {
             }
 
             group_key_vec.push(GroupKey(logical_key));
-            aggregate_vec.push(aggs.clone());
+            aggregate_vec.push(AggregateResults(aggs));
         }
 
         // update results
@@ -616,7 +658,7 @@ impl RowGroup {
             .map(|name| self.column_by_name(name))
             .collect::<Vec<_>>();
         let mut group_key_vec: Vec<GroupKey<'_>> = Vec::with_capacity(groups.len());
-        let mut aggregate_vec = Vec::with_capacity(groups.len());
+        let mut aggregate_vec: Vec<AggregateResults<'_>> = Vec::with_capacity(groups.len());
 
         for (group_key_packed, aggs) in groups.into_iter() {
             let mut logical_key = Vec::with_capacity(columns.len());
@@ -630,7 +672,7 @@ impl RowGroup {
             }
 
             group_key_vec.push(GroupKey(logical_key));
-            aggregate_vec.push(aggs.clone());
+            aggregate_vec.push(AggregateResults(aggs));
         }
 
         dst.group_keys = group_key_vec;
@@ -749,7 +791,7 @@ impl RowGroup {
                     }
                 });
             }
-            dst.aggregates.push(aggregates);
+            dst.aggregates.push(AggregateResults(aggregates));
         }
     }
 
@@ -764,8 +806,8 @@ impl RowGroup {
         groupby_encoded_ids: &[u32],
         aggregate_columns_data: Vec<Values<'a>>,
     ) {
+        assert_eq!(dst.schema().group_columns.len(), 1);
         let column = self.column_by_name(dst.schema.group_column_names_iter().next().unwrap());
-        assert_eq!(dst.schema.group_columns.len(), aggregate_columns_data.len());
         let total_rows = groupby_encoded_ids.len();
 
         // Allocate a vector to hold aggregates that can be updated as rows are
@@ -809,7 +851,7 @@ impl RowGroup {
         for (group_key, aggs) in groups.into_iter().enumerate() {
             if let Some(aggs) = aggs {
                 group_key_vec.push(GroupKey(vec![column.decode_id(group_key as u32)]));
-                aggregate_vec.push(aggs);
+                aggregate_vec.push(AggregateResults(aggs));
             }
         }
 
@@ -830,6 +872,101 @@ impl RowGroup {
     ) {
         todo!()
     }
+
+    // Applies aggregates on multiple columns with an optional predicate.
+    fn aggregate_columns<'a>(&'a self, predicate: &Predicate, dst: &mut ReadAggregateResult<'a>) {
+        let aggregate_columns = dst
+            .schema
+            .aggregate_columns
+            .iter()
+            .map(|(col_type, agg_type, _)| (self.column_by_name(col_type.as_str()), *agg_type))
+            .collect::<Vec<_>>();
+
+        let row_ids = match predicate.is_empty() {
+            true => {
+                // TODO(edd): PERF - teach each column encoding how to produce
+                // an aggregate for all its rows without needed
+                // to see the entire set of row ids. Currently
+                // column encodings aggregate based on the slice
+                // of row ids they see.
+                (0..self.rows()).into_iter().collect::<Vec<u32>>()
+            }
+            false => match self.row_ids_from_predicate(predicate) {
+                RowIDsOption::Some(row_ids) => row_ids.to_vec(),
+                RowIDsOption::None(_) => vec![],
+                RowIDsOption::All(row_ids) => {
+                    // see above comment.
+                    (0..self.rows()).into_iter().collect::<Vec<u32>>()
+                }
+            },
+        };
+
+        // the single row that will store the aggregate column values.
+        let mut aggregate_row = vec![];
+        for (col, agg_type) in aggregate_columns {
+            match agg_type {
+                AggregateType::Count => {
+                    aggregate_row.push(AggregateResult::Count(col.count(&row_ids) as u64));
+                }
+                AggregateType::Sum => {
+                    aggregate_row.push(AggregateResult::Sum(col.sum(&row_ids)));
+                }
+                AggregateType::Min => {
+                    aggregate_row.push(AggregateResult::Min(col.min(&row_ids)));
+                }
+                AggregateType::Max => {
+                    aggregate_row.push(AggregateResult::Max(col.max(&row_ids)));
+                }
+                _ => unimplemented!("Other aggregates are not yet supported"),
+            }
+        }
+        dst.aggregates.push(AggregateResults(aggregate_row)); // write the row
+    }
+
+    /// Given the predicate (which may be empty), determine a set of rows
+    /// contained in this row group that satisfy it. Any column that contains a
+    /// non-null value at any of these row positions is then included in the
+    /// results, which are added to `dst`.
+    ///
+    /// As an optimisation, the contents of `dst` are checked before execution
+    /// and any columns already existing in the set are not interrogated.
+    ///
+    /// If you are familiar with InfluxDB, this is essentially an implementation
+    /// of `SHOW TAG KEYS`.
+    pub fn column_names(&self, predicate: &Predicate, dst: &mut BTreeSet<String>) {
+        // Determine the set of columns in this row group that are not already
+        // present in `dst`, i.e., they haven't been identified in other row
+        // groups already.
+        let candidate_columns = self
+            .all_columns_by_name
+            .iter()
+            .filter_map(|(name, &id)| match dst.contains(name) {
+                // N.B there is bool::then() but it's currently unstable.
+                true => None,
+                false => Some((name, &self.columns[id])),
+            })
+            .collect::<Vec<_>>();
+
+        match self.row_ids_from_predicate(predicate) {
+            RowIDsOption::None(_) => {} // nothing matches predicate
+            RowIDsOption::Some(row_ids) => {
+                let row_ids = row_ids.to_vec();
+
+                for (name, column) in candidate_columns {
+                    if column.has_non_null_value(&row_ids) {
+                        dst.insert(name.to_owned());
+                    }
+                }
+            }
+            RowIDsOption::All(_) => {
+                for (name, column) in candidate_columns {
+                    if column.has_any_non_null_value() {
+                        dst.insert(name.to_owned());
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Initialise a `RowGroup` from an Arrow RecordBatch.
@@ -845,7 +982,7 @@ impl From<RecordBatch> for RowGroup {
         let schema: Schema = rb
             .schema()
             .try_into()
-            .expect("Valid timeseries schema when creating row group");
+            .expect("Valid time-series schema when creating row group");
 
         let mut columns = BTreeMap::new();
         for (i, arrow_column) in rb.columns().iter().enumerate() {
@@ -855,35 +992,25 @@ impl From<RecordBatch> for RowGroup {
             match lp_type {
                 Some(InfluxColumnType::Tag) => {
                     assert_eq!(arrow_column.data_type(), &arrow::datatypes::DataType::Utf8);
-                    let arr: &arrow::array::StringArray = arrow_column
-                        .as_any()
-                        .downcast_ref::<arrow::array::StringArray>()
-                        .unwrap();
-
-                    let column_data = Column::from(arr);
+                    let column_data =
+                        Column::from(arrow::array::StringArray::from(arrow_column.data()));
 
                     columns.insert(col_name.to_owned(), ColumnType::Tag(column_data));
                 }
                 Some(InfluxColumnType::Field(_)) => {
                     let column_data = match arrow_column.data_type() {
-                        arrow::datatypes::DataType::Int64 => Column::from(
-                            arrow_column
-                                .as_any()
-                                .downcast_ref::<arrow::array::Int64Array>()
-                                .unwrap(),
-                        ),
-                        arrow::datatypes::DataType::Float64 => Column::from(
-                            arrow_column
-                                .as_any()
-                                .downcast_ref::<arrow::array::Float64Array>()
-                                .unwrap(),
-                        ),
-                        arrow::datatypes::DataType::UInt64 => Column::from(
-                            arrow_column
-                                .as_any()
-                                .downcast_ref::<arrow::array::UInt64Array>()
-                                .unwrap(),
-                        ),
+                        arrow::datatypes::DataType::Int64 => {
+                            Column::from(arrow::array::Int64Array::from(arrow_column.data()))
+                        }
+                        arrow::datatypes::DataType::Float64 => {
+                            Column::from(arrow::array::Float64Array::from(arrow_column.data()))
+                        }
+                        arrow::datatypes::DataType::UInt64 => {
+                            Column::from(arrow::array::UInt64Array::from(arrow_column.data()))
+                        }
+                        arrow::datatypes::DataType::Boolean => {
+                            Column::from(arrow::array::BooleanArray::from(arrow_column.data()))
+                        }
                         dt => unimplemented!(
                             "data type {:?} currently not supported for field columns",
                             dt
@@ -895,13 +1022,8 @@ impl From<RecordBatch> for RowGroup {
                 Some(InfluxColumnType::Timestamp) => {
                     assert_eq!(col_name, TIME_COLUMN_NAME);
 
-                    let column_data = Column::from(match arrow_column.data_type() {
-                        arrow::datatypes::DataType::Int64 => arrow_column
-                            .as_any()
-                            .downcast_ref::<arrow::array::Int64Array>()
-                            .unwrap(),
-                        dt => panic!("{:?} column with {:?} must have type i64", col_name, dt),
-                    });
+                    let column_data =
+                        Column::from(arrow::array::Int64Array::from(arrow_column.data()));
 
                     columns.insert(col_name.to_owned(), ColumnType::Time(column_data));
                 }
@@ -1145,6 +1267,12 @@ impl TryFrom<&DfExpr> for BinaryExpr {
 #[derive(PartialEq, PartialOrd, Clone)]
 pub struct GroupKey<'row_group>(Vec<Value<'row_group>>);
 
+impl GroupKey<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
 impl<'a> From<Vec<Value<'a>>> for GroupKey<'a> {
     fn from(values: Vec<Value<'a>>) -> Self {
         Self(values)
@@ -1186,6 +1314,31 @@ impl Ord for GroupKey<'_> {
     }
 }
 
+#[derive(Debug, PartialEq, Clone)]
+pub struct AggregateResults<'row_group>(Vec<AggregateResult<'row_group>>);
+
+impl<'row_group> AggregateResults<'row_group> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn merge(&mut self, other: &AggregateResults<'row_group>) {
+        assert_eq!(self.0.len(), other.len());
+        for (i, agg) in self.0.iter_mut().enumerate() {
+            agg.merge(&other.0[i]);
+        }
+    }
+}
+
+impl<'a> IntoIterator for AggregateResults<'a> {
+    type Item = AggregateResult<'a>;
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
 // A representation of a column name.
 pub type ColumnName<'a> = &'a str;
 
@@ -1204,6 +1357,16 @@ impl ColumnType {
             ColumnType::Field(c) => c.size(),
             ColumnType::Time(c) => c.size(),
         }
+    }
+
+    /// Helper function to construct a `Tag` column from a slice of `&str`
+    pub fn create_tag(values: &[&str]) -> Self {
+        Self::Tag(Column::from(values))
+    }
+
+    /// Helper function to construct a `Time` column from a slice of `i64`
+    pub fn create_time(values: &[i64]) -> Self {
+        Self::Time(Column::from(values))
     }
 }
 
@@ -1325,7 +1488,19 @@ impl MetaData {
             .iter()
             .map(|(name, agg_type)| {
                 let schema = self.columns.get(*name).unwrap();
-                (schema.typ.clone(), *agg_type, schema.logical_data_type)
+
+                // TODO(edd): this check happens because an aggregate does
+                // not have to have the same physical type as the logical
+                // type of the column it is aggregating on. An example of
+                // this is Count. I'm going to fix this by associated data
+                // types with the aggregate itself.
+                let physical_data_type = if let AggregateType::Count = agg_type {
+                    LogicalDataType::Unsigned
+                } else {
+                    schema.logical_data_type
+                };
+
+                (schema.typ.clone(), *agg_type, physical_data_type)
             })
             .collect::<Vec<_>>()
     }
@@ -1415,7 +1590,7 @@ impl std::fmt::Display for &ReadFilterResult<'_> {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct ReadAggregateResult<'row_group> {
     // a schema describing the columns in the results and their types.
     pub(crate) schema: ResultSchema,
@@ -1426,16 +1601,32 @@ pub struct ReadAggregateResult<'row_group> {
 
     // row-wise collection of aggregates. Each aggregate contains column-wise
     // values for each of the aggregate_columns.
-    pub(crate) aggregates: Vec<Vec<AggregateResult<'row_group>>>,
+    pub(crate) aggregates: Vec<AggregateResults<'row_group>>,
+
+    pub(crate) group_keys_sorted: bool,
 }
 
-impl ReadAggregateResult<'_> {
+impl<'row_group> ReadAggregateResult<'row_group> {
+    fn with_capacity(schema: ResultSchema, capacity: usize) -> Self {
+        Self {
+            schema,
+            group_keys: Vec::with_capacity(capacity),
+            aggregates: Vec::with_capacity(capacity),
+            ..Default::default()
+        }
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.group_keys.is_empty()
+        self.aggregates.is_empty()
     }
 
     pub fn schema(&self) -> &ResultSchema {
         &self.schema
+    }
+
+    // The number of rows in the result.
+    pub fn rows(&self) -> usize {
+        self.aggregates.len()
     }
 
     // The number of distinct group keys in the result.
@@ -1443,9 +1634,110 @@ impl ReadAggregateResult<'_> {
         self.group_keys.len()
     }
 
+    // Is this result for a grouped aggregate?
+    pub fn is_grouped_aggregate(&self) -> bool {
+        !self.group_keys.is_empty()
+    }
+
+    // Whether or not the rows in the results are sorted by group keys or not.
+    pub fn group_keys_sorted(&self) -> bool {
+        self.group_keys.is_empty() || self.group_keys_sorted
+    }
+
+    /// Merges `other` and self, returning a new set of results.
+    ///
+    /// NOTE: This is slow! Not expected to be the final type of implementation
+    pub fn merge(
+        mut self,
+        mut other: ReadAggregateResult<'row_group>,
+    ) -> ReadAggregateResult<'row_group> {
+        assert_eq!(self.schema(), other.schema());
+
+        if self.is_empty() {
+            return other;
+        } else if other.is_empty() {
+            return self;
+        }
+
+        // `read_aggregate` uses a variety of ways to generate results. It is
+        // not safe to assume any particular ordering, so we will sort self and
+        // other and do a merge.
+        if !self.group_keys_sorted() {
+            self.sort();
+        }
+
+        if !other.group_keys_sorted() {
+            other.sort();
+        }
+
+        let self_group_keys = self.cardinality();
+        let other_group_keys = other.cardinality();
+        let self_len = self.rows();
+        let other_len = other.rows();
+        let mut result = Self::with_capacity(self.schema, self_len.max(other_len));
+
+        let mut i: usize = 0;
+        let mut j: usize = 0;
+        while i < self_len || j < other_len {
+            if i >= self_len {
+                // drained self, add the rest of other
+                result
+                    .group_keys
+                    .extend(other.group_keys.iter().skip(j).cloned());
+                result
+                    .aggregates
+                    .extend(other.aggregates.iter().skip(j).cloned());
+                return result;
+            } else if j >= other_len {
+                // drained other, add the rest of self
+                result
+                    .group_keys
+                    .extend(self.group_keys.iter().skip(j).cloned());
+                result
+                    .aggregates
+                    .extend(self.aggregates.iter().skip(j).cloned());
+                return result;
+            }
+
+            // just merge the aggregate if there are no group keys
+            if self_group_keys == 0 {
+                assert!((self_len == other_len) && self_len == 1); // there should be a single aggregate row
+                self.aggregates[i].merge(&other.aggregates[j]);
+                result.aggregates.push(self.aggregates[i].clone());
+                return result;
+            }
+
+            // there are group keys so merge them.
+            match self.group_keys[i].cmp(&other.group_keys[j]) {
+                Ordering::Less => {
+                    result.group_keys.push(self.group_keys[i].clone());
+                    result.aggregates.push(self.aggregates[i].clone());
+                    i += 1;
+                }
+                Ordering::Equal => {
+                    // merge aggregates
+                    self.aggregates[i].merge(&other.aggregates[j]);
+                    result.group_keys.push(self.group_keys[i].clone());
+                    result.aggregates.push(self.aggregates[i].clone());
+                    i += 1;
+                    j += 1;
+                }
+                Ordering::Greater => {
+                    result.group_keys.push(other.group_keys[j].clone());
+                    result.aggregates.push(other.aggregates[j].clone());
+                    j += 1;
+                }
+            }
+        }
+
+        result
+    }
+
     /// Executes a mutable sort of the rows in the result set based on the
-    /// lexicographic order of each group key column. This is useful for testing
-    /// because it allows you to compare `read_group` results.
+    /// lexicographic order of each group key column.
+    ///
+    /// TODO(edd): this has really poor performance. It clones the underlying
+    /// vectors rather than sorting them in place.
     pub fn sort(&mut self) {
         // The permutation crate lets you execute a sort on anything implements
         // `Ord` and return the sort order, which can then be applied to other
@@ -1453,6 +1745,133 @@ impl ReadAggregateResult<'_> {
         let perm = permutation::sort(self.group_keys.as_slice());
         self.group_keys = perm.apply_slice(self.group_keys.as_slice());
         self.aggregates = perm.apply_slice(self.aggregates.as_slice());
+        self.group_keys_sorted = true;
+    }
+
+    pub fn add_row(
+        &mut self,
+        group_key: Vec<Value<'row_group>>,
+        aggregates: Vec<AggregateResult<'row_group>>,
+    ) {
+        self.group_keys.push(GroupKey(group_key));
+        self.aggregates.push(AggregateResults(aggregates));
+    }
+}
+
+impl TryFrom<ReadAggregateResult<'_>> for RecordBatch {
+    type Error = Error;
+
+    fn try_from(result: ReadAggregateResult<'_>) -> Result<Self, Self::Error> {
+        let schema = data_types::schema::Schema::try_from(result.schema())
+            .map_err(|source| Error::SchemaError { source })?;
+        let arrow_schema: arrow_deps::arrow::datatypes::SchemaRef = schema.into();
+
+        // Build the columns for the group keys. This involves pivoting the
+        // row-wise group keys into column-wise data.
+        let mut group_column_builders = (0..result.schema.group_columns.len())
+            .map(|_| {
+                arrow::array::StringBuilder::with_capacity(
+                    result.cardinality(),
+                    result.cardinality() * 8, // arbitrarily picked for now
+                )
+            })
+            .collect::<Vec<_>>();
+
+        // build each column for a group key value row by row.
+        for gk in result.group_keys.iter() {
+            for (i, v) in gk.0.iter().enumerate() {
+                group_column_builders[i]
+                    .append_value(v.string())
+                    .map_err(|source| Error::ArrowError { source })?;
+            }
+        }
+
+        // Add the group columns to the set of column data for the record batch.
+        let mut columns: Vec<Arc<dyn arrow::array::Array>> =
+            Vec::with_capacity(result.schema.len());
+        for col in group_column_builders.iter_mut() {
+            columns.push(Arc::new(col.finish()));
+        }
+
+        // For the aggregate columns, build one column at a time, repeatedly
+        // iterating rows until all columns have been built.
+        //
+        // TODO(edd): I don't like this *at all*. I'm going to refactor the way
+        // aggregates are produced.
+        for (i, (_, agg_type, data_type)) in result.schema.aggregate_columns.iter().enumerate() {
+            match data_type {
+                LogicalDataType::Integer => {
+                    let mut builder = array::Int64Builder::new(result.cardinality());
+                    for agg_row in &result.aggregates {
+                        builder
+                            .append_option(agg_row.0[i].try_as_i64_scalar())
+                            .context(ArrowError)?;
+                    }
+                    columns.push(Arc::new(builder.finish()));
+                }
+                LogicalDataType::Unsigned => {
+                    let mut builder = array::UInt64Builder::new(result.cardinality());
+                    for agg_row in &result.aggregates {
+                        builder
+                            .append_option(agg_row.0[i].try_as_u64_scalar())
+                            .context(ArrowError)?;
+                    }
+                    columns.push(Arc::new(builder.finish()));
+                }
+                LogicalDataType::Float => {
+                    let mut builder = array::Float64Builder::new(result.cardinality());
+                    for agg_row in &result.aggregates {
+                        builder
+                            .append_option(agg_row.0[i].try_as_f64_scalar())
+                            .context(ArrowError)?;
+                    }
+                    columns.push(Arc::new(builder.finish()));
+                }
+                LogicalDataType::String => {
+                    let mut builder = array::StringBuilder::new(result.cardinality());
+                    for agg_row in &result.aggregates {
+                        match agg_row.0[i].try_as_str() {
+                            Some(s) => builder.append_value(s).context(ArrowError)?,
+                            None => builder.append_null().context(ArrowError)?,
+                        }
+                    }
+                    columns.push(Arc::new(builder.finish()));
+                }
+                LogicalDataType::Binary => {
+                    let mut builder = array::BinaryBuilder::new(result.cardinality());
+                    for agg_row in &result.aggregates {
+                        match agg_row.0[i].try_as_bytes() {
+                            Some(s) => builder.append_value(s).context(ArrowError)?,
+                            None => builder.append_null().context(ArrowError)?,
+                        }
+                    }
+                    columns.push(Arc::new(builder.finish()));
+                }
+                LogicalDataType::Boolean => {
+                    let mut builder = array::BooleanBuilder::new(result.cardinality());
+                    for agg_row in &result.aggregates {
+                        builder
+                            .append_option(agg_row.0[i].try_as_bool())
+                            .context(ArrowError)?;
+                    }
+                    columns.push(Arc::new(builder.finish()));
+                }
+            }
+        }
+
+        // try_new only returns an error if the schema is invalid or the number
+        // of rows on columns differ. We have full control over both so there
+        // should never be an error to return...
+        arrow::record_batch::RecordBatch::try_new(arrow_schema, columns).context(ArrowError)
+    }
+}
+
+// `group_keys_sorted` does not contribute to a result's equality with another
+impl PartialEq for ReadAggregateResult<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema() == other.schema()
+            && self.group_keys == other.group_keys
+            && self.aggregates == other.aggregates
     }
 }
 
@@ -1476,21 +1895,24 @@ impl std::fmt::Display for &ReadAggregateResult<'_> {
             return Ok(());
         }
 
-        let expected_rows = self.group_keys.len();
+        // There may or may not be group keys
+        let expected_rows = self.aggregates.len();
         for row in 0..expected_rows {
             if row > 0 {
                 writeln!(f)?;
             }
 
             // write row for group by columns
-            for value in self.group_keys[row].0.iter() {
-                write!(f, "{},", value)?;
+            if !self.group_keys.is_empty() {
+                for value in self.group_keys[row].0.iter() {
+                    write!(f, "{},", value)?;
+                }
             }
 
             // write row for aggregate columns
-            for (col_i, agg) in self.aggregates[row].iter().enumerate() {
+            for (col_i, agg) in self.aggregates[row].0.iter().enumerate() {
                 write!(f, "{}", agg)?;
-                if col_i < self.aggregates[row].len() - 1 {
+                if col_i < self.aggregates[row].0.len() - 1 {
                     write!(f, ",")?;
                 }
             }
@@ -1522,15 +1944,15 @@ mod test {
         let row_group = RowGroup::new(6, columns);
 
         // Closed partially covering "time range" predicate
-        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(&[], 200, 600));
+        let row_ids = row_group.row_ids_from_predicate(&Predicate::with_time_range(&[], 200, 600));
         assert_eq!(row_ids.unwrap().to_vec(), vec![1, 2, 4, 5]);
 
         // Fully covering "time range" predicate
-        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(&[], 10, 601));
+        let row_ids = row_group.row_ids_from_predicate(&Predicate::with_time_range(&[], 10, 601));
         assert!(matches!(row_ids, RowIDsOption::All(_)));
 
         // Open ended "time range" predicate
-        let row_ids = row_group.row_ids_from_predicates(&col_pred(BinaryExpr::from((
+        let row_ids = row_group.row_ids_from_predicate(&col_pred(BinaryExpr::from((
             TIME_COLUMN_NAME,
             ">=",
             300_i64,
@@ -1539,7 +1961,7 @@ mod test {
 
         // Closed partially covering "time range" predicate and other column
         // predicate
-        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(
+        let row_ids = row_group.row_ids_from_predicate(&Predicate::with_time_range(
             &[BinaryExpr::from(("region", "=", "south"))],
             200,
             600,
@@ -1547,7 +1969,7 @@ mod test {
         assert_eq!(row_ids.unwrap().to_vec(), vec![4]);
 
         // Fully covering "time range" predicate and other column predicate
-        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(
+        let row_ids = row_group.row_ids_from_predicate(&Predicate::with_time_range(
             &[BinaryExpr::from(("region", "=", "west"))],
             10,
             601,
@@ -1555,7 +1977,7 @@ mod test {
         assert_eq!(row_ids.unwrap().to_vec(), vec![0, 1, 3]);
 
         // "time range" predicate and other column predicate that doesn't match
-        let row_ids = row_group.row_ids_from_predicates(&Predicate::with_time_range(
+        let row_ids = row_group.row_ids_from_predicate(&Predicate::with_time_range(
             &[BinaryExpr::from(("region", "=", "nope"))],
             200,
             600,
@@ -1564,16 +1986,16 @@ mod test {
 
         // Just a column predicate
         let row_ids =
-            row_group.row_ids_from_predicates(&col_pred(BinaryExpr::from(("region", "=", "east"))));
+            row_group.row_ids_from_predicate(&col_pred(BinaryExpr::from(("region", "=", "east"))));
         assert_eq!(row_ids.unwrap().to_vec(), vec![2]);
 
         // Predicate can matches all the rows
-        let row_ids = row_group
-            .row_ids_from_predicates(&col_pred(BinaryExpr::from(("region", "!=", "abba"))));
+        let row_ids =
+            row_group.row_ids_from_predicate(&col_pred(BinaryExpr::from(("region", "!=", "abba"))));
         assert!(matches!(row_ids, RowIDsOption::All(_)));
 
         // No predicates
-        let row_ids = row_group.row_ids_from_predicates(&Predicate::default());
+        let row_ids = row_group.row_ids_from_predicate(&Predicate::default());
         assert!(matches!(row_ids, RowIDsOption::All(_)));
     }
 
@@ -1956,6 +2378,67 @@ west,POST,304,101,203
     }
 
     #[test]
+    fn row_group_satisfies_predicate() {
+        let mut columns = BTreeMap::new();
+        let tc = ColumnType::Time(Column::from(&[1_i64, 2, 3, 4, 5, 6][..]));
+        columns.insert("time".to_string(), tc);
+
+        let rc = ColumnType::Tag(Column::from(
+            &["west", "west", "east", "west", "south", "north"][..],
+        ));
+        columns.insert("region".to_string(), rc);
+
+        let mc = ColumnType::Tag(Column::from(
+            &["GET", "GET", "GET", "GET", "GET", "GET"][..],
+        ));
+        columns.insert("method".to_string(), mc);
+
+        let row_group = RowGroup::new(6, columns);
+
+        let mut predicate = Predicate::default();
+        assert_eq!(row_group.satisfies_predicate(&predicate), true);
+
+        predicate = Predicate::new(vec![BinaryExpr::from(("region", "=", "east"))]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), true);
+
+        // all expressions satisfied in data
+        predicate = Predicate::new(vec![
+            BinaryExpr::from(("region", "=", "east")),
+            BinaryExpr::from(("method", "!=", "POST")),
+        ]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), true);
+
+        // all expressions satisfied in data by all rows
+        predicate = Predicate::new(vec![BinaryExpr::from(("method", "=", "GET"))]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), true);
+
+        // one expression satisfied in data but other ruled out via column pruning.
+        predicate = Predicate::new(vec![
+            BinaryExpr::from(("region", "=", "east")),
+            BinaryExpr::from(("method", ">", "GET")),
+        ]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), false);
+
+        // all expressions rules out via column pruning.
+        predicate = Predicate::new(vec![
+            BinaryExpr::from(("region", ">", "west")),
+            BinaryExpr::from(("method", ">", "GET")),
+        ]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), false);
+
+        // column does not exist
+        predicate = Predicate::new(vec![BinaryExpr::from(("track", "=", "Jeanette"))]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), false);
+
+        // one column satisfies expression but other column does not exist
+        predicate = Predicate::new(vec![
+            BinaryExpr::from(("region", "=", "south")),
+            BinaryExpr::from(("track", "=", "Jeanette")),
+        ]);
+        assert_eq!(row_group.satisfies_predicate(&predicate), false);
+    }
+
+    #[test]
     fn pack_unpack_group_keys() {
         let cases = vec![
             vec![0, 0, 0, 0],
@@ -1984,8 +2467,8 @@ west,POST,304,101,203
     }
 
     #[test]
-    fn read_group_result() {
-        let result = ReadAggregateResult {
+    fn read_group_result_display() {
+        let mut result = ReadAggregateResult {
             schema: ResultSchema {
                 select_columns: vec![],
                 group_columns: vec![
@@ -2019,27 +2502,28 @@ west,POST,304,101,203
                 GroupKey(vec![Value::String("west"), Value::String("host-d")]),
             ],
             aggregates: vec![
-                vec![
+                AggregateResults(vec![
                     AggregateResult::Sum(Scalar::I64(10)),
                     AggregateResult::Count(3),
-                ],
-                vec![
+                ]),
+                AggregateResults(vec![
                     AggregateResult::Sum(Scalar::I64(20)),
                     AggregateResult::Count(4),
-                ],
-                vec![
+                ]),
+                AggregateResults(vec![
                     AggregateResult::Sum(Scalar::I64(25)),
                     AggregateResult::Count(3),
-                ],
-                vec![
+                ]),
+                AggregateResults(vec![
                     AggregateResult::Sum(Scalar::I64(21)),
                     AggregateResult::Count(1),
-                ],
-                vec![
+                ]),
+                AggregateResults(vec![
                     AggregateResult::Sum(Scalar::I64(11)),
                     AggregateResult::Count(9),
-                ],
+                ]),
             ],
+            group_keys_sorted: false,
         };
 
         // Debug implementation
@@ -2063,6 +2547,190 @@ west,host-a,25,3
 west,host-c,21,1
 west,host-d,11,9
 "
+        );
+
+        // results don't have to have group keys.
+        result.schema.group_columns = vec![];
+        result.group_keys = vec![];
+
+        // Debug implementation
+        assert_eq!(
+            format!("{:?}", &result),
+            "temp_sum,voltage_count
+10,3
+20,4
+25,3
+21,1
+11,9
+"
+        );
+
+        // Display implementation
+        assert_eq!(
+            format!("{}", &result),
+            "10,3
+20,4
+25,3
+21,1
+11,9
+"
+        );
+    }
+
+    #[test]
+    fn read_group_result_merge() {
+        let schema = ResultSchema {
+            group_columns: vec![
+                (
+                    schema::ColumnType::Tag("region".to_owned()),
+                    LogicalDataType::String,
+                ),
+                (
+                    schema::ColumnType::Tag("host".to_owned()),
+                    LogicalDataType::String,
+                ),
+            ],
+            aggregate_columns: vec![
+                (
+                    schema::ColumnType::Field("temp".to_owned()),
+                    AggregateType::Sum,
+                    LogicalDataType::Integer,
+                ),
+                (
+                    schema::ColumnType::Field("voltage".to_owned()),
+                    AggregateType::Count,
+                    LogicalDataType::Unsigned,
+                ),
+            ],
+            ..ResultSchema::default()
+        };
+
+        let mut result = ReadAggregateResult {
+            schema: schema.clone(),
+            ..Default::default()
+        };
+
+        let mut other_result = ReadAggregateResult {
+            schema: schema.clone(),
+            ..Default::default()
+        };
+        other_result.add_row(
+            vec![Value::String("east"), Value::String("host-a")],
+            vec![
+                AggregateResult::Sum(Scalar::I64(10)),
+                AggregateResult::Count(3),
+            ],
+        );
+        other_result.add_row(
+            vec![Value::String("east"), Value::String("host-b")],
+            vec![
+                AggregateResult::Sum(Scalar::I64(20)),
+                AggregateResult::Count(4),
+            ],
+        );
+
+        // merging something into nothing results in having a copy of something.
+        result = result.merge(other_result.clone());
+        assert_eq!(result, other_result.clone());
+
+        // merging the something into the result again results in all the
+        // aggregates doubling.
+        result = result.merge(other_result.clone());
+        assert_eq!(
+            result,
+            ReadAggregateResult {
+                schema: schema.clone(),
+                group_keys: vec![
+                    GroupKey(vec![Value::String("east"), Value::String("host-a")]),
+                    GroupKey(vec![Value::String("east"), Value::String("host-b")]),
+                ],
+                aggregates: vec![
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(20)),
+                        AggregateResult::Count(6),
+                    ]),
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(40)),
+                        AggregateResult::Count(8),
+                    ]),
+                ],
+                ..Default::default()
+            }
+        );
+
+        // merging a result in with different group keys merges those group
+        // keys in.
+        let mut other_result = ReadAggregateResult {
+            schema: schema.clone(),
+            ..Default::default()
+        };
+        other_result.add_row(
+            vec![Value::String("north"), Value::String("host-a")],
+            vec![
+                AggregateResult::Sum(Scalar::I64(-5)),
+                AggregateResult::Count(2),
+            ],
+        );
+        result = result.merge(other_result.clone());
+
+        assert_eq!(
+            result,
+            ReadAggregateResult {
+                schema: schema.clone(),
+                group_keys: vec![
+                    GroupKey(vec![Value::String("east"), Value::String("host-a")]),
+                    GroupKey(vec![Value::String("east"), Value::String("host-b")]),
+                    GroupKey(vec![Value::String("north"), Value::String("host-a")]),
+                ],
+                aggregates: vec![
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(20)),
+                        AggregateResult::Count(6),
+                    ]),
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(40)),
+                        AggregateResult::Count(8),
+                    ]),
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(-5)),
+                        AggregateResult::Count(2),
+                    ]),
+                ],
+                ..Default::default()
+            }
+        );
+
+        // merging nothing in doesn't change the result.
+        let other_result = ReadAggregateResult {
+            schema: schema.clone(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            result,
+            ReadAggregateResult {
+                schema,
+                group_keys: vec![
+                    GroupKey(vec![Value::String("east"), Value::String("host-a")]),
+                    GroupKey(vec![Value::String("east"), Value::String("host-b")]),
+                    GroupKey(vec![Value::String("north"), Value::String("host-a")]),
+                ],
+                aggregates: vec![
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(20)),
+                        AggregateResult::Count(6),
+                    ]),
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(40)),
+                        AggregateResult::Count(8),
+                    ]),
+                    AggregateResults(vec![
+                        AggregateResult::Sum(Scalar::I64(-5)),
+                        AggregateResult::Count(2),
+                    ]),
+                ],
+                ..Default::default()
+            }
         );
     }
 
@@ -2098,5 +2766,76 @@ west,host-d,11,9
         assert_eq!(col1, col2);
         assert_ne!(col1, col3);
         assert_ne!(col2, col3);
+    }
+
+    #[test]
+    fn column_names() {
+        let mut columns = BTreeMap::new();
+        let rc = ColumnType::Tag(Column::from(&[Some("west"), Some("west"), None, None][..]));
+        columns.insert("region".to_string(), rc);
+        let track = ColumnType::Tag(Column::from(
+            &[Some("Thinking"), Some("of"), Some("a"), Some("place")][..],
+        ));
+        columns.insert("track".to_string(), track);
+        let tc = ColumnType::Time(Column::from(&[100_i64, 200, 500, 600][..]));
+        columns.insert("time".to_string(), tc);
+        let row_group = RowGroup::new(4, columns);
+
+        // No predicate - just find a value in each column that matches.
+        let mut dst = BTreeSet::new();
+        row_group.column_names(&Predicate::default(), &mut dst);
+        assert_eq!(
+            dst,
+            vec!["region", "time", "track"]
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect()
+        );
+
+        // A predicate, but no rows match. No columns should be returned.
+        let mut dst = BTreeSet::new();
+        row_group.column_names(
+            &Predicate::new(vec![BinaryExpr::from(("region", "=", "east"))]),
+            &mut dst,
+        );
+        assert!(dst.is_empty());
+
+        // A predicate, that matches some rows. Columns with non-null values at
+        // those rows should be returned.
+        let mut dst = BTreeSet::new();
+        let names = row_group.column_names(
+            &Predicate::new(vec![BinaryExpr::from(("track", "=", "place"))]),
+            &mut dst,
+        );
+        // query matches one row.
+        //
+        // region, track, time
+        // NULL  , place, 600
+        //
+        assert_eq!(
+            dst,
+            vec!["track", "time"]
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect()
+        );
+
+        // Reusing the same buffer keeps existing results even if they're not
+        // part of the result-set from the row group.
+        let mut columns = BTreeMap::new();
+        let rc = ColumnType::Tag(Column::from(&[Some("prod")][..]));
+        columns.insert("env".to_string(), rc);
+        let tc = ColumnType::Time(Column::from(&[100_i64][..]));
+        columns.insert("time".to_string(), tc);
+        let row_group = RowGroup::new(1, columns);
+
+        row_group.column_names(&Predicate::default(), &mut dst);
+        assert_eq!(
+            dst,
+            vec!["env", "time", "track"]
+                .into_iter()
+                .map(|s| s.to_owned())
+                .collect()
+        );
     }
 }

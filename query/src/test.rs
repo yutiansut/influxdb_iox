@@ -1,34 +1,43 @@
 //! This module provides a reference implementaton of `query::DatabaseSource`
 //! and `query::Database` for use in testing.
 
-use arrow_deps::arrow::record_batch::RecordBatch;
+use arrow_deps::{
+    datafusion::{logical_plan::LogicalPlan, physical_plan::SendableRecordBatchStream},
+    util::str_iter_to_batch,
+};
 
-use crate::{exec::Executor, group_by::GroupByAndAggregate};
+use crate::{exec::Executor, group_by::GroupByAndAggregate, util::make_scan_plan};
 use crate::{
-    exec::FieldListPlan,
     exec::{
         stringset::{StringSet, StringSetRef},
-        SeriesSetPlans, StringSetPlan,
+        FieldListPlan, SeriesSetPlans, StringSetPlan,
     },
-    Database, DatabaseStore, PartitionChunk, Predicate, TimestampRange,
+    Database, DatabaseStore, PartitionChunk, Predicate,
 };
 
 use data_types::{
     data::{lines_to_replicated_write, ReplicatedWrite},
     database_rules::{DatabaseRules, PartitionTemplate, TemplatePart},
+    schema::Schema,
+    selection::Selection,
 };
 use influxdb_line_protocol::{parse_lines, ParsedLine};
 
 use async_trait::async_trait;
 use snafu::{OptionExt, ResultExt, Snafu};
-use std::{collections::BTreeMap, collections::BTreeSet, sync::Arc};
-
-use std::fmt::Write;
-
-use tokio::sync::Mutex;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write,
+    sync::{Arc, Mutex},
+};
 
 #[derive(Debug, Default)]
 pub struct TestDatabase {
+    /// Partitions which have been saved to this test database
+    /// Key is partition name
+    /// Value is map of chunk_id to chunk
+    partitions: Mutex<BTreeMap<String, BTreeMap<u32, Arc<TestChunk>>>>,
+
     /// Lines which have been written to this database, in order
     saved_lines: Mutex<Vec<String>>,
 
@@ -128,13 +137,16 @@ impl TestDatabase {
     }
 
     /// Get all lines written to this database
-    pub async fn get_lines(&self) -> Vec<String> {
-        self.saved_lines.lock().await.clone()
+    pub fn get_lines(&self) -> Vec<String> {
+        self.saved_lines.lock().expect("mutex poisoned").clone()
     }
 
     /// Get all replicated writs to this database
-    pub async fn get_writes(&self) -> Vec<ReplicatedWrite> {
-        self.replicated_writes.lock().await.clone()
+    pub fn get_writes(&self) -> Vec<ReplicatedWrite> {
+        self.replicated_writes
+            .lock()
+            .expect("mutex poisoned")
+            .clone()
     }
 
     /// Parse line protocol and add it as new lines to this
@@ -148,82 +160,122 @@ impl TestDatabase {
         writer.write_lines(self, &parsed_lines).await.unwrap();
 
         // Writes parsed lines into this database
-        let mut saved_lines = self.saved_lines.lock().await;
+        let mut saved_lines = self.saved_lines.lock().expect("mutex poisoned");
         for line in parsed_lines {
             saved_lines.push(line.to_string())
         }
     }
 
+    /// Add a test chunk to the database
+    pub fn add_chunk(&self, partition_key: &str, chunk: Arc<TestChunk>) {
+        let mut partitions = self.partitions.lock().expect("mutex poisoned");
+        let chunks = partitions
+            .entry(partition_key.to_string())
+            .or_insert_with(BTreeMap::new);
+        chunks.insert(chunk.id(), chunk);
+    }
+
+    /// Get the specified chunk
+    pub fn get_chunk(&self, partition_key: &str, id: u32) -> Option<Arc<TestChunk>> {
+        self.partitions
+            .lock()
+            .expect("mutex poisoned")
+            .get(partition_key)
+            .and_then(|p| p.get(&id).cloned())
+    }
+
     /// Set the list of column names that will be returned on a call to
     /// column_names
-    pub async fn set_column_names(&self, column_names: Vec<String>) {
+    pub fn set_column_names(&self, column_names: Vec<String>) {
         let column_names = column_names.into_iter().collect::<StringSet>();
         let column_names = Arc::new(column_names);
 
-        *(self.column_names.clone().lock().await) = Some(column_names)
+        *(self.column_names.clone().lock().expect("mutex poisoned")) = Some(column_names)
     }
 
     /// Get the parameters from the last column name request
-    pub async fn get_column_names_request(&self) -> Option<ColumnNamesRequest> {
-        self.column_names_request.clone().lock().await.take()
+    pub fn get_column_names_request(&self) -> Option<ColumnNamesRequest> {
+        self.column_names_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned")
+            .take()
     }
 
     /// Set the list of column values that will be returned on a call to
     /// column_values
-    pub async fn set_column_values(&self, column_values: Vec<String>) {
+    pub fn set_column_values(&self, column_values: Vec<String>) {
         let column_values = column_values.into_iter().collect::<StringSet>();
         let column_values = Arc::new(column_values);
 
-        *(self.column_values.clone().lock().await) = Some(column_values)
+        *(self.column_values.clone().lock().expect("mutex poisoned")) = Some(column_values)
     }
 
     /// Get the parameters from the last column name request
-    pub async fn get_column_values_request(&self) -> Option<ColumnValuesRequest> {
-        self.column_values_request.clone().lock().await.take()
+    pub fn get_column_values_request(&self) -> Option<ColumnValuesRequest> {
+        self.column_values_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned")
+            .take()
     }
 
     /// Set the series that will be returned on a call to query_series
-    pub async fn set_query_series_values(&self, plan: SeriesSetPlans) {
-        *(self.query_series_values.clone().lock().await) = Some(plan);
+    pub fn set_query_series_values(&self, plan: SeriesSetPlans) {
+        *(self
+            .query_series_values
+            .clone()
+            .lock()
+            .expect("mutex poisoned")) = Some(plan);
     }
 
     /// Get the parameters from the last column name request
-    pub async fn get_query_series_request(&self) -> Option<QuerySeriesRequest> {
-        self.query_series_request.clone().lock().await.take()
+    pub fn get_query_series_request(&self) -> Option<QuerySeriesRequest> {
+        self.query_series_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned")
+            .take()
     }
 
     /// Set the series that will be returned on a call to query_groups
-    pub async fn set_query_groups_values(&self, plan: SeriesSetPlans) {
-        *(self.query_groups_values.clone().lock().await) = Some(plan);
+    pub fn set_query_groups_values(&self, plan: SeriesSetPlans) {
+        *(self
+            .query_groups_values
+            .clone()
+            .lock()
+            .expect("mutex poisoned")) = Some(plan);
     }
 
     /// Get the parameters from the last column name request
-    pub async fn get_query_groups_request(&self) -> Option<QueryGroupsRequest> {
-        self.query_groups_request.clone().lock().await.take()
+    pub fn get_query_groups_request(&self) -> Option<QueryGroupsRequest> {
+        self.query_groups_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned")
+            .take()
     }
 
     /// Set the FieldSet plan that will be returned
-    pub async fn set_field_colum_names_values(&self, plan: FieldListPlan) {
-        *(self.field_columns_value.clone().lock().await) = Some(plan);
+    pub fn set_field_colum_names_values(&self, plan: FieldListPlan) {
+        *(self
+            .field_columns_value
+            .clone()
+            .lock()
+            .expect("mutex poisoned")) = Some(plan);
     }
 
     /// Get the parameters from the last column name request
-    pub async fn get_field_columns_request(&self) -> Option<FieldColumnsRequest> {
-        self.field_columns_request.clone().lock().await.take()
+    pub fn get_field_columns_request(&self) -> Option<FieldColumnsRequest> {
+        self.field_columns_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned")
+            .take()
     }
 }
 
 /// returns true if this line is within the range of the timestamp
-fn line_in_range(line: &ParsedLine<'_>, range: Option<&TimestampRange>) -> bool {
-    match range {
-        Some(range) => {
-            let timestamp = line.timestamp.expect("had a timestamp on line");
-            range.start <= timestamp && timestamp <= range.end
-        }
-        None => true,
-    }
-}
-
 fn set_to_string(s: &BTreeSet<String>) -> String {
     s.iter().cloned().collect::<Vec<_>>().join(", ")
 }
@@ -273,26 +325,11 @@ impl Database for TestDatabase {
 
     /// Adds the replicated write to this database
     async fn store_replicated_write(&self, write: &ReplicatedWrite) -> Result<(), Self::Error> {
-        self.replicated_writes.lock().await.push(write.clone());
+        self.replicated_writes
+            .lock()
+            .expect("mutex poisoned")
+            .push(write.clone());
         Ok(())
-    }
-
-    /// Return all table names that are saved in this database
-    async fn table_names(&self, predicate: Predicate) -> Result<StringSetPlan, Self::Error> {
-        let saved_lines = self.saved_lines.lock().await;
-
-        let names = parse_lines(&saved_lines.join("\n"))
-            .filter_map(|line| {
-                let line = line.expect("Correctly parsed saved line");
-                if line_in_range(&line, predicate.range.as_ref()) {
-                    Some(line.series.measurement.to_string())
-                } else {
-                    None
-                }
-            })
-            .collect::<StringSet>();
-
-        Ok(names.into())
     }
 
     /// Return the mocked out column names, recording the request
@@ -302,14 +339,18 @@ impl Database for TestDatabase {
 
         let new_column_names_request = Some(ColumnNamesRequest { predicate });
 
-        *self.column_names_request.clone().lock().await = new_column_names_request;
+        *self
+            .column_names_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned") = new_column_names_request;
 
         // pull out the saved columns
         let column_names = self
             .column_names
             .clone()
             .lock()
-            .await
+            .expect("mutex poisoned")
             .take()
             // Turn None into an error
             .context(General {
@@ -325,13 +366,17 @@ impl Database for TestDatabase {
 
         let field_columns_request = Some(FieldColumnsRequest { predicate });
 
-        *self.field_columns_request.clone().lock().await = field_columns_request;
+        *self
+            .field_columns_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned") = field_columns_request;
 
         // pull out the saved columns
         self.field_columns_value
             .clone()
             .lock()
-            .await
+            .expect("mutex poisoned")
             .take()
             // Turn None into an error
             .context(General {
@@ -353,14 +398,18 @@ impl Database for TestDatabase {
             predicate,
         });
 
-        *self.column_values_request.clone().lock().await = new_column_values_request;
+        *self
+            .column_values_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned") = new_column_values_request;
 
         // pull out the saved columns
         let column_values = self
             .column_values
             .clone()
             .lock()
-            .await
+            .expect("mutex poisoned")
             .take()
             // Turn None into an error
             .context(General {
@@ -375,12 +424,16 @@ impl Database for TestDatabase {
 
         let new_queries_series_request = Some(QuerySeriesRequest { predicate });
 
-        *self.query_series_request.clone().lock().await = new_queries_series_request;
+        *self
+            .query_series_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned") = new_queries_series_request;
 
         self.query_series_values
             .clone()
             .lock()
-            .await
+            .expect("mutex poisoned")
             .take()
             // Turn None into an error
             .context(General {
@@ -397,12 +450,16 @@ impl Database for TestDatabase {
 
         let new_queries_groups_request = Some(QueryGroupsRequest { predicate, gby_agg });
 
-        *self.query_groups_request.clone().lock().await = new_queries_groups_request;
+        *self
+            .query_groups_request
+            .clone()
+            .lock()
+            .expect("mutex poisoned") = new_queries_groups_request;
 
         self.query_groups_values
             .clone()
             .lock()
-            .await
+            .expect("mutex poisoned")
             .take()
             // Turn None into an error
             .context(General {
@@ -412,34 +469,100 @@ impl Database for TestDatabase {
 
     /// Return the partition keys for data in this DB
     async fn partition_keys(&self) -> Result<Vec<String>, Self::Error> {
-        unimplemented!("partition_keys not yet for test database");
+        let partitions = self.partitions.lock().expect("mutex poisoned");
+        let keys = partitions.keys().cloned().collect();
+        Ok(keys)
     }
 
-    async fn chunks(&self, _partition_key: &str) -> Vec<Arc<Self::Chunk>> {
-        unimplemented!("query_chunks for test database");
+    async fn chunks(&self, partition_key: &str) -> Vec<Arc<Self::Chunk>> {
+        let partitions = self.partitions.lock().expect("mutex poisoned");
+        if let Some(chunks) = partitions.get(partition_key) {
+            chunks.values().cloned().collect()
+        } else {
+            vec![]
+        }
     }
 }
 
-#[derive(Debug)]
-pub struct TestChunk {}
+#[derive(Debug, Default)]
+pub struct TestChunk {
+    pub id: u32,
 
+    /// Table names to return back
+    pub table_names: Vec<String>,
+
+    /// A copy of the captured predicate passed
+    pub table_names_predicate: std::sync::Mutex<Option<Predicate>>,
+}
+
+impl TestChunk {
+    pub fn new(id: u32) -> Self {
+        Self {
+            id,
+            ..Default::default()
+        }
+    }
+
+    pub fn with_table(mut self, name: impl Into<String>) -> Self {
+        self.table_names.push(name.into());
+        self
+    }
+
+    /// Get a copy of any predicate passed to table_names
+    pub fn table_names_predicate(&self) -> Option<Predicate> {
+        self.table_names_predicate
+            .lock()
+            .expect("mutex poisoned")
+            .as_ref()
+            //.map(|v| v.clone())
+            .cloned()
+    }
+}
+
+#[async_trait]
 impl PartitionChunk for TestChunk {
     type Error = TestError;
 
     fn id(&self) -> u32 {
-        unimplemented!()
+        self.id
     }
 
-    fn table_stats(&self) -> Result<Vec<data_types::partition_metadata::Table>, Self::Error> {
-        unimplemented!()
-    }
-
-    fn table_to_arrow(
+    fn table_stats(
         &self,
-        _dst: &mut Vec<RecordBatch>,
+    ) -> Result<Vec<data_types::partition_metadata::TableSummary>, Self::Error> {
+        unimplemented!()
+    }
+
+    async fn read_filter(
+        &self,
         _table_name: &str,
-        _columns: &[&str],
-    ) -> Result<(), Self::Error> {
+        _predicate: &Predicate,
+        _selection: Selection<'_>,
+    ) -> Result<SendableRecordBatchStream, Self::Error> {
+        unimplemented!()
+    }
+
+    async fn table_names(&self, predicate: &Predicate) -> Result<LogicalPlan, Self::Error> {
+        // save the predicate
+        self.table_names_predicate
+            .lock()
+            .expect("mutex poisoned")
+            .replace(predicate.clone());
+
+        let names = self.table_names.iter().map(Some);
+        let batch = str_iter_to_batch("tables", names).unwrap();
+        Ok(make_scan_plan(batch).unwrap())
+    }
+
+    async fn table_schema(
+        &self,
+        _table_name: &str,
+        _selection: Selection<'_>,
+    ) -> Result<Schema, Self::Error> {
+        unimplemented!()
+    }
+
+    async fn has_table(&self, _table_name: &str) -> bool {
         unimplemented!()
     }
 }
@@ -478,9 +601,17 @@ impl Default for TestDatabaseStore {
 impl DatabaseStore for TestDatabaseStore {
     type Database = TestDatabase;
     type Error = TestError;
+
+    /// List the database names.
+    async fn db_names_sorted(&self) -> Vec<String> {
+        let databases = self.databases.lock().expect("mutex poisoned");
+
+        databases.keys().cloned().collect()
+    }
+
     /// Retrieve the database specified name
     async fn db(&self, name: &str) -> Option<Arc<Self::Database>> {
-        let databases = self.databases.lock().await;
+        let databases = self.databases.lock().expect("mutex poisoned");
 
         databases.get(name).cloned()
     }
@@ -488,7 +619,7 @@ impl DatabaseStore for TestDatabaseStore {
     /// Retrieve the database specified by name, creating it if it
     /// doesn't exist.
     async fn db_or_create(&self, name: &str) -> Result<Arc<Self::Database>, Self::Error> {
-        let mut databases = self.databases.lock().await;
+        let mut databases = self.databases.lock().expect("mutex poisoned");
 
         if let Some(db) = databases.get(name) {
             Ok(db.clone())

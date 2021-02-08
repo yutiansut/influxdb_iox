@@ -71,26 +71,32 @@ mod config;
 pub mod db;
 pub mod snapshot;
 
+#[cfg(test)]
+mod query_tests;
+
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc,
 };
 
-use crate::{config::Config, db::Db};
+use crate::{
+    config::{object_store_path_for_database_config, Config, DB_RULES_FILE_NAME},
+    db::Db,
+};
 use data_types::{
     data::{lines_to_replicated_write, ReplicatedWrite},
     database_rules::{DatabaseRules, HostGroup, HostGroupId, MatchTables},
     {DatabaseName, DatabaseNameError},
 };
 use influxdb_line_protocol::ParsedLine;
-use object_store::{path::ObjectStorePath, ObjectStore};
+use object_store::{path::ObjectStorePath, ObjectStore, ObjectStoreApi};
 use query::{exec::Executor, Database, DatabaseStore};
 
-use crate::config::object_store_path_for_database_config;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::stream::TryStreamExt;
 use snafu::{OptionExt, ResultExt, Snafu};
-use tracing::{error, info};
+use tracing::error;
 
 type DatabaseError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -136,13 +142,15 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+const STORE_ERROR_PAUSE_SECONDS: u64 = 100;
+
 /// `Server` is the container struct for how servers store data internally, as
 /// well as how they communicate with other servers. Each server will have one
 /// of these structs, which keeps track of all replication and query rules.
 #[derive(Debug)]
 pub struct Server<M: ConnectionManager> {
     id: AtomicU32,
-    config: Config,
+    config: Arc<Config>,
     connection_manager: Arc<M>,
     pub store: Arc<ObjectStore>,
     executor: Arc<Executor>,
@@ -152,7 +160,7 @@ impl<M: ConnectionManager> Server<M> {
     pub fn new(connection_manager: M, store: Arc<ObjectStore>) -> Self {
         Self {
             id: AtomicU32::new(SERVER_ID_NOT_SET),
-            config: Config::default(),
+            config: Arc::new(Config::default()),
             store,
             connection_manager: Arc::new(connection_manager),
             executor: Arc::new(Executor::new()),
@@ -180,22 +188,22 @@ impl<M: ConnectionManager> Server<M> {
     pub async fn create_database(
         &self,
         db_name: impl Into<String>,
-        rules: DatabaseRules,
+        mut rules: DatabaseRules,
     ) -> Result<()> {
         // Return an error if this server hasn't yet been setup with an id
-        let id = self.require_id()?;
+        self.require_id()?;
 
-        let db_name = DatabaseName::new(db_name.into()).context(InvalidDatabaseName)?;
+        let name = db_name.into();
+        let db_name = DatabaseName::new(name.clone()).context(InvalidDatabaseName)?;
+        rules.name = name;
 
         let db_reservation = self.config.create_db(db_name, rules)?;
 
         let data =
             Bytes::from(serde_json::to_vec(&db_reservation.db.rules).context(ErrorSerializing)?);
         let len = data.len();
-        let location = object_store_path_for_database_config(
-            &server_object_store_path(id),
-            &db_reservation.name,
-        );
+        let location =
+            object_store_path_for_database_config(&self.root_path()?, &db_reservation.name);
 
         let stream_data = std::io::Result::Ok(data);
         self.store
@@ -208,6 +216,74 @@ impl<M: ConnectionManager> Server<M> {
             .context(StoreError)?;
 
         db_reservation.commit();
+
+        Ok(())
+    }
+
+    // base location in object store for this writer
+    fn root_path(&self) -> Result<object_store::path::Path> {
+        let id = self.require_id()?;
+
+        let mut path = self.store.new_path();
+        path.push_dir(format!("{}", id));
+        Ok(path)
+    }
+
+    /// Loads the database configurations based on the databases in the
+    /// object store. Any databases in the config already won't be
+    /// replaced.
+    pub async fn load_database_configs(&self) -> Result<()> {
+        // get the database names from the object store prefixes
+        // TODO: update object store to pull back all common prefixes by
+        //       following the next tokens.
+        let list_result = self
+            .store
+            .list_with_delimiter(&self.root_path()?)
+            .await
+            .context(StoreError)?;
+
+        let handles: Vec<_> = list_result
+            .common_prefixes
+            .into_iter()
+            .map(|mut path| {
+                let store = self.store.clone();
+                let config = self.config.clone();
+
+                path.set_file_name(DB_RULES_FILE_NAME);
+
+                tokio::task::spawn(async move {
+                    let mut res = get_store_bytes(&path, &store).await;
+                    while let Err(e) = &res {
+                        error!(
+                            "error getting database config {:?} from object store: {}",
+                            path, e
+                        );
+                        tokio::time::sleep(tokio::time::Duration::from_secs(
+                            STORE_ERROR_PAUSE_SECONDS,
+                        ))
+                        .await;
+                        res = get_store_bytes(&path, &store).await;
+                    }
+
+                    let res = res.unwrap();
+
+                    match serde_json::from_slice::<DatabaseRules>(&res) {
+                        Err(e) => {
+                            error!("error parsing database config {:?} from store: {}", path, e)
+                        }
+                        Ok(rules) => match DatabaseName::new(rules.name.clone()) {
+                            Err(e) => error!("error parsing name {} from rules: {}", rules.name, e),
+                            Ok(name) => match config.create_db(name, rules) {
+                                Err(e) => error!("error adding database to config: {}", e),
+                                Ok(handle) => handle.commit(),
+                            },
+                        },
+                    }
+                })
+            })
+            .collect();
+
+        futures::future::join_all(handles).await;
 
         Ok(())
     }
@@ -278,12 +354,10 @@ impl<M: ConnectionManager> Server<M> {
             if let Some(segment) = segment {
                 if persist {
                     let writer_id = self.require_id()?;
-                    let data = segment.to_file_bytes(writer_id).context(WalError)?;
                     let store = self.store.clone();
-                    let location = database_object_store_path(writer_id, db_name);
-                    let location = buffer::object_store_path_for_segment(&location, segment.id)
+                    segment
+                        .persist_bytes_in_background(writer_id, db_name, store)
                         .context(WalError)?;
-                    persist_bytes_in_background(data, store, location);
                 }
             }
         }
@@ -360,6 +434,14 @@ where
 {
     type Database = Db;
     type Error = Error;
+
+    async fn db_names_sorted(&self) -> Vec<String> {
+        self.config
+            .db_names_sorted()
+            .iter()
+            .map(|i| i.clone().into())
+            .collect()
+    }
 
     async fn db(&self, name: &str) -> Option<Arc<Self::Database>> {
         if let Ok(name) = DatabaseName::new(name) {
@@ -455,43 +537,21 @@ impl RemoteServer for RemoteServerImpl {
     }
 }
 
-// base location in object store for a given database name
-fn database_object_store_path(writer_id: u32, database_name: &DatabaseName<'_>) -> ObjectStorePath {
-    let mut path = ObjectStorePath::default();
-    path.push_dir(format!("{}", writer_id));
-    path.push_dir(database_name.to_string());
-    path
-}
+// get bytes from the location in object store
+async fn get_store_bytes(
+    location: &object_store::path::Path,
+    store: &ObjectStore,
+) -> Result<bytes::BytesMut> {
+    let b = store
+        .get(location)
+        .await
+        .context(StoreError)?
+        .map_ok(|b| bytes::BytesMut::from(&b[..]))
+        .try_concat()
+        .await
+        .context(StoreError)?;
 
-fn server_object_store_path(writer_id: u32) -> ObjectStorePath {
-    ObjectStorePath::from_cloud_unchecked(format!("{}", writer_id))
-}
-
-const STORE_ERROR_PAUSE_SECONDS: u64 = 100;
-
-/// Spawns a tokio task that will continuously try to persist the bytes to the
-/// given object store location.
-fn persist_bytes_in_background(data: Bytes, store: Arc<ObjectStore>, location: ObjectStorePath) {
-    let len = data.len();
-    let mut stream_data = std::io::Result::Ok(data.clone());
-
-    tokio::task::spawn(async move {
-        while let Err(err) = store
-            .put(
-                &location,
-                futures::stream::once(async move { stream_data }),
-                len,
-            )
-            .await
-        {
-            error!("error writing bytes to store: {}", err);
-            tokio::time::delay_for(tokio::time::Duration::from_secs(STORE_ERROR_PAUSE_SECONDS))
-                .await;
-            stream_data = std::io::Result::Ok(data.clone());
-        }
-
-        info!("persisted data to {}", store.convert_path(&location));
-    });
+    Ok(b)
 }
 
 #[cfg(test)]
@@ -506,7 +566,7 @@ mod tests {
     };
     use futures::TryStreamExt;
     use influxdb_line_protocol::parse_lines;
-    use object_store::memory::InMemory;
+    use object_store::{memory::InMemory, path::ObjectStorePath};
     use query::frontend::sql::SQLQueryPlanner;
     use snafu::Snafu;
     use std::collections::BTreeMap;
@@ -551,6 +611,7 @@ mod tests {
             partition_template: PartitionTemplate {
                 parts: vec![TemplatePart::TimeFormat("YYYY-MM".to_string())],
             },
+            name: name.to_string(),
             ..Default::default()
         };
 
@@ -560,11 +621,13 @@ mod tests {
             .await
             .expect("failed to create database");
 
+        let mut rules_path = server.store.new_path();
+        rules_path.push_all_dirs(&["1", name]);
+        rules_path.set_file_name("rules.json");
+
         let read_data = server
             .store
-            .get(&ObjectStorePath::from_cloud_unchecked(
-                "1/bananas/rules.json",
-            ))
+            .get(&rules_path)
             .await
             .unwrap()
             .map_ok(|b| bytes::BytesMut::from(&b[..]))
@@ -576,6 +639,22 @@ mod tests {
         let read_rules = serde_json::from_str::<DatabaseRules>(read_data).unwrap();
 
         assert_eq!(rules, read_rules);
+
+        let db2 = "db_awesome";
+        server
+            .create_database(db2, DatabaseRules::default())
+            .await
+            .expect("failed to create 2nd db");
+
+        store.list_with_delimiter(&store.new_path()).await.unwrap();
+
+        let manager = TestConnectionManager::new();
+        let server2 = Server::new(manager, store);
+        server2.set_id(1);
+        server2.load_database_configs().await.unwrap();
+
+        let _ = server2.db(&DatabaseName::new(db2).unwrap()).await.unwrap();
+        let _ = server2.db(&DatabaseName::new(name).unwrap()).await.unwrap();
     }
 
     #[tokio::test]
@@ -604,6 +683,28 @@ mod tests {
         if !matches!(got, Error::DatabaseAlreadyExists {..}) {
             panic!("expected already exists error");
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn db_names_sorted() -> Result {
+        let manager = TestConnectionManager::new();
+        let store = Arc::new(ObjectStore::new_in_memory(InMemory::new()));
+        let server = Server::new(manager, store);
+        server.set_id(1);
+
+        let names = vec!["bar", "baz"];
+
+        for name in &names {
+            server
+                .create_database(*name, DatabaseRules::default())
+                .await
+                .expect("failed to create database");
+        }
+
+        let db_names_sorted = server.db_names_sorted().await;
+        assert_eq!(names, db_names_sorted);
 
         Ok(())
     }
@@ -654,12 +755,10 @@ mod tests {
         let db_name = DatabaseName::new("foo").unwrap();
         let db = server.db(&db_name).await.unwrap();
 
-        let buff = db.mutable_buffer.as_ref().unwrap();
-
         let planner = SQLQueryPlanner::default();
         let executor = server.executor();
         let physical_plan = planner
-            .query(buff, "select * from cpu", executor.as_ref())
+            .query(db.as_ref(), "select * from cpu", executor.as_ref())
             .await
             .unwrap();
 
@@ -826,7 +925,10 @@ partition_key:
         // write lines should have caused a segment rollover and persist, wait
         tokio::task::yield_now().await;
 
-        let path = ObjectStorePath::from_cloud_unchecked("1/my_db/wal/000/000/001.segment");
+        let mut path = store.new_path();
+        path.push_all_dirs(&["1", "my_db", "wal", "000", "000"]);
+        path.set_file_name("001.segment");
+
         let data = store
             .get(&path)
             .await

@@ -43,7 +43,7 @@ use arrow_deps::{
     },
 };
 
-use tokio::stream::StreamExt;
+use tokio_stream::StreamExt;
 
 pub use arrow_deps::datafusion::error::{DataFusionError as Error, Result};
 
@@ -110,8 +110,8 @@ impl UserDefinedLogicalNode for SchemaPivotNode {
 
     fn from_template(
         &self,
-        exprs: &Vec<Expr>,
-        inputs: &Vec<LogicalPlan>,
+        exprs: &[Expr],
+        inputs: &[LogicalPlan],
     ) -> Arc<dyn UserDefinedLogicalNode + Send + Sync> {
         assert_eq!(inputs.len(), 1, "SchemaPivot: input sizes inconistent");
         assert_eq!(

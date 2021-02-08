@@ -2,51 +2,41 @@
 //! implemented in terms of the `query::Database` and
 //! `query::DatabaseStore`
 
-use std::{collections::HashMap, sync::Arc};
-
-use generated_types::{
-    i_ox_testing_server::{IOxTesting, IOxTestingServer},
-    storage_server::{Storage, StorageServer},
-    CapabilitiesResponse, Capability, Int64ValuesResponse, MeasurementFieldsRequest,
-    MeasurementFieldsResponse, MeasurementNamesRequest, MeasurementTagKeysRequest,
-    MeasurementTagValuesRequest, Predicate, ReadFilterRequest, ReadGroupRequest, ReadResponse,
-    ReadSeriesCardinalityRequest, ReadWindowAggregateRequest, StringValuesResponse, TagKeysRequest,
-    TagValuesRequest, TestErrorRequest, TestErrorResponse, TimestampRange,
+use super::{
+    data::{
+        fieldlist_to_measurement_fields_response, series_set_item_to_read_response,
+        tag_keys_to_byte_vecs,
+    },
+    expr::{self, AddRPCNode, Loggable, SpecialTagKeys},
+    input::GrpcInputs,
+    GrpcService,
 };
-
-use data_types::error::ErrorLogger;
-
-use query::exec::fieldlist::FieldList;
-use query::group_by::GroupByAndAggregate;
-
-use super::expr::{self, AddRPCNode, Loggable, SpecialTagKeys};
-use super::input::GrpcInputs;
-use data_types::names::org_and_bucket_to_database;
-
-use data_types::DatabaseName;
-
+use data_types::{error::ErrorLogger, names::org_and_bucket_to_database, DatabaseName};
+use generated_types::{
+    i_ox_testing_server::IOxTesting, storage_server::Storage, CapabilitiesResponse, Capability,
+    Int64ValuesResponse, MeasurementFieldsRequest, MeasurementFieldsResponse,
+    MeasurementNamesRequest, MeasurementTagKeysRequest, MeasurementTagValuesRequest, Predicate,
+    ReadFilterRequest, ReadGroupRequest, ReadResponse, ReadSeriesCardinalityRequest,
+    ReadWindowAggregateRequest, StringValuesResponse, TagKeysRequest, TagValuesRequest,
+    TestErrorRequest, TestErrorResponse, TimestampRange,
+};
 use query::{
+    exec::fieldlist::FieldList,
     exec::seriesset::{Error as SeriesSetError, SeriesSetItem},
+    frontend::influxrpc::InfluxRPCPlanner,
+    group_by::GroupByAndAggregate,
     predicate::PredicateBuilder,
     Database, DatabaseStore,
 };
-
 use snafu::{OptionExt, ResultExt, Snafu};
-
-use tokio::{net::TcpListener, sync::mpsc};
+use std::{collections::HashMap, sync::Arc};
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use tracing::{error, info, warn};
 
-use super::data::{
-    fieldlist_to_measurement_fields_response, series_set_item_to_read_response,
-    tag_keys_to_byte_vecs,
-};
-
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("gRPC server error:  {}", source))]
-    ServerError { source: tonic::transport::Error },
-
     #[snafu(display("Database not found: {}", db_name))]
     DatabaseNotFound { db_name: String },
 
@@ -182,7 +172,6 @@ impl Error {
     /// status
     fn to_status(&self) -> tonic::Status {
         match &self {
-            Self::ServerError { .. } => Status::internal(self.to_string()),
             Self::DatabaseNotFound { .. } => Status::not_found(self.to_string()),
             Self::ListingTables { .. } => Status::internal(self.to_string()),
             Self::ListingColumns { .. } => {
@@ -214,21 +203,6 @@ impl Error {
     }
 }
 
-#[derive(Debug)]
-pub struct GrpcService<T: DatabaseStore> {
-    db_store: Arc<T>,
-}
-
-impl<T> GrpcService<T>
-where
-    T: DatabaseStore + 'static,
-{
-    /// Create a new GrpcService connected to `db_store`
-    pub fn new(db_store: Arc<T>) -> Self {
-        Self { db_store }
-    }
-}
-
 #[tonic::async_trait]
 /// Implements the protobuf defined IOx rpc service for a DatabaseStore
 impl<T> IOxTesting for GrpcService<T>
@@ -250,7 +224,7 @@ impl<T> Storage for GrpcService<T>
 where
     T: DatabaseStore + 'static,
 {
-    type ReadFilterStream = mpsc::Receiver<Result<ReadResponse, Status>>;
+    type ReadFilterStream = ReceiverStream<Result<ReadResponse, Status>>;
 
     async fn read_filter(
         &self,
@@ -279,10 +253,10 @@ where
             .await
             .map_err(|e| e.to_status())?;
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type ReadGroupStream = mpsc::Receiver<Result<ReadResponse, Status>>;
+    type ReadGroupStream = ReceiverStream<Result<ReadResponse, Status>>;
 
     async fn read_group(
         &self,
@@ -337,10 +311,10 @@ where
         .await
         .map_err(|e| e.to_status())?;
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type ReadWindowAggregateStream = mpsc::Receiver<Result<ReadResponse, Status>>;
+    type ReadWindowAggregateStream = ReceiverStream<Result<ReadResponse, Status>>;
 
     async fn read_window_aggregate(
         &self,
@@ -387,16 +361,16 @@ where
         .await
         .map_err(|e| e.to_status())?;
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type TagKeysStream = mpsc::Receiver<Result<StringValuesResponse, Status>>;
+    type TagKeysStream = ReceiverStream<Result<StringValuesResponse, Status>>;
 
     async fn tag_keys(
         &self,
         req: tonic::Request<TagKeysRequest>,
     ) -> Result<tonic::Response<Self::TagKeysStream>, Status> {
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
 
         let tag_keys_request = req.into_inner();
 
@@ -431,16 +405,16 @@ where
             .await
             .expect("sending tag_keys response to server");
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type TagValuesStream = mpsc::Receiver<Result<StringValuesResponse, Status>>;
+    type TagValuesStream = ReceiverStream<Result<StringValuesResponse, Status>>;
 
     async fn tag_values(
         &self,
         req: tonic::Request<TagValuesRequest>,
     ) -> Result<tonic::Response<Self::TagValuesStream>, Status> {
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
 
         let tag_values_request = req.into_inner();
 
@@ -515,10 +489,10 @@ where
             .await
             .expect("sending tag_values response to server");
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type ReadSeriesCardinalityStream = mpsc::Receiver<Result<Int64ValuesResponse, Status>>;
+    type ReadSeriesCardinalityStream = ReceiverStream<Result<Int64ValuesResponse, Status>>;
 
     async fn read_series_cardinality(
         &self,
@@ -563,13 +537,13 @@ where
         Ok(tonic::Response::new(caps))
     }
 
-    type MeasurementNamesStream = mpsc::Receiver<Result<StringValuesResponse, Status>>;
+    type MeasurementNamesStream = ReceiverStream<Result<StringValuesResponse, Status>>;
 
     async fn measurement_names(
         &self,
         req: tonic::Request<MeasurementNamesRequest>,
     ) -> Result<tonic::Response<Self::MeasurementNamesStream>, Status> {
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
 
         let measurement_names_request = req.into_inner();
 
@@ -607,16 +581,16 @@ where
             .await
             .expect("sending measurement names response to server");
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type MeasurementTagKeysStream = mpsc::Receiver<Result<StringValuesResponse, Status>>;
+    type MeasurementTagKeysStream = ReceiverStream<Result<StringValuesResponse, Status>>;
 
     async fn measurement_tag_keys(
         &self,
         req: tonic::Request<MeasurementTagKeysRequest>,
     ) -> Result<tonic::Response<Self::MeasurementTagKeysStream>, Status> {
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
 
         let measurement_tag_keys_request = req.into_inner();
 
@@ -653,16 +627,16 @@ where
             .await
             .expect("sending measurement_tag_keys response to server");
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type MeasurementTagValuesStream = mpsc::Receiver<Result<StringValuesResponse, Status>>;
+    type MeasurementTagValuesStream = ReceiverStream<Result<StringValuesResponse, Status>>;
 
     async fn measurement_tag_values(
         &self,
         req: tonic::Request<MeasurementTagValuesRequest>,
     ) -> Result<tonic::Response<Self::MeasurementTagValuesStream>, Status> {
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
 
         let measurement_tag_values_request = req.into_inner();
 
@@ -699,16 +673,16 @@ where
             .await
             .expect("sending measurement_tag_values response to server");
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 
-    type MeasurementFieldsStream = mpsc::Receiver<Result<MeasurementFieldsResponse, Status>>;
+    type MeasurementFieldsStream = ReceiverStream<Result<MeasurementFieldsResponse, Status>>;
 
     async fn measurement_fields(
         &self,
         req: tonic::Request<MeasurementFieldsRequest>,
     ) -> Result<tonic::Response<Self::MeasurementFieldsStream>, Status> {
-        let (mut tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(4);
 
         let measurement_fields_request = req.into_inner();
 
@@ -749,7 +723,7 @@ where
             .await
             .expect("sending measurement_fields response to server");
 
-        Ok(tonic::Response::new(rx))
+        Ok(tonic::Response::new(ReceiverStream::new(rx)))
     }
 }
 
@@ -788,27 +762,27 @@ where
     T: DatabaseStore,
 {
     let predicate = PredicateBuilder::default().set_range(range).build();
+    let db_name = db_name.as_ref();
 
-    let plan = db_store
+    let db = db_store
         .db(&db_name)
         .await
-        .context(DatabaseNotFound { db_name: &*db_name })?
-        .table_names(predicate)
-        .await
-        .map_err(|e| Error::ListingTables {
-            db_name: db_name.to_string(),
-            source: Box::new(e),
-        })?;
+        .context(DatabaseNotFound { db_name })?;
 
+    let planner = InfluxRPCPlanner::new();
+
+    let plan = planner
+        .table_names(db.as_ref(), predicate)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingTables { db_name })?;
     let executor = db_store.executor();
 
     let table_names = executor
         .to_string_set(plan)
         .await
-        .map_err(|e| Error::ListingTables {
-            db_name: db_name.to_string(),
-            source: Box::new(e),
-        })?;
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingTables { db_name })?;
 
     // Map the resulting collection of Strings into a Vec<Vec<u8>>for return
     let values: Vec<Vec<u8>> = table_names
@@ -842,29 +816,27 @@ where
         })?
         .build();
 
-    let db = db_store
-        .db(&db_name)
-        .await
-        .context(DatabaseNotFound { db_name: &*db_name })?;
+    let db = db_store.db(&db_name).await.context(DatabaseNotFound {
+        db_name: db_name.as_str(),
+    })?;
 
     let executor = db_store.executor();
 
     let tag_key_plan = db
         .tag_column_names(predicate)
         .await
-        .map_err(|e| Error::ListingColumns {
-            db_name: db_name.to_string(),
-            source: Box::new(e),
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingColumns {
+            db_name: db_name.as_str(),
         })?;
 
-    let tag_keys =
-        executor
-            .to_string_set(tag_key_plan)
-            .await
-            .map_err(|e| Error::ListingColumns {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
-            })?;
+    let tag_keys = executor
+        .to_string_set(tag_key_plan)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingColumns {
+            db_name: db_name.as_str(),
+        })?;
 
     // Map the resulting collection of Strings into a Vec<Vec<u8>>for return
     let values = tag_keys_to_byte_vecs(tag_keys);
@@ -899,31 +871,27 @@ where
         })?
         .build();
 
+    let db_name = db_name.as_str();
+    let tag_name = &tag_name;
+
     let db = db_store
-        .db(&db_name)
+        .db(db_name)
         .await
-        .context(DatabaseNotFound { db_name: &*db_name })?;
+        .context(DatabaseNotFound { db_name })?;
 
     let executor = db_store.executor();
 
-    let tag_value_plan =
-        db.column_values(&tag_name, predicate)
-            .await
-            .map_err(|e| Error::ListingTagValues {
-                db_name: db_name.to_string(),
-                tag_name: tag_name.clone(),
-                source: Box::new(e),
-            })?;
+    let tag_value_plan = db
+        .column_values(tag_name, predicate)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingTagValues { db_name, tag_name })?;
 
-    let tag_values =
-        executor
-            .to_string_set(tag_value_plan)
-            .await
-            .map_err(|e| Error::ListingTagValues {
-                db_name: db_name.to_string(),
-                tag_name: tag_name.clone(),
-                source: Box::new(e),
-            })?;
+    let tag_values = executor
+        .to_string_set(tag_value_plan)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingTagValues { db_name, tag_name })?;
 
     // Map the resulting collection of Strings into a Vec<Vec<u8>>for return
     let values: Vec<Vec<u8>> = tag_values
@@ -959,20 +927,23 @@ where
         })?
         .build();
 
+    // keep original name so we can transfer ownership
+    // to closure below
+    let owned_db_name = db_name;
+
+    let db_name = owned_db_name.as_str();
     let db = db_store
-        .db(&db_name)
+        .db(db_name)
         .await
-        .context(DatabaseNotFound { db_name: &*db_name })?;
+        .context(DatabaseNotFound { db_name })?;
 
     let executor = db_store.executor();
 
-    let series_plan =
-        db.query_series(predicate)
-            .await
-            .map_err(|e| Error::PlanningFilteringSeries {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
-            })?;
+    let series_plan = db
+        .query_series(predicate)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(PlanningFilteringSeries { db_name })?;
 
     // Spawn task to convert between series sets and the gRPC results
     // and to run the actual plans (so we can return a result to the
@@ -989,9 +960,9 @@ where
         executor
             .to_series_set(series_plan, tx_series)
             .await
-            .map_err(|e| Error::FilteringSeries {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
+            .map_err(|e| Box::new(e) as _)
+            .context(FilteringSeries {
+                db_name: owned_db_name.as_str(),
             })
             .log_if_error("Running series set plan")
     });
@@ -1003,7 +974,7 @@ where
 /// and sends them to tx
 async fn convert_series_set(
     mut rx: mpsc::Receiver<Result<SeriesSetItem, SeriesSetError>>,
-    mut tx: mpsc::Sender<Result<ReadResponse, Status>>,
+    tx: mpsc::Sender<Result<ReadResponse, Status>>,
 ) -> Result<()> {
     while let Some(series_set) = rx.recv().await {
         let response = series_set
@@ -1015,7 +986,7 @@ async fn convert_series_set(
 
         tx.send(response)
             .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            .map_err(|e| Box::new(e) as _)
             .context(SendingResults)?
     }
     Ok(())
@@ -1043,20 +1014,23 @@ where
         })?
         .build();
 
+    // keep original name so we can transfer ownership
+    // to closure below
+    let owned_db_name = db_name;
+    let db_name = owned_db_name.as_str();
+
     let db = db_store
         .db(&db_name)
         .await
-        .context(DatabaseNotFound { db_name: &*db_name })?;
+        .context(DatabaseNotFound { db_name })?;
 
     let executor = db_store.executor();
 
-    let grouped_series_set_plan =
-        db.query_groups(predicate, gby_agg)
-            .await
-            .map_err(|e| Error::PlanningFilteringSeries {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
-            })?;
+    let grouped_series_set_plan = db
+        .query_groups(predicate, gby_agg)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(PlanningFilteringSeries { db_name })?;
 
     // Spawn task to convert between series sets and the gRPC results
     // and to run the actual plans (so we can return a result to the
@@ -1073,9 +1047,9 @@ where
         executor
             .to_series_set(grouped_series_set_plan, tx_series)
             .await
-            .map_err(|e| Error::GroupingSeries {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
+            .map_err(|e| Box::new(e) as _)
+            .context(GroupingSeries {
+                db_name: owned_db_name.as_str(),
             })
             .log_if_error("Running Grouped SeriesSet Plan")
     });
@@ -1106,48 +1080,27 @@ where
         })?
         .build();
 
+    let db_name = db_name.as_str();
     let db = db_store
-        .db(&db_name)
+        .db(db_name)
         .await
-        .context(DatabaseNotFound { db_name: &*db_name })?;
+        .context(DatabaseNotFound { db_name })?;
 
     let executor = db_store.executor();
 
-    let field_list_plan =
-        db.field_column_names(predicate)
-            .await
-            .map_err(|e| Error::ListingFields {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
-            })?;
+    let field_list_plan = db
+        .field_column_names(predicate)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingFields { db_name })?;
 
-    let field_list =
-        executor
-            .to_field_list(field_list_plan)
-            .await
-            .map_err(|e| Error::ListingFields {
-                db_name: db_name.to_string(),
-                source: Box::new(e),
-            })?;
+    let field_list = executor
+        .to_field_list(field_list_plan)
+        .await
+        .map_err(|e| Box::new(e) as _)
+        .context(ListingFields { db_name })?;
 
     Ok(field_list)
-}
-
-/// Instantiate a server listening on the specified address
-/// implementing the IOx and Storage gRPC interfaces, the
-/// underlying hyper server instance. Resolves when the server has
-/// shutdown.
-pub async fn make_server<T>(socket: TcpListener, storage: Arc<T>) -> Result<()>
-where
-    T: DatabaseStore + 'static,
-{
-    tonic::transport::Server::builder()
-        .add_service(IOxTestingServer::new(GrpcService::new(storage.clone())))
-        .add_service(StorageServer::new(GrpcService::new(storage.clone())))
-        .serve_with_incoming(socket)
-        .await
-        .context(ServerError {})
-        .log_if_error("Running Tonic Server")
 }
 
 #[cfg(test)]
@@ -1166,7 +1119,7 @@ mod tests {
         test::FieldColumnsRequest,
         test::QueryGroupsRequest,
         test::TestDatabaseStore,
-        test::{ColumnValuesRequest, QuerySeriesRequest},
+        test::{ColumnValuesRequest, QuerySeriesRequest, TestChunk},
     };
     use std::{
         convert::TryFrom,
@@ -1216,19 +1169,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_storage_rpc_measurement_names() -> Result<(), tonic::Status> {
+    async fn test_storage_rpc_measurement_names() {
         // Start a test gRPC server on a randomally allocated port
         let mut fixture = Fixture::new().await.expect("Connecting to test server");
 
         let db_info = OrgAndBucket::new(123, 456);
         let partition_id = 1;
 
-        let lp_data = "h2o,state=CA temp=50.4 100\n\
-                       o2,state=MA temp=50.4 200";
+        let chunk = TestChunk::new(0).with_table("h2o").with_table("o2");
+
         fixture
             .test_storage
-            .add_lp_string(&db_info.db_name, lp_data)
-            .await;
+            .db_or_create(&db_info.db_name)
+            .await
+            .unwrap()
+            .add_chunk("my_partition_key", Arc::new(chunk));
 
         let source = Some(StorageClientWrapper::read_source(
             db_info.org_id,
@@ -1243,7 +1198,11 @@ mod tests {
             predicate: None,
         };
 
-        let actual_measurements = fixture.storage_client.measurement_names(request).await?;
+        let actual_measurements = fixture
+            .storage_client
+            .measurement_names(request)
+            .await
+            .unwrap();
         let expected_measurements = to_string_vec(&["h2o", "o2"]);
         assert_eq!(actual_measurements, expected_measurements);
 
@@ -1258,11 +1217,35 @@ mod tests {
             predicate: None,
         };
 
-        let actual_measurements = fixture.storage_client.measurement_names(request).await?;
-        let expected_measurements = to_string_vec(&["o2"]);
+        let actual_measurements = fixture
+            .storage_client
+            .measurement_names(request)
+            .await
+            .unwrap();
+        let expected_measurements = to_string_vec(&["h2o", "o2"]);
         assert_eq!(actual_measurements, expected_measurements);
 
-        Ok(())
+        // also ensure the plumbing is hooked correctly and that the predicate made it
+        // down to the chunk
+        let actual_predicate = fixture
+            .test_storage
+            .db_or_create(&db_info.db_name)
+            .await
+            .expect("getting db")
+            .get_chunk("my_partition_key", 0)
+            .and_then(|chunk| chunk.table_names_predicate());
+
+        let expected_predicate = Some(
+            PredicateBuilder::default()
+                .timestamp_range(150, 200)
+                .build(),
+        );
+
+        assert_eq!(
+            actual_predicate, expected_predicate,
+            "\nActual: {:?}\nExpected: {:?}",
+            actual_predicate, expected_predicate
+        );
     }
 
     /// test the plumbing of the RPC layer for tag_keys -- specifically that
@@ -1299,7 +1282,7 @@ mod tests {
             predicate: "Predicate { exprs: [#state Eq Utf8(\"MA\")] range: TimestampRange { start: 150, end: 200 }}".into()
         };
 
-        test_db.set_column_names(to_string_vec(&tag_keys)).await;
+        test_db.set_column_names(to_string_vec(&tag_keys));
 
         let actual_tag_keys = fixture.storage_client.tag_keys(request).await?;
         let mut expected_tag_keys = vec!["_f(0xff)", "_m(0x00)"];
@@ -1310,7 +1293,7 @@ mod tests {
             "unexpected tag keys while getting column names"
         );
         assert_eq!(
-            test_db.get_column_names_request().await,
+            test_db.get_column_names_request(),
             Some(expected_request),
             "unexpected request while getting column names"
         );
@@ -1340,7 +1323,7 @@ mod tests {
         let expected_request = Some(ColumnNamesRequest {
             predicate: "Predicate {}".into(),
         });
-        assert_eq!(test_db.get_column_names_request().await, expected_request);
+        assert_eq!(test_db.get_column_names_request(), expected_request);
 
         Ok(())
     }
@@ -1391,7 +1374,7 @@ mod tests {
             predicate: "Predicate { table_names: m4 exprs: [#state Eq Utf8(\"MA\")] range: TimestampRange { start: 150, end: 200 }}".into()
         };
 
-        test_db.set_column_names(to_string_vec(&tag_keys)).await;
+        test_db.set_column_names(to_string_vec(&tag_keys));
 
         let actual_tag_keys = fixture.storage_client.measurement_tag_keys(request).await?;
 
@@ -1404,7 +1387,7 @@ mod tests {
         );
 
         assert_eq!(
-            test_db.get_column_names_request().await,
+            test_db.get_column_names_request(),
             Some(expected_request),
             "unexpected request while getting column names"
         );
@@ -1435,7 +1418,7 @@ mod tests {
         let expected_request = Some(ColumnNamesRequest {
             predicate: "Predicate { table_names: m5}".into(),
         });
-        assert_eq!(test_db.get_column_names_request().await, expected_request);
+        assert_eq!(test_db.get_column_names_request(), expected_request);
 
         Ok(())
     }
@@ -1476,7 +1459,7 @@ mod tests {
             column_name: "the_tag_key".into(),
         };
 
-        test_db.set_column_values(to_string_vec(&tag_values)).await;
+        test_db.set_column_values(to_string_vec(&tag_values));
 
         let actual_tag_values = fixture.storage_client.tag_values(request).await.unwrap();
         assert_eq!(
@@ -1484,7 +1467,7 @@ mod tests {
             "unexpected tag values while getting tag values"
         );
         assert_eq!(
-            test_db.get_column_values_request().await,
+            test_db.get_column_values_request(),
             Some(expected_request),
             "unexpected request while getting tag values"
         );
@@ -1499,12 +1482,14 @@ mod tests {
             tag_key: [0].into(),
         };
 
-        let lp_data = "h2o,state=CA temp=50.4 1000\n\
-                       o2,state=MA temp=50.4 2000";
+        let chunk = TestChunk::new(0).with_table("h2o");
+
         fixture
             .test_storage
-            .add_lp_string(&db_info.db_name, lp_data)
-            .await;
+            .db_or_create(&db_info.db_name)
+            .await
+            .unwrap()
+            .add_chunk("my_partition_key", Arc::new(chunk));
 
         let tag_values = vec!["h2o"];
         let actual_tag_values = fixture.storage_client.tag_values(request).await.unwrap();
@@ -1532,7 +1517,7 @@ mod tests {
             }],
         };
         let fieldlist_plan = FieldListPlan::Known(Ok(fieldlist));
-        test_db.set_field_colum_names_values(fieldlist_plan).await;
+        test_db.set_field_colum_names_values(fieldlist_plan);
 
         let expected_tag_values = vec!["Field1"];
         let actual_tag_values = fixture.storage_client.tag_values(request).await.unwrap();
@@ -1568,7 +1553,7 @@ mod tests {
             predicate: "Predicate {}".into(),
             column_name: "the_tag_key".into(),
         });
-        assert_eq!(test_db.get_column_values_request().await, expected_request);
+        assert_eq!(test_db.get_column_values_request(), expected_request);
 
         // ---
         // test error with non utf8 value
@@ -1629,7 +1614,7 @@ mod tests {
             column_name: "the_tag_key".into(),
         };
 
-        test_db.set_column_values(to_string_vec(&tag_values)).await;
+        test_db.set_column_values(to_string_vec(&tag_values));
 
         let actual_tag_values = fixture
             .storage_client
@@ -1643,7 +1628,7 @@ mod tests {
         );
 
         assert_eq!(
-            test_db.get_column_values_request().await,
+            test_db.get_column_values_request(),
             Some(expected_request),
             "unexpected request while getting tag values",
         );
@@ -1676,7 +1661,7 @@ mod tests {
             predicate: "Predicate { table_names: m5}".into(),
             column_name: "the_tag_key".into(),
         });
-        assert_eq!(test_db.get_column_values_request().await, expected_request);
+        assert_eq!(test_db.get_column_values_request(), expected_request);
     }
 
     #[tokio::test]
@@ -1686,7 +1671,7 @@ mod tests {
         // message ends up in the log system
 
         // Normally, the global panic logger is set at program start
-        let f = SendPanicsToTracing::new();
+        let _f = SendPanicsToTracing::new();
 
         // capture all tracing messages
         let tracing_capture = TracingCapture::new();
@@ -1704,20 +1689,16 @@ mod tests {
                 panic!("Unexpected success: {:?}", response);
             }
             Err(status) => {
-                assert_eq!(status.code(), Code::Unknown);
+                assert_eq!(status.code(), Code::Cancelled);
                 assert!(
-                    status.message().contains("transport error"),
-                    "could not find 'transport error' in '{}'",
+                    status.message().contains("stream no longer needed"),
+                    "could not find 'stream no longer needed' in '{}'",
                     status.message()
                 );
             }
         };
 
-        // Ensure that the logs captured the panic (and drop f
-        // beforehand -- if assert fails, it panics and during that
-        // panic `f` gets dropped causing a nasty error message)
-        drop(f);
-
+        // Ensure that the logs captured the panic
         let captured_logs = tracing_capture.to_string();
         // Note we don't include the actual line / column in the
         // expected panic message to avoid needing to update the test
@@ -1779,7 +1760,7 @@ mod tests {
         };
 
         let dummy_series_set_plan = SeriesSetPlans::from(vec![]);
-        test_db.set_query_series_values(dummy_series_set_plan).await;
+        test_db.set_query_series_values(dummy_series_set_plan);
 
         let actual_frames = fixture.storage_client.read_filter(request).await?;
 
@@ -1791,7 +1772,7 @@ mod tests {
             "unexpected frames returned by query_series",
         );
         assert_eq!(
-            test_db.get_query_series_request().await,
+            test_db.get_query_series_request(),
             Some(expected_request),
             "unexpected request to query_series",
         );
@@ -1820,7 +1801,7 @@ mod tests {
         let expected_request = Some(QuerySeriesRequest {
             predicate: "Predicate {}".into(),
         });
-        assert_eq!(test_db.get_query_series_request().await, expected_request);
+        assert_eq!(test_db.get_query_series_request(), expected_request);
 
         Ok(())
     }
@@ -1869,7 +1850,7 @@ mod tests {
 
         // TODO setup any expected results
         let dummy_groups_set_plan = SeriesSetPlans::from(vec![]);
-        test_db.set_query_groups_values(dummy_groups_set_plan).await;
+        test_db.set_query_groups_values(dummy_groups_set_plan);
 
         let actual_frames = fixture.storage_client.read_group(request).await?;
         let expected_frames: Vec<String> = vec!["0 group frames".into()];
@@ -1879,7 +1860,7 @@ mod tests {
             "unexpected frames returned by query_groups"
         );
         assert_eq!(
-            test_db.get_query_groups_request().await,
+            test_db.get_query_groups_request(),
             Some(expected_request),
             "unexpected request to query_groups"
         );
@@ -1912,7 +1893,7 @@ mod tests {
 
         // Errored out in gRPC and never got to database layer
         let expected_request: Option<QueryGroupsRequest> = None;
-        assert_eq!(test_db.get_query_groups_request().await, expected_request);
+        assert_eq!(test_db.get_query_groups_request(), expected_request);
 
         // ---
         // test error returned in database processing
@@ -1948,7 +1929,7 @@ mod tests {
                 group_columns: vec!["tag1".into()],
             },
         });
-        assert_eq!(test_db.get_query_groups_request().await, expected_request);
+        assert_eq!(test_db.get_query_groups_request(), expected_request);
 
         Ok(())
     }
@@ -2005,7 +1986,7 @@ mod tests {
 
         // setup expected results
         let dummy_groups_set_plan = SeriesSetPlans::from(vec![]);
-        test_db.set_query_groups_values(dummy_groups_set_plan).await;
+        test_db.set_query_groups_values(dummy_groups_set_plan);
 
         let actual_frames = fixture
             .storage_client
@@ -2018,7 +1999,7 @@ mod tests {
             "unexpected frames returned by query_groups"
         );
         assert_eq!(
-            test_db.get_query_groups_request().await,
+            test_db.get_query_groups_request(),
             Some(expected_request_window_every),
             "unexpected request to query_groups"
         );
@@ -2067,7 +2048,7 @@ mod tests {
 
         // setup expected results
         let dummy_groups_set_plan = SeriesSetPlans::from(vec![]);
-        test_db.set_query_groups_values(dummy_groups_set_plan).await;
+        test_db.set_query_groups_values(dummy_groups_set_plan);
 
         let actual_frames = fixture
             .storage_client
@@ -2080,7 +2061,7 @@ mod tests {
             "unexpected frames returned by query_groups"
         );
         assert_eq!(
-            test_db.get_query_groups_request().await,
+            test_db.get_query_groups_request(),
             Some(expected_request_window.clone()),
             "unexpected request to query_groups"
         );
@@ -2105,7 +2086,7 @@ mod tests {
         );
 
         assert_eq!(
-            test_db.get_query_groups_request().await,
+            test_db.get_query_groups_request(),
             Some(expected_request_window)
         );
 
@@ -2152,7 +2133,7 @@ mod tests {
         };
 
         let fieldlist_plan = FieldListPlan::Known(Ok(fieldlist));
-        test_db.set_field_colum_names_values(fieldlist_plan).await;
+        test_db.set_field_colum_names_values(fieldlist_plan);
 
         let actual_fields = fixture.storage_client.measurement_fields(request).await?;
         let expected_fields: Vec<String> = vec!["key: Field1, type: 3, timestamp: 1000".into()];
@@ -2162,7 +2143,7 @@ mod tests {
             "unexpected frames returned by measuremnt_fields"
         );
         assert_eq!(
-            test_db.get_field_columns_request().await,
+            test_db.get_field_columns_request(),
             Some(expected_request),
             "unexpected request to measurement-fields"
         );
@@ -2192,7 +2173,7 @@ mod tests {
         let expected_request = Some(FieldColumnsRequest {
             predicate: "Predicate { table_names: TheMeasurement}".into(),
         });
-        assert_eq!(test_db.get_field_columns_request().await, expected_request);
+        assert_eq!(test_db.get_field_columns_request(), expected_request);
 
         Ok(())
     }
@@ -2572,7 +2553,7 @@ mod tests {
 
             println!("Starting InfluxDB IOx rpc test server on {:?}", bind_addr);
 
-            let server = make_server(socket, test_storage.clone());
+            let server = super::super::make_server(socket, test_storage.clone());
             tokio::task::spawn(server);
 
             let iox_client = connect_to_server::<IOxTestingClient>(bind_addr)

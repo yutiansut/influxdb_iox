@@ -1,3 +1,4 @@
+pub mod bool;
 pub mod cmp;
 pub mod dictionary;
 pub mod fixed;
@@ -36,20 +37,16 @@ pub enum Column {
 
     // A column of signed integers, which may be encoded with a different
     // physical type to the logical type.
-    //
-    // TODO - meta stored at highest precision, but returning correct logical
-    // type probably needs some thought.
     Integer(MetaData<i64>, IntegerEncoding),
 
     // A column of unsigned integers, which may be encoded with a different
     // physical type to the logical type.
-    //
-    // TODO - meta stored at highest precision, but returning correct logical
-    // type probably needs some thought.
-    Unsigned(MetaData<u64>, IntegerEncoding), // TODO - 64-bit unsigned integers
+    Unsigned(MetaData<u64>, IntegerEncoding),
+
+    // A column of boolean values.
+    Bool(MetaData<bool>, BooleanEncoding),
 
     // These are TODO
-    Bool,                                         // TODO - booleans
     ByteArray(MetaData<Vec<u8>>, StringEncoding), // TODO - arbitrary bytes
 }
 
@@ -63,7 +60,7 @@ impl Column {
             Column::Float(meta, _) => meta.rows,
             Column::Integer(meta, _) => meta.rows,
             Column::Unsigned(meta, _) => meta.rows,
-            Column::Bool => todo!(),
+            Column::Bool(meta, _) => meta.rows,
             Column::ByteArray(meta, _) => meta.rows,
         }
     }
@@ -75,7 +72,7 @@ impl Column {
             Column::Float(_, _) => LogicalDataType::Float,
             Column::Integer(_, _) => LogicalDataType::Integer,
             Column::Unsigned(_, _) => LogicalDataType::Unsigned,
-            Column::Bool => LogicalDataType::Boolean,
+            Column::Bool(_, _) => LogicalDataType::Boolean,
             Column::ByteArray(_, _) => LogicalDataType::Binary,
         }
     }
@@ -115,7 +112,10 @@ impl Column {
                 )),
                 None => None,
             },
-            Column::Bool => todo!(),
+            Column::Bool(meta, _) => match meta.range {
+                Some(range) => Some((OwnedValue::Boolean(range.0), OwnedValue::Boolean(range.1))),
+                None => None,
+            },
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -126,7 +126,7 @@ impl Column {
             Column::Float(meta, _) => &meta.properties,
             Column::Integer(meta, _) => &meta.properties,
             Column::Unsigned(meta, _) => &meta.properties,
-            Column::Bool => todo!(),
+            Column::Bool(meta, _) => &meta.properties,
             Column::ByteArray(meta, _) => &meta.properties,
         }
     }
@@ -159,7 +159,7 @@ impl Column {
             Column::Float(_, data) => data.value(row_id),
             Column::Integer(_, data) => data.value(row_id),
             Column::Unsigned(_, data) => data.value(row_id),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.value(row_id),
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -180,7 +180,7 @@ impl Column {
             Column::Float(_, data) => data.values(row_ids),
             Column::Integer(_, data) => data.values(row_ids),
             Column::Unsigned(_, data) => data.values(row_ids),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.values(row_ids),
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -192,7 +192,7 @@ impl Column {
             Column::Float(_, data) => data.all_values(),
             Column::Integer(_, data) => data.all_values(),
             Column::Unsigned(_, data) => data.all_values(),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.all_values(),
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -299,7 +299,7 @@ impl Column {
             Column::Float(_, data) => data.row_ids_filter(op, value.scalar(), dst),
             Column::Integer(_, data) => data.row_ids_filter(op, value.scalar(), dst),
             Column::Unsigned(_, data) => data.row_ids_filter(op, value.scalar(), dst),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.row_ids_filter(op, value.bool(), dst),
             Column::ByteArray(_, data) => todo!(),
         };
 
@@ -358,7 +358,7 @@ impl Column {
             Column::Unsigned(_, data) => {
                 data.row_ids_filter_range((&low.0, low.1.scalar()), (&high.0, high.1.scalar()), dst)
             }
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => unimplemented!("filter_range not supported on boolean column"),
             Column::ByteArray(_, data) => todo!(),
         };
 
@@ -411,7 +411,9 @@ impl Column {
         PredicateMatch::SomeMaybe
     }
 
-    // Helper method to determine if the column possibly contains this value
+    // Helper method to determine if the column possibly contains this value.
+    //
+    // TODO(edd): currently this only handles non-null values.
     fn might_contain_value(&self, value: &Value<'_>) -> bool {
         match &self {
             Column::String(meta, _) => {
@@ -441,13 +443,19 @@ impl Column {
                 .scalar()
                 .try_as_u64()
                 .map_or_else(|| false, |v| meta.might_contain_value(v)),
-            Column::Bool => todo!(),
+            Column::Bool(meta, _) => match value {
+                Value::Null => false,
+                Value::Boolean(b) => meta.might_contain_value(*b),
+                v => panic!("cannot compare boolean to {:?}", v),
+            },
             Column::ByteArray(meta, _) => todo!(),
         }
     }
 
     // Helper method to determine if the predicate matches all the values in
     // the column.
+    //
+    // TODO(edd): this doesn't handle operators that compare to a NULL value yet.
     fn predicate_matches_all_values(&self, op: &cmp::Operator, value: &Value<'_>) -> bool {
         match &self {
             Column::String(meta, data) => {
@@ -498,7 +506,17 @@ impl Column {
                     .try_as_u64()
                     .map_or_else(|| false, |v| meta.might_match_all_values(op, v))
             }
-            Column::Bool => todo!(),
+            Column::Bool(meta, data) => {
+                if data.contains_null() {
+                    return false;
+                }
+
+                match value {
+                    Value::Null => false,
+                    Value::Boolean(b) => meta.might_match_all_values(op, *b),
+                    v => panic!("cannot compare on boolean column using {:?}", v),
+                }
+            }
             Column::ByteArray(meta, _) => todo!(),
         }
     }
@@ -522,7 +540,7 @@ impl Column {
             Column::Float(meta, data) => meta.match_no_values(op, value.scalar().as_f64()),
             Column::Integer(meta, data) => meta.match_no_values(op, value.scalar().as_i64()),
             Column::Unsigned(meta, data) => meta.match_no_values(op, value.scalar().as_u64()),
-            Column::Bool => todo!(),
+            Column::Bool(meta, data) => meta.match_no_values(op, value.bool()),
             Column::ByteArray(meta, _) => todo!(),
         }
     }
@@ -540,7 +558,7 @@ impl Column {
             Column::Float(_, data) => data.min(row_ids),
             Column::Integer(_, data) => data.min(row_ids),
             Column::Unsigned(_, data) => data.min(row_ids),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.min(row_ids),
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -554,7 +572,7 @@ impl Column {
             Column::Float(_, data) => data.max(row_ids),
             Column::Integer(_, data) => data.max(row_ids),
             Column::Unsigned(_, data) => data.max(row_ids),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.max(row_ids),
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -584,7 +602,7 @@ impl Column {
             Column::Float(_, data) => data.count(row_ids),
             Column::Integer(_, data) => data.count(row_ids),
             Column::Unsigned(_, data) => data.count(row_ids),
-            Column::Bool => todo!(),
+            Column::Bool(_, data) => data.count(row_ids),
             Column::ByteArray(_, _) => todo!(),
         }
     }
@@ -593,10 +611,41 @@ impl Column {
     // Methods for inspecting
     //
 
+    /// Determines if this column contains any NULL values.
+    pub fn contains_null(&self) -> bool {
+        match &self {
+            Column::String(_, data) => data.contains_null(),
+            Column::Float(_, data) => data.contains_null(),
+            Column::Integer(_, data) => data.contains_null(),
+            Column::Unsigned(_, data) => data.contains_null(),
+            Column::Bool(_, data) => data.contains_null(),
+            Column::ByteArray(_, _) => todo!(),
+        }
+    }
+
     /// Determines if the column has a non-null value at any of the provided
-    /// rows.
+    /// row ids.
     pub fn has_non_null_value(&self, row_ids: &[u32]) -> bool {
-        todo!()
+        match &self {
+            Column::String(_, data) => data.has_non_null_value(row_ids),
+            Column::Float(_, data) => data.has_non_null_value(row_ids),
+            Column::Integer(_, data) => data.has_non_null_value(row_ids),
+            Column::Unsigned(_, data) => data.has_non_null_value(row_ids),
+            Column::Bool(_, data) => data.has_non_null_value(row_ids),
+            Column::ByteArray(_, _) => todo!(),
+        }
+    }
+
+    /// Determines if the column has a non-null value on any row.
+    pub fn has_any_non_null_value(&self) -> bool {
+        match &self {
+            Column::String(_, data) => data.has_any_non_null_value(),
+            Column::Float(_, data) => data.has_any_non_null_value(),
+            Column::Integer(_, data) => data.has_any_non_null_value(),
+            Column::Unsigned(_, data) => data.has_any_non_null_value(),
+            Column::Bool(_, data) => data.has_any_non_null_value(),
+            Column::ByteArray(_, _) => todo!(),
+        }
     }
 
     /// Determines if the column contains other values than those provided in
@@ -705,9 +754,26 @@ pub enum StringEncoding {
 impl StringEncoding {
     /// Determines if the column contains a NULL value.
     pub fn contains_null(&self) -> bool {
+        match self {
+            StringEncoding::RLEDictionary(enc) => enc.contains_null(),
+            StringEncoding::Dictionary(enc) => enc.contains_null(),
+        }
+    }
+
+    /// Determines if the column contains a non-null value
+    pub fn has_any_non_null_value(&self) -> bool {
         match &self {
-            Self::RLEDictionary(c) => c.contains_null(),
-            Self::Dictionary(c) => c.contains_null(),
+            Self::RLEDictionary(c) => c.has_any_non_null_value(),
+            Self::Dictionary(c) => c.has_any_non_null_value(),
+        }
+    }
+
+    /// Determines if the column contains a non-null value at one of the
+    /// provided rows.
+    pub fn has_non_null_value(&self, row_ids: &[u32]) -> bool {
+        match &self {
+            Self::RLEDictionary(c) => c.has_non_null_value(row_ids),
+            Self::Dictionary(c) => c.has_non_null_value(row_ids),
         }
     }
 
@@ -1070,10 +1136,30 @@ pub enum IntegerEncoding {
 impl IntegerEncoding {
     /// Determines if the column contains a NULL value.
     pub fn contains_null(&self) -> bool {
-        if let Self::I64I64N(c) = &self {
-            return c.contains_null();
+        match self {
+            IntegerEncoding::I64I64N(enc) => enc.contains_null(),
+            IntegerEncoding::U64U64N(enc) => enc.contains_null(),
+            _ => false,
         }
-        false
+    }
+
+    /// Determines if the column contains a non-null value.
+    pub fn has_any_non_null_value(&self) -> bool {
+        match self {
+            IntegerEncoding::I64I64N(enc) => enc.has_any_non_null_value(),
+            IntegerEncoding::U64U64N(enc) => enc.has_any_non_null_value(),
+            _ => true,
+        }
+    }
+
+    /// Determines if the column contains a non-null value at one of the
+    /// provided rows.
+    pub fn has_non_null_value(&self, row_ids: &[u32]) -> bool {
+        match self {
+            IntegerEncoding::I64I64N(enc) => enc.has_non_null_value(row_ids),
+            IntegerEncoding::U64U64N(enc) => enc.has_non_null_value(row_ids),
+            _ => !row_ids.is_empty(), // all rows will be non-null
+        }
     }
 
     /// Returns the logical value found at the provided row id.
@@ -1378,9 +1464,27 @@ pub enum FloatEncoding {
 impl FloatEncoding {
     /// Determines if the column contains a NULL value.
     pub fn contains_null(&self) -> bool {
-        // TODO(edd): when adding the nullable columns then ask the nullable
-        // encoding if it has any null values.
-        false
+        match self {
+            FloatEncoding::Fixed64(_) => false,
+            FloatEncoding::FixedNull64(enc) => enc.contains_null(),
+        }
+    }
+
+    /// Determines if the column contains a non-null value.
+    pub fn has_any_non_null_value(&self) -> bool {
+        match self {
+            Self::Fixed64(_) => true,
+            Self::FixedNull64(enc) => enc.has_any_non_null_value(),
+        }
+    }
+
+    /// Determines if the column contains a non-null value at one of the
+    /// provided rows.
+    pub fn has_non_null_value(&self, row_ids: &[u32]) -> bool {
+        match self {
+            Self::Fixed64(_) => !row_ids.is_empty(), // all rows will be non-null
+            Self::FixedNull64(enc) => enc.has_non_null_value(row_ids),
+        }
     }
 
     /// Returns the logical value found at the provided row id.
@@ -1483,6 +1587,98 @@ impl FloatEncoding {
     }
 }
 
+/// Encodings for boolean values.
+pub enum BooleanEncoding {
+    BooleanNull(bool::Bool),
+}
+
+impl BooleanEncoding {
+    /// Determines if the column contains a NULL value.
+    pub fn contains_null(&self) -> bool {
+        match self {
+            BooleanEncoding::BooleanNull(enc) => enc.contains_null(),
+        }
+    }
+
+    /// Determines if the column contains a non-null value.
+    pub fn has_any_non_null_value(&self) -> bool {
+        match self {
+            Self::BooleanNull(enc) => enc.has_any_non_null_value(),
+        }
+    }
+
+    /// Determines if the column contains a non-null value at one of the
+    /// provided rows.
+    pub fn has_non_null_value(&self, row_ids: &[u32]) -> bool {
+        match self {
+            Self::BooleanNull(enc) => enc.has_non_null_value(row_ids),
+        }
+    }
+
+    /// Returns the logical value found at the provided row id.
+    pub fn value(&self, row_id: u32) -> Value<'_> {
+        match &self {
+            Self::BooleanNull(c) => match c.value(row_id) {
+                Some(v) => Value::Boolean(v),
+                None => Value::Null,
+            },
+        }
+    }
+
+    /// Returns the logical values found at the provided row ids.
+    ///
+    /// TODO(edd): perf - pooling of destination vectors.
+    pub fn values(&self, row_ids: &[u32]) -> Values<'_> {
+        match &self {
+            Self::BooleanNull(c) => Values::Bool(c.values(row_ids, vec![])),
+        }
+    }
+
+    /// Returns all logical values in the column.
+    ///
+    /// TODO(edd): perf - pooling of destination vectors.
+    pub fn all_values(&self) -> Values<'_> {
+        match &self {
+            Self::BooleanNull(c) => Values::Bool(c.all_values(vec![])),
+        }
+    }
+
+    /// Returns the row ids that satisfy the provided predicate.
+    ///
+    /// Note: it is the caller's responsibility to ensure that the provided
+    /// `Scalar` value will fit within the physical type of the encoded column.
+    /// `row_ids_filter` will panic if this invariant is broken.
+    pub fn row_ids_filter(&self, op: &cmp::Operator, value: bool, dst: RowIDs) -> RowIDs {
+        match &self {
+            Self::BooleanNull(c) => c.row_ids_filter(value, op, dst),
+        }
+    }
+
+    pub fn min(&self, row_ids: &[u32]) -> Value<'_> {
+        match &self {
+            Self::BooleanNull(c) => match c.min(row_ids) {
+                Some(v) => Value::Boolean(v),
+                None => Value::Null,
+            },
+        }
+    }
+
+    pub fn max(&self, row_ids: &[u32]) -> Value<'_> {
+        match &self {
+            Self::BooleanNull(c) => match c.max(row_ids) {
+                Some(v) => Value::Boolean(v),
+                None => Value::Null,
+            },
+        }
+    }
+
+    pub fn count(&self, row_ids: &[u32]) -> u32 {
+        match &self {
+            Self::BooleanNull(c) => c.count(row_ids),
+        }
+    }
+}
+
 // Converts an Arrow `StringArray` into a column, currently using the RLE
 // encoding scheme. Other encodings can be supported and added to this
 // implementation.
@@ -1493,13 +1689,6 @@ impl FloatEncoding {
 impl From<arrow::array::StringArray> for Column {
     fn from(arr: arrow::array::StringArray) -> Self {
         let data = StringEncoding::from_arrow_string_array(&arr);
-        Column::String(StringEncoding::meta_from_data(&data), data)
-    }
-}
-
-impl From<&arrow::array::StringArray> for Column {
-    fn from(arr: &arrow::array::StringArray) -> Self {
-        let data = StringEncoding::from_arrow_string_array(arr);
         Column::String(StringEncoding::meta_from_data(&data), data)
     }
 }
@@ -1640,140 +1829,6 @@ impl From<arrow::array::UInt64Array> for Column {
         // TODO(edd): currently fixed null only supports 64-bit logical/physical
         // types. Need to add support for storing as smaller physical types.
         Column::Unsigned(meta, IntegerEncoding::U64U64N(data))
-    }
-}
-
-impl From<&arrow::array::UInt64Array> for Column {
-    fn from(arr: &arrow::array::UInt64Array) -> Self {
-        if arr.null_count() == 0 {
-            return Self::from(arr.values());
-        }
-
-        todo!("figure out how to run off of a borrowed arrow array");
-    }
-}
-
-/// Converts a slice of u32 values into the most compact fixed-width physical
-/// encoding. Whilst `u32` isn't a supported logical type it is still possible
-/// to store these values as logically `u64` values with `u32`, `u16`, `u8`
-/// physical representations.
-impl From<&[u32]> for Column {
-    fn from(arr: &[u32]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-
-        // This match is carefully ordered. It prioritises smaller physical
-        // datatypes that can safely represent the provided logical data type.
-        match (min, max) {
-            // encode as u8 values
-            (min, max) if max <= u8::MAX as u32 => {
-                let data = fixed::Fixed::<u8>::from(arr);
-                let meta = MetaData::<u64> {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as u64, max as u64)),
-                    ..MetaData::default()
-                };
-                Column::Unsigned(meta, IntegerEncoding::U64U8(data))
-            }
-            // encode as u16 values
-            (min, max) if max <= u16::MAX as u32 => {
-                let data = fixed::Fixed::<u16>::from(arr);
-                let meta = MetaData::<u64> {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as u64, max as u64)),
-                    ..MetaData::default()
-                };
-                Column::Unsigned(meta, IntegerEncoding::U64U16(data))
-            }
-            // encode as u32 values
-            (_, _) => {
-                let data = fixed::Fixed::<u32>::from(arr);
-                let meta = MetaData::<u64> {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as u64, max as u64)),
-                    ..MetaData::default()
-                };
-                Column::Unsigned(meta, IntegerEncoding::U64U32(data))
-            }
-        }
-    }
-}
-
-/// Converts a slice of `u16` values into the most compact fixed-width physical
-/// encoding. Whilst `u16` isn't a supported logical type it is still possible
-/// to store these values as logically `u64` values with `u16` or `u8` physical
-/// representations.
-impl From<&[u16]> for Column {
-    fn from(arr: &[u16]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-
-        // This match is carefully ordered. It prioritises smaller physical
-        // datatypes that can safely represent the provided logical data type.
-        match (min, max) {
-            // encode as u8 values
-            (min, max) if max <= u8::MAX as u16 => {
-                let data = fixed::Fixed::<u8>::from(arr);
-                let meta = MetaData::<u64> {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as u64, max as u64)),
-                    ..MetaData::default()
-                };
-                Column::Unsigned(meta, IntegerEncoding::U64U8(data))
-            }
-            // encode as u16 values
-            (_, _) => {
-                let data = fixed::Fixed::<u16>::from(arr);
-                let meta = MetaData::<u64> {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as u64, max as u64)),
-                    ..MetaData::default()
-                };
-                Column::Unsigned(meta, IntegerEncoding::U64U16(data))
-            }
-        }
-    }
-}
-
-/// Converts a slice of `u8` values into the most compact fixed-width physical
-/// encoding. Whilst `u8` isn't a supported logical type it is still possible
-/// to store these values as logically `u64` values with a `u8` physical
-/// representation.
-impl From<&[u8]> for Column {
-    fn from(arr: &[u8]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-
-        // This match is carefully ordered. It prioritises smaller physical
-        // datatypes that can safely represent the provided logical data type.
-        let data = fixed::Fixed::<u8>::from(arr);
-        let meta = MetaData::<u64> {
-            size: data.size(),
-            rows: data.num_rows(),
-            range: Some((min as u64, max as u64)),
-            ..MetaData::default()
-        };
-        Column::Unsigned(meta, IntegerEncoding::U64U8(data))
     }
 }
 
@@ -1928,170 +1983,6 @@ impl From<arrow::array::Int64Array> for Column {
     }
 }
 
-impl From<&arrow::array::Int64Array> for Column {
-    fn from(arr: &arrow::array::Int64Array) -> Self {
-        if arr.null_count() == 0 {
-            return Self::from(arr.values());
-        }
-
-        todo!("figure out how to run off of a borrowed arrow array");
-    }
-}
-
-/// Converts a slice of i32 values into the most compact fixed-width physical
-/// encoding. Whilst `i32` isn't a supported logical type it is still possible
-/// to store these values as logically `i64` values with `i32`, `i16`, `u16`,
-/// `u8` or `i8` physical representations.
-impl From<&[i32]> for Column {
-    fn from(arr: &[i32]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-
-        // This match is carefully ordered. It prioritises smaller physical
-        // datatypes that can safely represent the provided logical data type.
-        match (min, max) {
-            // encode as u8 values
-            (min, max) if min >= 0 && max <= u8::MAX as i32 => {
-                let data = fixed::Fixed::<u8>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64U8(data))
-            }
-            // encode as i8 values
-            (min, max) if min >= i8::MIN as i32 && max <= i8::MAX as i32 => {
-                let data = fixed::Fixed::<i8>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64I8(data))
-            }
-            // encode as u16 values
-            (min, max) if min >= 0 && max <= u16::MAX as i32 => {
-                let data = fixed::Fixed::<u16>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64U16(data))
-            }
-            // encode as i16 values
-            (min, max) if min >= i16::MIN as i32 && max <= i16::MAX as i32 => {
-                let data = fixed::Fixed::<i16>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64I16(data))
-            }
-            // otherwise, encode with the same physical type (i32)
-            (_, _) => {
-                let data = fixed::Fixed::<i32>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64I32(data))
-            }
-        }
-    }
-}
-
-/// Converts a slice of i16 values into the most compact fixed-width physical
-/// encoding. Whilst `i16` isn't a supported logical type it is still possible
-/// to store these values as logically `i64` values with `i16`, `u8` or `i8`
-/// physical representations.
-impl From<&[i16]> for Column {
-    fn from(arr: &[i16]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-
-        // This match is carefully ordered. It prioritises smaller physical
-        // datatypes that can safely represent the provided logical data type.
-        match (min, max) {
-            // encode as i8 values
-            (min, max) if min >= i8::MIN as i16 && max <= i8::MAX as i16 => {
-                let data = fixed::Fixed::<i8>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64I8(data))
-            }
-            // encode as u8 values
-            (min, max) if min >= 0 && max <= u8::MAX as i16 => {
-                let data = fixed::Fixed::<u8>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64U8(data))
-            }
-            // otherwise, encode with the same physical type (i16)
-            (_, _) => {
-                let data = fixed::Fixed::<i16>::from(arr);
-                let meta = MetaData {
-                    size: data.size(),
-                    rows: data.num_rows(),
-                    range: Some((min as i64, max as i64)),
-                    ..MetaData::default()
-                };
-                Column::Integer(meta, IntegerEncoding::I64I16(data))
-            }
-        }
-    }
-}
-
-/// Converts a slice of `i8` values into a `Column`. Whilst `i8` isn't a
-/// supported logical type it is still possible to store these values as
-/// logically `i64` values with an `i8` physical representations.
-impl From<&[i8]> for Column {
-    fn from(arr: &[i8]) -> Self {
-        // determine min and max values.
-        let mut min = arr[0];
-        let mut max = arr[0];
-        for &v in arr.iter().skip(1) {
-            min = min.min(v);
-            max = max.max(v);
-        }
-
-        let data = fixed::Fixed::<i8>::from(arr);
-        let meta = MetaData {
-            size: data.size(),
-            rows: data.num_rows(),
-            range: Some((min as i64, max as i64)),
-            ..MetaData::default()
-        };
-        Column::Integer(meta, IntegerEncoding::I64I8(data))
-    }
-}
-
 /// Converts a slice of `f64` values into a fixed-width column encoding.
 impl From<&[f64]> for Column {
     fn from(arr: &[f64]) -> Self {
@@ -2164,25 +2055,61 @@ impl From<arrow::array::Float64Array> for Column {
             ..MetaData::default()
         };
 
-        // TODO(edd): currently fixed null only supports 64-bit logical/physical
-        // types. Need to add support for storing as smaller physical types.
         Column::Float(meta, FloatEncoding::FixedNull64(data))
     }
 }
 
-impl From<&arrow::array::Float64Array> for Column {
-    fn from(arr: &arrow::array::Float64Array) -> Self {
-        if arr.null_count() == 0 {
-            return Self::from(arr.values());
+impl From<arrow::array::BooleanArray> for Column {
+    fn from(arr: arrow::array::BooleanArray) -> Self {
+        // determine min and max values.
+        let mut min: Option<bool> = None;
+        let mut max: Option<bool> = None;
+
+        for i in 0..arr.len() {
+            if arr.is_null(i) {
+                continue;
+            }
+
+            let v = arr.value(i);
+            match min {
+                Some(m) => {
+                    if !v & m {
+                        min = Some(v);
+                    }
+                }
+                None => min = Some(v),
+            };
+
+            match max {
+                Some(m) => {
+                    if v & !m {
+                        max = Some(v)
+                    }
+                }
+                None => max = Some(v),
+            };
         }
 
-        todo!("figure out how to run off of a borrowed arrow array");
+        let range = match (min, max) {
+            (None, None) => None,
+            (Some(min), Some(max)) => Some((min, max)),
+            _ => unreachable!("min/max must both be Some or None"),
+        };
+
+        let data = bool::Bool::from(arr);
+        let meta = MetaData {
+            size: data.size(),
+            rows: data.num_rows(),
+            range,
+            ..MetaData::default()
+        };
+        Column::Bool(meta, BooleanEncoding::BooleanNull(data))
     }
 }
 
 /// These variants hold aggregates, which are the results of applying aggregates
 /// to column data.
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub enum AggregateResult<'a> {
     // Any type of column can have rows counted. NULL values do not contribute
     // to the count. If all rows are NULL then count will be `0`.
@@ -2301,6 +2228,175 @@ impl<'a> AggregateResult<'a> {
             _ => unimplemented!("First and Last aggregates not implemented yet"),
         }
     }
+
+    /// Merge `other` into `self`
+    pub fn merge(&mut self, other: &AggregateResult<'a>) {
+        match (self, other) {
+            (AggregateResult::Count(this), AggregateResult::Count(that)) => *this += *that,
+            (AggregateResult::Sum(this), AggregateResult::Sum(that)) => *this += that,
+            (AggregateResult::Min(this), AggregateResult::Min(that)) => {
+                if *this > *that {
+                    *this = *that;
+                }
+            }
+            (AggregateResult::Max(this), AggregateResult::Max(that)) => {
+                if *this < *that {
+                    *this = *that;
+                }
+            }
+            (a, b) => unimplemented!("merging {:?} into {:?} not yet implemented", b, a),
+        }
+    }
+
+    pub fn try_as_str(&self) -> Option<&str> {
+        match &self {
+            AggregateResult::Min(v) => match v {
+                Value::Null => None,
+                Value::String(s) => Some(s),
+                v => panic!("cannot convert {:?} to &str", v),
+            },
+            AggregateResult::Max(v) => match v {
+                Value::Null => None,
+                Value::String(s) => Some(s),
+                v => panic!("cannot convert {:?} to &str", v),
+            },
+            AggregateResult::First(_) => panic!("cannot convert first tuple to &str"),
+            AggregateResult::Last(_) => panic!("cannot convert last tuple to &str"),
+            AggregateResult::Sum(v) => panic!("cannot convert {:?} to &str", v),
+            AggregateResult::Count(_) => panic!("cannot convert count to &str"),
+        }
+    }
+
+    pub fn try_as_bytes(&self) -> Option<&[u8]> {
+        match &self {
+            AggregateResult::Min(v) => match v {
+                Value::Null => None,
+                Value::ByteArray(s) => Some(s),
+                v => panic!("cannot convert {:?} to &[u8]", v),
+            },
+            AggregateResult::Max(v) => match v {
+                Value::Null => None,
+                Value::ByteArray(s) => Some(s),
+                v => panic!("cannot convert {:?} to &[u8]", v),
+            },
+            AggregateResult::First(_) => panic!("cannot convert first tuple to &[u8]"),
+            AggregateResult::Last(_) => panic!("cannot convert last tuple to &[u8]"),
+            AggregateResult::Sum(v) => panic!("cannot convert {:?} to &[u8]", v),
+            AggregateResult::Count(_) => panic!("cannot convert count to &[u8]"),
+        }
+    }
+
+    pub fn try_as_bool(&self) -> Option<bool> {
+        match &self {
+            AggregateResult::Min(v) => match v {
+                Value::Null => None,
+                Value::Boolean(s) => Some(*s),
+                v => panic!("cannot convert {:?} to bool", v),
+            },
+            AggregateResult::Max(v) => match v {
+                Value::Null => None,
+                Value::Boolean(s) => Some(*s),
+                v => panic!("cannot convert {:?} to bool", v),
+            },
+            AggregateResult::First(_) => panic!("cannot convert first tuple to bool"),
+            AggregateResult::Last(_) => panic!("cannot convert last tuple to bool"),
+            AggregateResult::Sum(v) => panic!("cannot convert {:?} to bool", v),
+            AggregateResult::Count(_) => panic!("cannot convert count to bool"),
+        }
+    }
+
+    pub fn try_as_i64_scalar(&self) -> Option<i64> {
+        match &self {
+            AggregateResult::Sum(v) => match v {
+                Scalar::Null => None,
+                Scalar::I64(v) => Some(*v),
+                v => panic!("cannot convert {:?} to i64", v),
+            },
+            AggregateResult::Min(v) => match v {
+                Value::Null => None,
+                Value::Scalar(s) => match s {
+                    Scalar::Null => None,
+                    Scalar::I64(v) => Some(*v),
+                    v => panic!("cannot convert {:?} to u64", v),
+                },
+                v => panic!("cannot convert {:?} to i64", v),
+            },
+            AggregateResult::Max(v) => match v {
+                Value::Null => None,
+                Value::Scalar(s) => match s {
+                    Scalar::Null => None,
+                    Scalar::I64(v) => Some(*v),
+                    v => panic!("cannot convert {:?} to u64", v),
+                },
+                v => panic!("cannot convert {:?} to i64", v),
+            },
+            AggregateResult::First(_) => panic!("cannot convert first tuple to scalar"),
+            AggregateResult::Last(_) => panic!("cannot convert last tuple to scalar"),
+            AggregateResult::Count(_) => panic!("cannot represent count as i64"),
+        }
+    }
+
+    pub fn try_as_u64_scalar(&self) -> Option<u64> {
+        match &self {
+            AggregateResult::Sum(v) => match v {
+                Scalar::Null => None,
+                Scalar::U64(v) => Some(*v),
+                v => panic!("cannot convert {:?} to u64", v),
+            },
+            AggregateResult::Count(c) => Some(*c),
+            AggregateResult::Min(v) => match v {
+                Value::Null => None,
+                Value::Scalar(s) => match s {
+                    Scalar::Null => None,
+                    Scalar::U64(v) => Some(*v),
+                    v => panic!("cannot convert {:?} to u64", v),
+                },
+                v => panic!("cannot convert {:?} to u64", v),
+            },
+            AggregateResult::Max(v) => match v {
+                Value::Null => None,
+                Value::Scalar(s) => match s {
+                    Scalar::Null => None,
+                    Scalar::U64(v) => Some(*v),
+                    v => panic!("cannot convert {:?} to u64", v),
+                },
+                v => panic!("cannot convert {:?} to u64", v),
+            },
+            AggregateResult::First(_) => panic!("cannot convert first tuple to scalar"),
+            AggregateResult::Last(_) => panic!("cannot convert last tuple to scalar"),
+        }
+    }
+
+    pub fn try_as_f64_scalar(&self) -> Option<f64> {
+        match &self {
+            AggregateResult::Sum(v) => match v {
+                Scalar::Null => None,
+                Scalar::F64(v) => Some(*v),
+                v => panic!("cannot convert {:?} to f64", v),
+            },
+            AggregateResult::Min(v) => match v {
+                Value::Null => None,
+                Value::Scalar(s) => match s {
+                    Scalar::Null => None,
+                    Scalar::F64(v) => Some(*v),
+                    v => panic!("cannot convert {:?} to f64", v),
+                },
+                v => panic!("cannot convert {:?} to f64", v),
+            },
+            AggregateResult::Max(v) => match v {
+                Value::Null => None,
+                Value::Scalar(s) => match s {
+                    Scalar::Null => None,
+                    Scalar::F64(v) => Some(*v),
+                    v => panic!("cannot convert {:?} to f64", v),
+                },
+                v => panic!("cannot convert {:?} to f64", v),
+            },
+            AggregateResult::First(_) => panic!("cannot convert first tuple to scalar"),
+            AggregateResult::Last(_) => panic!("cannot convert last tuple to scalar"),
+            AggregateResult::Count(_) => panic!("cannot represent count as f64"),
+        }
+    }
 }
 
 impl From<&AggregateType> for AggregateResult<'_> {
@@ -2361,7 +2457,7 @@ macro_rules! typed_scalar_converters {
                     Self::I64(v) => $type::try_from(*v).ok(),
                     Self::U64(v) => $type::try_from(*v).ok(),
                     Self::F64(v) => panic!("cannot convert Self::F64"),
-                    Self::Null => panic!("cannot convert Scalar::Null"),
+                    Self::Null => None,
                 }
             }
         )*
@@ -2497,6 +2593,8 @@ impl PartialEq<Value<'_>> for OwnedValue {
         match (&self, other) {
             (OwnedValue::String(a), Value::String(b)) => a == b,
             (OwnedValue::Scalar(a), Value::Scalar(b)) => a == b,
+            (OwnedValue::Boolean(a), Value::Boolean(b)) => a == b,
+            (OwnedValue::ByteArray(a), Value::ByteArray(b)) => a == b,
             _ => false,
         }
     }
@@ -2507,6 +2605,8 @@ impl PartialOrd<Value<'_>> for OwnedValue {
         match (&self, other) {
             (OwnedValue::String(a), Value::String(b)) => Some(a.as_str().cmp(b)),
             (OwnedValue::Scalar(a), Value::Scalar(b)) => a.partial_cmp(b),
+            (OwnedValue::Boolean(a), Value::Boolean(b)) => a.partial_cmp(b),
+            (OwnedValue::ByteArray(a), Value::ByteArray(b)) => a.as_slice().partial_cmp(*b),
             _ => None,
         }
     }
@@ -2548,6 +2648,13 @@ impl Value<'_> {
             return s;
         }
         panic!("cannot unwrap Value to String");
+    }
+
+    pub fn bool(&self) -> bool {
+        if let Self::Boolean(b) = self {
+            return *b;
+        }
+        panic!("cannot unwrap Value to Scalar");
     }
 }
 
@@ -3076,102 +3183,6 @@ mod test {
     }
 
     #[test]
-    fn from_i32_slice() {
-        let input = &[-1, i8::MAX as i32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64I8(_))
-        ));
-
-        let input = &[0, u8::MAX as i32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64U8(_))
-        ));
-
-        let input = &[-1, i16::MAX as i32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64I16(_))
-        ));
-
-        let input = &[0, u16::MAX as i32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64U16(_))
-        ));
-
-        let input = &[-1, i32::MAX];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64I32(_))
-        ));
-
-        // validate min/max check
-        let input = &[0, -12, u8::MAX as i32, 5];
-        let col = Column::from(&input[..]);
-        if let Column::Integer(meta, IntegerEncoding::I64I16(_)) = col {
-            assert_eq!(meta.size, 32); // 4 i16s (8b) and a vec (24b)
-            assert_eq!(meta.rows, 4);
-            assert_eq!(meta.range, Some((-12, u8::MAX as i64)));
-        } else {
-            panic!("invalid variant");
-        }
-    }
-
-    #[test]
-    fn from_i16_slice() {
-        let input = &[-1, i8::MAX as i16];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64I8(_))
-        ));
-
-        let input = &[0, u8::MAX as i16];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64U8(_))
-        ));
-
-        let input = &[-1, i16::MAX as i16];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64I16(_))
-        ));
-
-        // validate min/max check
-        let input = &[0, -12, u8::MAX as i16, 5];
-        let col = Column::from(&input[..]);
-        if let Column::Integer(meta, IntegerEncoding::I64I16(_)) = col {
-            assert_eq!(meta.size, 32); // 4 i16s (8b) and a vec (24b)
-            assert_eq!(meta.rows, 4);
-            assert_eq!(meta.range, Some((-12, u8::MAX as i64)));
-        } else {
-            panic!("invalid variant");
-        }
-    }
-
-    #[test]
-    fn from_i8_slice() {
-        let input = &[-1, i8::MAX];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Integer(_, IntegerEncoding::I64I8(_))
-        ));
-
-        // validate min/max check
-        let input = &[0, -12, i8::MAX, 5];
-        let col = Column::from(&input[..]);
-        if let Column::Integer(meta, IntegerEncoding::I64I8(_)) = col {
-            assert_eq!(meta.size, 28); // 4 i8s (4b) and a vec (24b)
-            assert_eq!(meta.rows, 4);
-            assert_eq!(meta.range, Some((-12, i8::MAX as i64)));
-        } else {
-            panic!("invalid variant");
-        }
-    }
-
-    #[test]
     fn from_u64_slice() {
         let input = &[0, u8::MAX as u64];
         assert!(matches!(
@@ -3204,107 +3215,29 @@ mod test {
     }
 
     #[test]
-    fn from_u32_slice() {
-        let input = &[0, u8::MAX as u32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Unsigned(_, IntegerEncoding::U64U8(_))
-        ));
-
-        let input = &[0, u16::MAX as u32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Unsigned(_, IntegerEncoding::U64U16(_))
-        ));
-
-        let input = &[0, u32::MAX as u32];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Unsigned(_, IntegerEncoding::U64U32(_))
-        ));
-
-        // validate min/max check
-        let input = &[13, 12, u16::MAX as u32, 5];
-        let col = Column::from(&input[..]);
-        if let Column::Unsigned(meta, IntegerEncoding::U64U16(_)) = col {
-            assert_eq!(meta.size, 32); // 4 u16s (8b) and a vec (24b)
-            assert_eq!(meta.rows, 4);
-            assert_eq!(meta.range, Some((5, u16::MAX as u64)));
-        } else {
-            panic!("invalid variant");
-        }
-    }
-
-    #[test]
-    fn from_u16_slice() {
-        let input = &[0, u8::MAX as u16];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Unsigned(_, IntegerEncoding::U64U8(_))
-        ));
-
-        let input = &[0, u16::MAX as u16];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Unsigned(_, IntegerEncoding::U64U16(_))
-        ));
-
-        // validate min/max check
-        let input = &[13, 12, u8::MAX as u16, 5];
-        let col = Column::from(&input[..]);
-        if let Column::Unsigned(meta, IntegerEncoding::U64U8(_)) = col {
-            assert_eq!(meta.size, 28); // 4 u8s (4b) and a vec (24b)
-            assert_eq!(meta.rows, 4);
-            assert_eq!(meta.range, Some((5, u8::MAX as u64)));
-        } else {
-            panic!("invalid variant");
-        }
-    }
-
-    #[test]
-    fn from_u8_slice() {
-        let input = &[0, u8::MAX];
-        assert!(matches!(
-            Column::from(&input[..]),
-            Column::Unsigned(_, IntegerEncoding::U64U8(_))
-        ));
-
-        // validate min/max check
-        let input = &[13, 12, u8::MAX, 5];
-        let col = Column::from(&input[..]);
-        if let Column::Unsigned(meta, IntegerEncoding::U64U8(_)) = col {
-            assert_eq!(meta.size, 28); // 4 u8s (4b) and a vec (24b)
-            assert_eq!(meta.rows, 4);
-            assert_eq!(meta.range, Some((5, u8::MAX as u64)));
-        } else {
-            panic!("invalid variant");
-        }
-    }
-
-    #[test]
     fn value() {
         // The Scalar variant always represents the logical type of the column.
         // The `value` method always returns values according to the logical
         // type, no matter what the underlying physical type might be.
 
-        // physical type of `col` will be `i16` but logical type is `i64`
+        // `col` will stored as `i16`, but logical type in and out is `i64`.
         let col = Column::from(&[0_i64, 1, 200, 20, -1][..]);
         assert_eq!(col.value(4), Value::from(-1_i64));
 
-        // physical type of `col` will be `u16` but logical type is `u64`
+        // `col` will stored as `u16`, but logical type in and out is `u64`.
         let col = Column::from(&[20_u64, 300][..]);
         assert_eq!(col.value(1), Value::from(300_u64));
 
-        // physical type of `col` will be `u8` but logical type is `u64`
-        let col = Column::from(&[20_u32, 3][..]);
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
+        let col = Column::from(&[20_u64, 3][..]);
         assert_eq!(col.value(0), Value::from(20_u64));
 
-        // physical type of `col` will be `u8` but logical type is `u64`
-        let col = Column::from(&[20_u16, 3][..]);
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
+        let col = Column::from(&[20_u64, 3][..]);
         assert_eq!(col.value(1), Value::from(3_u64));
 
-        // physical and logical type of `col` will be `u64`
-        let col = Column::from(&[243_u8, 198][..]);
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
+        let col = Column::from(&[243_u64, 198][..]);
         assert_eq!(col.value(0), Value::from(243_u64));
 
         let col = Column::from(&[-19.2, -30.2][..]);
@@ -3317,36 +3250,36 @@ mod test {
 
     #[test]
     fn values() {
-        // physical type of `col` will be `i16` but logical type is `i64`
+        // `col` will stored as `i16`, but logical type in and out is `i64`.
         let col = Column::from(&[0_i64, 1, 200, 20, -1][..]);
         assert_eq!(col.values(&[0, 2, 3]), Values::I64(vec![0, 200, 20]));
 
-        // physical type of `col` will be `i16` but logical type is `i64`
-        let col = Column::from(&[0_i32, 1, 200, 20, -1][..]);
+        // `col` will stored as `i16`, but logical type in and out is `i64`.
+        let col = Column::from(&[0_i64, 1, 200, 20, -1][..]);
         assert_eq!(col.values(&[0, 2, 3]), Values::I64(vec![0, 200, 20]));
 
-        // physical and logical type of `col` will be `i64`
-        let col = Column::from(&[0_i16, 1, 200, 20, -1][..]);
+        // `col` will stored as `i16`, but logical type in and out is `i64`.
+        let col = Column::from(&[0_i64, 1, 200, 20, -1][..]);
         assert_eq!(col.values(&[0, 2, 3]), Values::I64(vec![0, 200, 20]));
 
-        // physical and logical type of `col` will be `i64`
-        let col = Column::from(&[0_i8, 1, 127, 20, -1][..]);
+        // `col` will stored as `i8`, but logical type in and out is `i64`.
+        let col = Column::from(&[0_i64, 1, 127, 20, -1][..]);
         assert_eq!(col.values(&[0, 2, 3]), Values::I64(vec![0, 127, 20]));
 
-        // physical type of `col` will be `u8` but logical type is `u64`
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
         let col = Column::from(&[0_u64, 1, 200, 20, 100][..]);
         assert_eq!(col.values(&[3, 4]), Values::U64(vec![20, 100]));
 
-        // physical type of `col` will be `u8` but logical type is `u64`
-        let col = Column::from(&[0_u32, 1, 200, 20, 100][..]);
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
+        let col = Column::from(&[0_u64, 1, 200, 20, 100][..]);
         assert_eq!(col.values(&[3, 4]), Values::U64(vec![20, 100]));
 
-        // physical type of `col` will be `u8` but logical type is `u64`
-        let col = Column::from(&[0_u16, 1, 200, 20, 100][..]);
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
+        let col = Column::from(&[0_u64, 1, 200, 20, 100][..]);
         assert_eq!(col.values(&[3, 4]), Values::U64(vec![20, 100]));
 
-        // physical and logical type of `col` will be `u64`
-        let col = Column::from(&[0_u8, 1, 200, 20, 100][..]);
+        // `col` will stored as `u8`, but logical type in and out is `u64`.
+        let col = Column::from(&[0_u64, 1, 200, 20, 100][..]);
         assert_eq!(col.values(&[3, 4]), Values::U64(vec![20, 100]));
 
         // physical and logical type of `col` will be `f64`
@@ -3587,7 +3520,7 @@ mod test {
 
     #[test]
     fn row_ids_filter_int() {
-        let input = &[100, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
 
         let col = Column::from(&input[..]);
         let mut row_ids = col.row_ids_filter(
@@ -3653,7 +3586,7 @@ mod test {
 
     #[test]
     fn row_ids_filter_uint() {
-        let input = &[100_u32, 200, 300, 2, 200, 22, 30];
+        let input = &[100_u64, 200, 300, 2, 200, 22, 30];
 
         let col = Column::from(&input[..]);
         let mut row_ids = col.row_ids_filter(
@@ -3735,7 +3668,7 @@ mod test {
 
     #[test]
     fn row_ids_range() {
-        let input = &[100, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
 
         let col = Column::from(&input[..]);
         let mut row_ids = col.row_ids_filter_range(
@@ -3797,7 +3730,7 @@ mod test {
 
     #[test]
     fn might_contain_value() {
-        let input = &[100i64, 200, 300, 2, 200, 22, 30, -1228282828282];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30, -1228282828282];
         let col = Column::from(&input[..]);
         assert!(matches!(
             col,
@@ -3820,11 +3753,11 @@ mod test {
         }
 
         // Input stored as different physical size
-        let input = &[100i16, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert!(matches!(
             col,
-            Column::Integer(_, IntegerEncoding::I64I16(_))
+            Column::Integer(_, IntegerEncoding::I64U16(_))
         ));
 
         for (scalar, result) in cases.clone() {
@@ -3832,7 +3765,7 @@ mod test {
         }
 
         // Input stored as unsigned column
-        let input = &[100u64, 200, 300, 2, 200, 22, 30];
+        let input = &[100_u64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert!(matches!(
             col,
@@ -3881,7 +3814,7 @@ mod test {
         }
 
         // Future improvement would be to support this type of check.
-        let input = &[100i8, -20];
+        let input = &[100_i64, -20];
         let col = Column::from(&input[..]);
         assert_eq!(
             col.predicate_matches_all_values(&cmp::Operator::LT, &Value::from(u64::MAX)),
@@ -3891,7 +3824,7 @@ mod test {
 
     #[test]
     fn evaluate_predicate_on_meta() {
-        let input = &[100i64, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
 
         let cases: Vec<(cmp::Operator, Scalar, PredicateMatch)> = vec![
@@ -3954,12 +3887,12 @@ mod test {
 
     #[test]
     fn min() {
-        let input = &[100i64, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert_eq!(col.min(&[0, 1, 3][..]), Value::from(2_i64));
         assert_eq!(col.min(&[0, 1, 2][..]), Value::from(100_i64));
 
-        let input = &[100u8, 200, 245, 2, 200, 22, 30];
+        let input = &[100_u64, 200, 245, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert_eq!(col.min(&[4, 6][..]), Value::from(30_u64));
 
@@ -3971,7 +3904,7 @@ mod test {
 
     #[test]
     fn max() {
-        let input = &[100i64, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert_eq!(col.max(&[0, 1, 3][..]), Value::from(200_i64));
         assert_eq!(col.max(&[0, 1, 2][..]), Value::from(300_i64));
@@ -3993,12 +3926,12 @@ mod test {
 
     #[test]
     fn sum() {
-        let input = &[100i64, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert_eq!(col.sum(&[0, 1, 3][..]), Scalar::I64(302));
         assert_eq!(col.sum(&[0, 1, 2][..]), Scalar::I64(600));
 
-        let input = &[10.2f64, -2.43, 200.2];
+        let input = &[10.2_f64, -2.43, 200.2];
         let col = Column::from(&input[..]);
         assert_eq!(col.sum(&[0, 1, 2][..]), Scalar::F64(207.97));
 
@@ -4010,7 +3943,7 @@ mod test {
 
     #[test]
     fn count() {
-        let input = &[100i64, 200, 300, 2, 200, 22, 30];
+        let input = &[100_i64, 200, 300, 2, 200, 22, 30];
         let col = Column::from(&input[..]);
         assert_eq!(col.count(&[0, 1, 3][..]), 3);
 
@@ -4091,5 +4024,25 @@ mod test {
 
         res.update(Value::Scalar(Scalar::Null));
         assert!(matches!(res, AggregateResult::Sum(Scalar::I64(15))));
+    }
+
+    #[test]
+    fn has_non_null_value() {
+        // Check each column type is wired up. Actual logic is tested in encoders.
+
+        let col = Column::from(&[Some("Knocked Down"), None][..]);
+        assert!(col.has_non_null_value(&[0, 1]));
+
+        let col = Column::from(&[100_u64][..]);
+        assert!(col.has_non_null_value(&[0]));
+
+        let col = Column::from(&[100_i64][..]);
+        assert!(col.has_non_null_value(&[0]));
+
+        let col = Column::from(&[22.6][..]);
+        assert!(col.has_non_null_value(&[0]));
+
+        let col = Column::from(arrow::array::BooleanArray::from(vec![true]));
+        assert!(col.has_non_null_value(&[0]));
     }
 }

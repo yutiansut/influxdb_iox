@@ -1,23 +1,192 @@
 //! This module contains the IOx implementation for using Azure Blob storage as
 //! the object store.
-use crate::{
-    path::{cloud::CloudConverter, ObjectStorePath},
-    DataDoesNotMatchLength, Result, UnableToDeleteDataFromAzure, UnableToGetDataFromAzure,
-    UnableToListDataFromAzure, UnableToPutDataToAzure,
+use crate::{path::cloud::CloudPath, ListResult, ObjectStoreApi};
+use async_trait::async_trait;
+use azure_core::HttpClient;
+use azure_storage::{
+    clients::{
+        AsBlobClient, AsContainerClient, AsStorageClient, ContainerClient, StorageAccountClient,
+    },
+    DeleteSnapshotsMethod,
 };
-use azure_sdk_core::prelude::*;
-use azure_sdk_storage_blob::prelude::*;
 use bytes::Bytes;
-use futures::{stream, FutureExt, Stream, TryStreamExt};
-use snafu::{ensure, ResultExt};
+use futures::{
+    stream::{self, BoxStream},
+    FutureExt, Stream, StreamExt, TryStreamExt,
+};
+use snafu::{ensure, ResultExt, Snafu};
 use std::io;
 use std::sync::Arc;
+
+/// A specialized `Result` for Azure object store-related errors
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+/// A specialized `Error` for Azure object store-related errors
+#[derive(Debug, Snafu)]
+#[allow(missing_docs)]
+pub enum Error {
+    #[snafu(display("Expected streamed data to have length {}, got {}", expected, actual))]
+    DataDoesNotMatchLength { expected: usize, actual: usize },
+
+    #[snafu(display("Unable to DELETE data. Location: {}, Error: {}", location, source,))]
+    UnableToDeleteData {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        location: String,
+    },
+
+    #[snafu(display("Unable to GET data. Location: {}, Error: {}", location, source,))]
+    UnableToGetData {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        location: String,
+    },
+
+    #[snafu(display("Unable to PUT data. Location: {}, Error: {}", location, source,))]
+    UnableToPutData {
+        source: Box<dyn std::error::Error + Send + Sync>,
+        location: String,
+    },
+
+    #[snafu(display("Unable to list data. Error: {}", source))]
+    UnableToListData {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+}
 
 /// Configuration for connecting to [Microsoft Azure Blob Storage](https://azure.microsoft.com/en-us/services/storage/blobs/).
 #[derive(Debug)]
 pub struct MicrosoftAzure {
-    client: Arc<azure_sdk_storage_core::key_client::KeyClient>,
+    container_client: Arc<ContainerClient>,
     container_name: String,
+}
+
+#[async_trait]
+impl ObjectStoreApi for MicrosoftAzure {
+    type Path = CloudPath;
+    type Error = Error;
+
+    fn new_path(&self) -> Self::Path {
+        CloudPath::default()
+    }
+
+    async fn put<S>(&self, location: &Self::Path, bytes: S, length: usize) -> Result<()>
+    where
+        S: Stream<Item = io::Result<Bytes>> + Send + Sync + 'static,
+    {
+        let location = location.to_raw();
+        let temporary_non_streaming = bytes
+            .map_ok(|b| bytes::BytesMut::from(&b[..]))
+            .try_concat()
+            .await
+            .expect("Should have been able to collect streaming data");
+
+        ensure!(
+            temporary_non_streaming.len() == length,
+            DataDoesNotMatchLength {
+                actual: temporary_non_streaming.len(),
+                expected: length,
+            }
+        );
+
+        self.container_client
+            .as_blob_client(&location)
+            .put_block_blob(&temporary_non_streaming)
+            .execute()
+            .await
+            .context(UnableToPutData {
+                location: location.to_owned(),
+            })?;
+
+        Ok(())
+    }
+
+    async fn get(&self, location: &Self::Path) -> Result<BoxStream<'static, Result<Bytes>>> {
+        let container_client = self.container_client.clone();
+        let location = location.to_raw();
+        Ok(async move {
+            container_client
+                .as_blob_client(&location)
+                .get()
+                .execute()
+                .await
+                .map(|blob| blob.data.into())
+                .context(UnableToGetData {
+                    location: location.to_owned(),
+                })
+        }
+        .into_stream()
+        .boxed())
+    }
+
+    async fn delete(&self, location: &Self::Path) -> Result<()> {
+        let location = location.to_raw();
+        self.container_client
+            .as_blob_client(&location)
+            .delete()
+            .delete_snapshots_method(DeleteSnapshotsMethod::Include)
+            .execute()
+            .await
+            .context(UnableToDeleteData {
+                location: location.to_owned(),
+            })?;
+
+        Ok(())
+    }
+
+    async fn list<'a>(
+        &'a self,
+        prefix: Option<&'a Self::Path>,
+    ) -> Result<BoxStream<'a, Result<Vec<Self::Path>>>> {
+        #[derive(Clone)]
+        enum ListState {
+            Start,
+            HasMore(String),
+            Done,
+        }
+
+        Ok(stream::unfold(ListState::Start, move |state| async move {
+            let mut request = self.container_client.list_blobs();
+
+            let prefix = prefix.map(|p| p.to_raw());
+            if let Some(ref p) = prefix {
+                request = request.prefix(p as &str);
+            }
+
+            match state {
+                ListState::HasMore(ref marker) => {
+                    request = request.next_marker(marker as &str);
+                }
+                ListState::Done => {
+                    return None;
+                }
+                ListState::Start => {}
+            }
+
+            let resp = match request.execute().await.context(UnableToListData) {
+                Ok(resp) => resp,
+                Err(err) => return Some((Err(err), state)),
+            };
+
+            let next_state = if let Some(marker) = resp.incomplete_vector.next_marker() {
+                ListState::HasMore(marker.as_str().to_string())
+            } else {
+                ListState::Done
+            };
+
+            let names = resp
+                .incomplete_vector
+                .vector
+                .into_iter()
+                .map(|blob| CloudPath::raw(blob.name))
+                .collect();
+
+            Some((Ok(names), next_state))
+        })
+        .boxed())
+    }
+
+    async fn list_with_delimiter(&self, _prefix: &Self::Path) -> Result<ListResult<Self::Path>> {
+        unimplemented!();
+    }
 }
 
 impl MicrosoftAzure {
@@ -27,12 +196,21 @@ impl MicrosoftAzure {
     /// The credentials `account` and `master_key` must provide access to the
     /// store.
     pub fn new(account: String, master_key: String, container_name: impl Into<String>) -> Self {
+        // From https://github.com/Azure/azure-sdk-for-rust/blob/master/sdk/storage/examples/blob_00.rs#L29
+        let http_client: Arc<Box<dyn HttpClient>> = Arc::new(Box::new(reqwest::Client::new()));
+
+        let storage_account_client =
+            StorageAccountClient::new_access_key(http_client.clone(), &account, &master_key);
+
+        let storage_client = storage_account_client.as_storage_client();
+
+        let container_name = container_name.into();
+
+        let container_client = storage_client.as_container_client(&container_name);
+
         Self {
-            client: Arc::new(azure_sdk_storage_core::client::with_access_key(
-                &account,
-                &master_key,
-            )),
-            container_name: container_name.into(),
+            container_client,
+            container_name,
         }
     }
 
@@ -50,141 +228,12 @@ impl MicrosoftAzure {
 
         Self::new(account, master_key, container_name)
     }
-
-    /// Save the provided bytes to the specified location.
-    pub async fn put<S>(&self, location: &ObjectStorePath, bytes: S, length: usize) -> Result<()>
-    where
-        S: Stream<Item = io::Result<Bytes>> + Send + Sync + 'static,
-    {
-        let location = CloudConverter::convert(&location);
-        let temporary_non_streaming = bytes
-            .map_ok(|b| bytes::BytesMut::from(&b[..]))
-            .try_concat()
-            .await
-            .expect("Should have been able to collect streaming data");
-
-        ensure!(
-            temporary_non_streaming.len() == length,
-            DataDoesNotMatchLength {
-                actual: temporary_non_streaming.len(),
-                expected: length,
-            }
-        );
-
-        self.client
-            .put_block_blob()
-            .with_container_name(&self.container_name)
-            .with_blob_name(&location)
-            .with_body(&temporary_non_streaming)
-            .finalize()
-            .await
-            .context(UnableToPutDataToAzure {
-                location: location.to_owned(),
-            })?;
-
-        Ok(())
-    }
-
-    /// Return the bytes that are stored at the specified location.
-    pub async fn get(
-        &self,
-        location: &ObjectStorePath,
-    ) -> Result<impl Stream<Item = Result<Bytes>>> {
-        let client = self.client.clone();
-        let container_name = self.container_name.clone();
-        let location = CloudConverter::convert(&location);
-        Ok(async move {
-            client
-                .get_blob()
-                .with_container_name(&container_name)
-                .with_blob_name(&location)
-                .finalize()
-                .await
-                .map(|blob| blob.data.into())
-                .context(UnableToGetDataFromAzure {
-                    location: location.to_owned(),
-                })
-        }
-        .into_stream())
-    }
-
-    /// Delete the object at the specified location.
-    pub async fn delete(&self, location: &ObjectStorePath) -> Result<()> {
-        let location = CloudConverter::convert(&location);
-        self.client
-            .delete_blob()
-            .with_container_name(&self.container_name)
-            .with_blob_name(&location)
-            .with_delete_snapshots_method(DeleteSnapshotsMethod::Include)
-            .finalize()
-            .await
-            .context(UnableToDeleteDataFromAzure {
-                location: location.to_owned(),
-            })?;
-
-        Ok(())
-    }
-
-    /// List all the objects with the given prefix.
-    pub async fn list<'a>(
-        &'a self,
-        prefix: Option<&'a ObjectStorePath>,
-    ) -> Result<impl Stream<Item = Result<Vec<ObjectStorePath>>> + 'a> {
-        #[derive(Clone)]
-        enum ListState {
-            Start,
-            HasMore(String),
-            Done,
-        }
-
-        Ok(stream::unfold(ListState::Start, move |state| async move {
-            let mut request = self
-                .client
-                .list_blobs()
-                .with_container_name(&self.container_name);
-
-            let prefix = prefix.map(CloudConverter::convert);
-            if let Some(ref p) = prefix {
-                request = request.with_prefix(p);
-            }
-
-            match state {
-                ListState::HasMore(ref token) => {
-                    request = request.with_next_marker(token);
-                }
-                ListState::Done => {
-                    return None;
-                }
-                ListState::Start => {}
-            }
-
-            let resp = match request.finalize().await.context(UnableToListDataFromAzure) {
-                Ok(resp) => resp,
-                Err(err) => return Some((Err(err), state)),
-            };
-
-            let next_state = if let Some(token) = resp.incomplete_vector.token() {
-                ListState::HasMore(token.to_string())
-            } else {
-                ListState::Done
-            };
-
-            let names = resp
-                .incomplete_vector
-                .vector
-                .into_iter()
-                .map(|blob| ObjectStorePath::from_cloud_unchecked(blob.name))
-                .collect();
-
-            Some((Ok(names), next_state))
-        }))
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{tests::put_get_delete_list, ObjectStore};
+    use crate::tests::put_get_delete_list;
     use std::env;
 
     type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -239,9 +288,8 @@ mod tests {
 
         let container_name = env::var("AZURE_STORAGE_CONTAINER")
             .map_err(|_| "The environment variable AZURE_STORAGE_CONTAINER must be set")?;
-        let azure = MicrosoftAzure::new_from_env(container_name);
+        let integration = MicrosoftAzure::new_from_env(container_name);
 
-        let integration = ObjectStore::new_microsoft_azure(azure);
         put_get_delete_list(&integration).await?;
 
         Ok(())
